@@ -36,7 +36,9 @@ constexpr const char* kHelp =
     "  --help, -h       Show this help\n"
     "  --version        Print version\n"
     "\n"
-    "User-account login inputs: TG_TELEGRAM_CODE, TG_TELEGRAM_PASSWORD.\n"
+    "User-account login: the program prompts for the Telegram code (and\n"
+    "the 2FA password, if enabled) on the terminal. TG_TELEGRAM_CODE\n"
+    "and TG_TELEGRAM_PASSWORD may be set instead for non-interactive use.\n"
     "Secrets in the config file use ${VAR} environment expansion.\n";
 
 extern "C" void HandleSignal(int) {

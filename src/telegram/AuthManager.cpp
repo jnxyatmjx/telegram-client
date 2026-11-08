@@ -5,6 +5,9 @@
 #include <telegram/TelegramClient.h>
 
 #include <cstdlib>
+#include <iostream>
+#include <istream>
+#include <limits>
 #include <utility>
 
 namespace tg::telegram {
@@ -58,13 +61,41 @@ const char* AuthStateName(std::int32_t state_id) {
 
 AuthManager::AuthManager(ITdSender& sender, const app::TelegramConfig& config)
     : sender_(sender), config_(config) {
-  code_provider_ = [] { return EnvInputProvider("TG_TELEGRAM_CODE"); };
-  password_provider_ = [] { return EnvInputProvider("TG_TELEGRAM_PASSWORD"); };
+  // Environment first (scripted / non-interactive use), terminal prompt
+  // second (interactive login, as in td_example.cpp). This makes the first
+  // login a single run: start, read the SMS, type the code at the prompt —
+  // no second run, so the code cannot go stale.
+  code_provider_ = [] {
+    std::string value = EnvInputProvider("TG_TELEGRAM_CODE");
+    if (!value.empty()) return value;
+    return PromptTerminal("Enter authentication code: ", std::cin, false);
+  };
+  password_provider_ = [] {
+    std::string value = EnvInputProvider("TG_TELEGRAM_PASSWORD");
+    if (!value.empty()) return value;
+    return PromptTerminal("Enter authentication password: ", std::cin, true);
+  };
 }
 
 std::string EnvInputProvider(const char* variable) {
   const char* value = std::getenv(variable);
   return value != nullptr ? std::string(value) : std::string{};
+}
+
+std::string PromptTerminal(const char* prompt, std::istream& in,
+                           bool whole_line) {
+  std::cout << prompt << std::flush;
+  std::string value;
+  if (whole_line) {
+    std::getline(in, value);
+  } else {
+    in >> value;
+    // operator>> leaves the trailing newline behind; a later getline (the
+    // 2FA password prompt) would otherwise read that newline as an empty
+    // answer. Consume the rest of the line.
+    in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+  }
+  return value;
 }
 
 void AuthManager::HandleAuthorizationState(
@@ -131,11 +162,15 @@ void AuthManager::SetFailed(const std::string& reason) {
 
 std::string AuthManager::RequestInput(const char* what,
                                       InputProvider& provider) {
+  // Note: a terminal prompt blocks the Receive thread until the user types
+  // (or EOF). TDLib queues further updates meanwhile, and the 300 s auth
+  // timeout in Application still bounds the wait.
   std::string value = provider ? provider() : std::string{};
   if (value.empty()) {
     SetFailed(std::string("Telegram asked for ") + what +
-              " but no provider produced one (set TG_TELEGRAM_CODE / "
-              "TG_TELEGRAM_PASSWORD, or install a custom provider)");
+              " but no input was provided (type it at the terminal prompt, "
+              "or set TG_TELEGRAM_CODE / TG_TELEGRAM_PASSWORD for "
+              "non-interactive use)");
     return {};
   }
   return value;

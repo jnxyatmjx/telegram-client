@@ -9,14 +9,18 @@
 // carries database_encryption_key directly (flat parameter form).
 //
 // Interactive inputs (code, password) come from providers. Defaults read
-// TG_TELEGRAM_CODE / TG_TELEGRAM_PASSWORD from the environment; an empty
-// answer fails the login loudly with a log message instead of hanging.
+// TG_TELEGRAM_CODE / TG_TELEGRAM_PASSWORD from the environment when set, and
+// otherwise prompt on the terminal (td_example.cpp style), so the first
+// login is a single run: start, read the SMS, type the code at the prompt.
+// An empty answer fails the login loudly with a log message instead of
+// hanging.
 
 #include <td/telegram/td_api.h>
 
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <iosfwd>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -78,6 +82,14 @@ class AuthManager {
 
 // Default providers: read from the environment, empty when unset.
 std::string EnvInputProvider(const char* variable);
+
+// Terminal prompt provider, mirroring td_example.cpp: prints `prompt` and
+// reads the answer from `in` (std::cin in production; injectable in tests).
+// `whole_line` false reads one whitespace-delimited token (login code, as in
+// the example); true reads a whole line (2FA password, which may contain
+// spaces). Returns the answer, or empty on EOF / empty input.
+std::string PromptTerminal(const char* prompt, std::istream& in,
+                           bool whole_line);
 
 // Short human name for an AuthorizationState type id (local helper; the
 // generated td_api.h has no to_string(int32)).

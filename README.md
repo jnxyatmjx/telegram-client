@@ -546,11 +546,14 @@ in the certificate.
 A live run needs a real config (see Open items below): Telegram
 api_id/api_hash, the target gRPC server, and the trigger bot's user_id.
 
-First login is a two-step flow: the login code is read from the
-environment (`TG_TELEGRAM_CODE`, and `TG_TELEGRAM_PASSWORD` for 2FA),
-so start once, read the SMS code Telegram sends, then restart with the
-code set — after that the session is stored in `database_directory`
-and later runs log in without a code.
+First login is interactive, as in TDLib's own example
+(`td_example.cpp`): start the program, read the SMS code Telegram
+sends, and type it at the `Enter authentication code:` prompt (then
+the 2FA password at `Enter authentication password:`, if your account
+has one). After that the session is stored in `database_directory`
+and later runs log in without a code. For non-interactive use,
+`TG_TELEGRAM_CODE` and `TG_TELEGRAM_PASSWORD` may be set instead;
+the environment takes precedence over the prompt.
 
 Stop with Ctrl+C (SIGINT) or `kill <pid>` (SIGTERM): the program
 drains in-flight work, finishes the gRPC streams, closes the TDLib

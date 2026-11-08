@@ -29,6 +29,14 @@ void TelegramClient::Start(const app::TelegramConfig& config) {
   // v5: request ids start at 1; 0 is reserved for updates.
   next_request_id_.store(1, std::memory_order_relaxed);
   log_updates_ = config.log_updates;
+  if (log_updates_) {
+    // One line at startup so it is obvious the flag took effect: without
+    // it, "no update lines" is ambiguous between "flag off" and "no
+    // updates arriving".
+    spdlog::info(
+        "telegram: log_updates enabled — every incoming update will be "
+        "logged (type + full content)");
+  }
   receive_thread_ = std::thread([this] { ReceiveLoop(); });
   // Bootstrap: TDLib only creates the Td actor — which emits the initial
   // updateAuthorizationState — on the first send() for a client id.

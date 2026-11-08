@@ -360,6 +360,188 @@ tg-client (1 process)
   join the CQ thread. (4) `TelegramClient::Stop()`: `close()`, wait for
   the Receive thread. (5) Flush the Outbox, join the retry thread, exit.
 
+### Parallel gRPC connections (lanes)
+
+`grpc.connections` (default 1, range 1–16) controls how many parallel
+connections the client opens to the gRPC server. This section explains
+the whole mechanism: what a lane is, why one connection is not enough,
+how traffic is spread, and exactly what breaks — and what recovers —
+when a connection dies.
+
+#### What a lane is
+
+One lane = **one Channel + one ProcessImages stream + one SearchImages
+stream**. A Channel is one TCP/HTTP2 connection to the server target, so
+`grpc.connections: 3` means 3 independent TCP connections, 3
+ProcessImages streams and 3 SearchImages streams:
+
+```
+grpc.connections = 3
+
+lane 0:  Channel ── ProcessImages stream ──┐
+              └─ SearchImages stream ──┤
+lane 1:  Channel ── ProcessImages stream ──┼── gRPC server (one target)
+              └─ SearchImages stream ──┤
+lane 2:  Channel ── ProcessImages stream ──┘
+              └─ SearchImages stream ──┘
+```
+
+Everything is built per lane: `GrpcTransport` creates all N channels
+eagerly at startup (same credentials for every lane — TLS or insecure,
+plus the optional private CA from `grpc.ca_cert`); each lane gets its
+own pair of stubs (`ProcessImagesClient` / `SearchImagesClient`,
+constructed with that lane's channel) and its own pair of
+`AsyncStreamer`s, each with its own CompletionQueue and its own CQ
+thread. `StreamerPool` (one per RPC) owns the N streamers for that RPC.
+Application threads are therefore **7 + 2 × connections**: Main (1) +
+TDLib Receive (1) + Worker Pool (4) + Outbox Retry (1) + 2 CQ threads
+per lane. Each lane also holds 2 stubs and 2 long-lived streams.
+
+#### Why one connection is not enough
+
+A single gRPC Channel is **one** HTTP/2 connection. It multiplexes many
+streams, but they all share one TCP connection: one connection's
+bandwidth, one TCP-level failure domain, and one connection's congestion
+state. Two streams on one channel is normal gRPC, but it is not
+connection-level parallelism — and a dead channel takes all of its
+streams down with it. N lanes means N independent TCP connections: the
+traffic actually spreads across connections, and one dead connection
+only ever costs 1/N of the capacity.
+
+#### How requests are spread
+
+`StreamerPool::Enqueue` deals requests **round-robin** across lanes
+with an atomic counter — one lane per call, no queue-depth or latency
+checks, no least-loaded routing. This is deliberate: the two RPCs have
+very different traffic shapes, and round-robin is the simplest scheme
+that spreads both evenly.
+
+- **ProcessImages** may run for a long time or sit idle for a long
+  time. Its streams are long-lived bidi streams that just stay open
+  while idle; there is no per-message setup cost, so idleness costs
+  nothing.
+- **SearchImages** may spike in short bursts (many searches at once).
+  A burst spreads across lanes, so no single stream or queue absorbs
+  the whole spike.
+
+Replies do not need to come back in lane order, or in send order at
+all: ProcessImages replies are matched by `image_id` (Outbox
+`MarkDone`), SearchImages replies by `(oid, id)` (correlation table
+lookup). Nothing in the pipeline assumes ordering, so dealing requests
+across lanes is safe.
+
+Each streamer has its own **bounded write queue** (`grpc.queue_capacity`,
+default 1000). `Enqueue` waits up to `grpc.enqueue_timeout_ms`
+(default 5 s) for a free slot in the chosen lane's queue, then fails
+and the caller treats it as "try again later" — that is the
+backpressure mechanism (§6). A full queue on one lane does not block
+the other lanes.
+
+A SearchImages burst cannot block ProcessImages: the two RPCs use
+separate streams, separate queues, and separate CQ threads on every
+lane. The only resource they share inside a lane is that lane's TCP
+connection bandwidth.
+
+#### What happens when a connection dies
+
+There are two failure levels, and they behave differently:
+
+**Channel failure (one lane's connection dies).** Both streams on that
+lane break together — they share the TCP connection, so a dead channel
+takes both down at once. The other lanes are completely unaffected and
+keep serving both RPCs. Each broken streamer then reconnects
+**independently**, with its own backoff timer (1 s → 2 s → 4 s … cap
+30 s) and its own attempt counter; one lane's reconnect does not wait
+for or affect the other's.
+
+**Stream failure (one RPC breaks, the connection is fine).** Only that
+one stream on that one lane is affected. The other RPC on the same
+lane keeps running — the two streams are isolated from each other.
+
+**Queued requests on a dead lane.** When a stream fails,
+`AsyncStreamer::FailStream` clears that streamer's queue. What that
+means depends on the RPC:
+
+- **ProcessImages: not lost.** Every request was recorded in the
+  Outbox before it was enqueued. On reconnect, the streamer's
+  `OnReconnected` handler fires `SweepOutbox`, which re-enqueues the
+  unacknowledged records by `image_id`; the server deduplicates on
+  that key (at-least-once delivery). So a dead lane delays ProcessImages
+  traffic, it does not drop it.
+- **SearchImages: lost.** Search requests are never written to the
+  Outbox (by design — search is idempotent/read-only, and the
+  `(oid, id)` correlation lives only in memory). A search that was
+  queued or in flight on a dying lane simply never returns; re-send
+  the command to run it again.
+
+**New requests during an outage.** Round-robin keeps dealing 1/N of
+new requests to the dead lane. They wait in that lane's bounded queue
+until its stream is back up and the queue is pumped — they are delayed,
+not rejected. (If the stream fails again while they are queued, the
+rule above applies: ProcessImages is Outbox-covered, SearchImages is
+lost.)
+
+**Reconnect side effects.** `OnReconnected` fires once per lane, and
+each firing sweeps the Outbox. The sweep is idempotent (it only picks
+up records that are still unacknowledged), so several lanes
+reconnecting at once is harmless — the same record is never sent twice
+in a harmful way, and the server dedupes by `image_id` anyway.
+Permanent gRPC errors (`INVALID_ARGUMENT`, `PERMISSION_DENIED`,
+`UNIMPLEMENTED`, `NOT_FOUND`) are different from a dead connection:
+they dead-letter all pending Outbox records instead of retrying them,
+because retrying cannot help.
+
+#### What this design deliberately does NOT do
+
+- **No per-RPC channel pools.** One lane carries both RPCs; there is
+  no separate `grpc.process_connections` / `grpc.search_connections`.
+  This was a deliberate choice (kept after review on 2026-11-08): the
+  two RPCs share a lane's connection, and lane-level independence
+  (other lanes keep working) is considered enough isolation. Splitting
+  them would double the connection count and the configuration surface
+  for a failure mode that is already contained to one lane.
+- **No load-aware routing.** Distribution is pure round-robin. The
+  pool does not look at queue depth, in-flight counts, or latency, and
+  it does not skip a lane whose stream is down — a request dealt to a
+  down lane waits for that lane to recover (see above).
+- **No dynamic scaling.** Lanes are fixed at startup from
+  `grpc.connections`. `StreamerPool::AddLane` after `Start()` is
+  ignored (with a warning); there is no API to add or remove lanes
+  while running. Restart the client to change the lane count.
+- **One N for both RPCs.** The same lane count applies to
+  ProcessImages and SearchImages; they cannot be tuned independently.
+
+#### Observability and verification
+
+- Startup logs the lane count twice: `grpc: N channel(s) created for
+  <target> (TLS|insecure)` from `GrpcTransport`, and
+  `application: starting — workers=… outbox=… grpc target=… lanes=N`.
+- Every stream is named per lane in the logs (`ProcessImages#0`,
+  `SearchImages#2`), so a failure and its reconnect are attributable:
+  `ProcessImages#0: stream failed: …`, `ProcessImages#0: reconnecting
+  in 2000 ms (attempt 2)`.
+- `tests/test_streamer_pool.cpp` proves the mechanism against an
+  in-process fake server: a 3-lane pool opens exactly one stream per
+  lane (3 connections), 9 requests are dealt 3 per lane, and every
+  reply round-trips by `image_id`.
+
+#### Tuning
+
+- **N = 1** (the default) is enough for low or steady traffic, and it
+  is the previous behavior — upgrading the binary without setting the
+  option changes nothing.
+- **Raise N** when SearchImages bursts or sustained ProcessImages
+  throughput saturate a single connection, or when you want a dead
+  connection to cost less than all of your capacity (a dead lane costs
+  1/N).
+- **Cost per lane:** 2 CQ threads, 2 stubs, 2 long-lived streams, and
+  one more TCP connection the server must accept. The cap of 16 exists
+  because beyond that the extra parallelism buys nothing for
+  thumbnail-sized traffic.
+- To change N: set `grpc.connections: N` in `config.yaml`, rebuild
+  only if the binary predates this feature, and restart — the lane
+  count is read once at startup.
+
 ### Third-party components
 
 All libraries come from Ubuntu 24.04 (`noble`) apt packages, except
@@ -538,6 +720,18 @@ default) means the system default roots. This does not help if the
 server certificate has no SAN matching the target: connecting by IP
 requires an IP SAN for that address, otherwise connect by the DNS name
 in the certificate.
+
+### Parallel connections (grpc.connections)
+
+`grpc.connections: N` (default 1, range 1–16) opens N parallel gRPC
+connections ("lanes") to the server instead of one; each lane is one
+Channel (one TCP connection) with its own ProcessImages + SearchImages
+stream, and requests are dealt round-robin across lanes. Set it when
+SearchImages bursts or sustained ProcessImages throughput saturate a
+single connection, or when you want one dead connection to cost only
+1/N of capacity. The full mechanism — what a lane is, how traffic is
+spread, and exactly what breaks and recovers when a connection dies —
+is documented under Architecture → "Parallel gRPC connections (lanes)".
 
 ## Run
 

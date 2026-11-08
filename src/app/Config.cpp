@@ -265,6 +265,7 @@ Config Config::FromFile(const std::string& path) {
     cfg.grpc.target = Str(*g, "target", cfg.grpc.target);
     cfg.grpc.tls = Bool(*g, "tls", cfg.grpc.tls);
     cfg.grpc.token = Str(*g, "token", {});
+    cfg.grpc.ca_cert_path = Str(*g, "ca_cert", {});
     cfg.grpc.ack_timeout_ms = Int(*g, "ack_timeout_ms", cfg.grpc.ack_timeout_ms);
     cfg.grpc.reconnect_backoff_ms =
         Int(*g, "reconnect_backoff_ms", cfg.grpc.reconnect_backoff_ms);

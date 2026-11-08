@@ -17,6 +17,7 @@ grpc:
   target: "dns:///media.example.com:443"   # real server address pending (user)
   tls: true
   token: "${GRPC_TOKEN}"
+  ca_cert: ""   # optional: PEM file with the CA that signed the server cert (private/self-signed CA); empty = system default roots
   # Bidi streams have no per-message deadline; ack timeout is used instead.
   ack_timeout_ms: 30000
   reconnect_backoff_ms: 1000   # 1s -> 2s -> 4s ... capped at 30s

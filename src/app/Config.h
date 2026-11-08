@@ -32,6 +32,9 @@ struct GrpcConfig {
   std::string target;
   bool tls = true;
   std::string token;
+  // Optional PEM file with the CA(s) that signed the server certificate
+  // (private/self-signed CA). Empty = system default roots.
+  std::string ca_cert_path;
   std::int64_t ack_timeout_ms = 30'000;          // app-level ack timeout
   std::int64_t reconnect_backoff_ms = 1'000;     // 1s -> 2s -> ... capped
   std::int64_t max_reconnect_backoff_ms = 30'000;

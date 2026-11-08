@@ -519,6 +519,18 @@ unauthenticated clients (`UNAUTHENTICATED` / `PERMISSION_DENIED`).
 - If the server requires no authentication, leave the token empty and
   the client sends no such metadata.
 
+### Private CA (grpc.ca_cert)
+
+If the gRPC server uses a private or self-signed CA, set `grpc.ca_cert`
+to the PEM file containing that CA, e.g.
+`ca_cert: "/home/hkm/ca.crt"`. The file is read at startup and passed
+to gRPC as the root certs; an unreadable file fails startup loudly
+instead of failing later with a certificate verify error. Empty (the
+default) means the system default roots. This does not help if the
+server certificate has no SAN matching the target: connecting by IP
+requires an IP SAN for that address, otherwise connect by the DNS name
+in the certificate.
+
 ## Run
 
 ```bash

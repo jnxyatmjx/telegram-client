@@ -22,6 +22,7 @@ grpc:
   target: "dns:///media.example.com:443"
   tls: false
   token: ${TG_TEST_TOKEN}
+  ca_cert: /etc/ssl/tg-ca.crt
   ack_timeout_ms: 45000
   queue_capacity: 50
 
@@ -105,6 +106,7 @@ TEST_F(ConfigFileTest, FromFileMapsEverything) {
   EXPECT_EQ(config.grpc.target, "dns:///media.example.com:443");
   EXPECT_FALSE(config.grpc.tls);
   EXPECT_EQ(config.grpc.token, "grpc-token");
+  EXPECT_EQ(config.grpc.ca_cert_path, "/etc/ssl/tg-ca.crt");
   EXPECT_EQ(config.grpc.ack_timeout_ms, 45000);
   EXPECT_EQ(config.grpc.queue_capacity, 50);
   EXPECT_FALSE(config.media_thumbnail.enabled);

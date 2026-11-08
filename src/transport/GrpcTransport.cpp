@@ -2,6 +2,10 @@
 
 #include <common/Logger.h>
 
+#include <infra/FileStore.h>
+
+#include <stdexcept>
+
 namespace tg::transport {
 
 GrpcTransport::GrpcTransport(const app::GrpcConfig& config)
@@ -12,9 +16,26 @@ GrpcTransport::GrpcTransport(const app::GrpcConfig& config)
     spdlog::warn("grpc: no target configured — channel will not be created");
     return;
   }
-  std::shared_ptr<grpc::ChannelCredentials> credentials =
-      config_.tls ? grpc::SslCredentials(grpc::SslCredentialsOptions())
-                  : grpc::InsecureChannelCredentials();
+  std::shared_ptr<grpc::ChannelCredentials> credentials;
+  if (!config_.tls) {
+    credentials = grpc::InsecureChannelCredentials();
+  } else if (!config_.ca_cert_path.empty()) {
+    // Custom CA (e.g. a private/self-signed CA): read the PEM bundle and
+    // hand it to gRPC as the root certs. An unreadable file fails loudly
+    // here at startup instead of surfacing as a confusing verify error on
+    // the first connect.
+    auto pem = infra::ReadFileBytes(config_.ca_cert_path, 1 << 20);
+    if (!pem) {
+      throw std::runtime_error("grpc: cannot read CA cert file " +
+                               config_.ca_cert_path);
+    }
+    grpc::SslCredentialsOptions options;
+    options.pem_root_certs = *pem;
+    credentials = grpc::SslCredentials(options);
+    spdlog::info("grpc: using custom CA certs from {}", config_.ca_cert_path);
+  } else {
+    credentials = grpc::SslCredentials(grpc::SslCredentialsOptions());
+  }
   channel_ = grpc::CreateChannel(config_.target, credentials);
   spdlog::info("grpc: channel created for {} ({})", config_.target,
                config_.tls ? "TLS" : "insecure");

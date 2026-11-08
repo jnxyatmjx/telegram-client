@@ -398,7 +398,11 @@ of libraries.
 - `telegram/TelegramClient` — Owns the `td::ClientManager` and the
   single client id. Runs the Receive thread, the only caller of
   `receive()`. `Send()` is callable from any thread and routes each
-  response to its waiting future by `request_id`.
+  response to its waiting future by `request_id`. `Start()` sends a
+  bootstrap `getOption("version")` request: TDLib only creates the Td
+  actor (which emits the initial `updateAuthorizationState`) on the
+  first `send()` for a client id, so without it no update ever arrives
+  and login waits forever.
 - `telegram/AuthManager` — The login state machine: `setTdlibParameters`,
   phone code, 2FA password (from env providers), ready/closed states.
 - `telegram/UpdateDispatcher` — Routes each `td_api::Update` to the

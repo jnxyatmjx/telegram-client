@@ -12,7 +12,8 @@ set(TG_TEST_SOURCES
   test_auto_search.cpp
   test_handler_registry.cpp
   test_async_streamer.cpp
-  test_e2e_fake_server.cpp)
+  test_e2e_fake_server.cpp
+  test_tdlib_bootstrap.cpp)
 
 foreach(src IN LISTS TG_TEST_SOURCES)
   get_filename_component(test_name "${src}" NAME_WE)
@@ -26,3 +27,6 @@ endforeach()
 set_property(TEST test_async_streamer PROPERTY TIMEOUT 120)
 # The e2e test opens real sockets (fake server + two streams).
 set_property(TEST test_e2e_fake_server PROPERTY TIMEOUT 120)
+# The bootstrap test creates a real TDLib client and waits for its first
+# authorization-state update (no network, no real credentials).
+set_property(TEST test_tdlib_bootstrap PROPERTY TIMEOUT 60)

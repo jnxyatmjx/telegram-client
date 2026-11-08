@@ -29,6 +29,16 @@ void TelegramClient::Start(const app::TelegramConfig& config) {
   // v5: request ids start at 1; 0 is reserved for updates.
   next_request_id_.store(1, std::memory_order_relaxed);
   receive_thread_ = std::thread([this] { ReceiveLoop(); });
+  // Bootstrap: TDLib only creates the Td actor — which emits the initial
+  // updateAuthorizationState — on the first send() for a client id.
+  // create_client_id() alone only reserves the id, so a client that never
+  // sends a request receives no update at all and authorization waits
+  // forever (live bug, 2026-11-08: state stayed "unknown" for the full
+  // 300 s auth timeout). The official example does the same
+  // (td_example.cpp: getOption("version")). The response is ignored; the
+  // request exists only to force actor creation.
+  Send(td_api::make_object<td_api::getOption>("version"),
+       [](td::ClientManager::Response&&) {});
   spdlog::info("telegram: client {} started", static_cast<int>(client_id_));
 }
 

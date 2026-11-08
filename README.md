@@ -410,6 +410,40 @@ values. Secrets (`TG_API_HASH`, `TG_TDLIB_ENCRYPTION_KEY`, `GRPC_TOKEN`,
 phone) come from environment variables — never hardcoded, never committed
 (`.gitignore` excludes `config/config.yaml`).
 
+### Secrets — what each one does
+
+**`telegram.encryption_key` (`TG_TDLIB_ENCRYPTION_KEY`) — a lock on the
+local database.** TDLib keeps a local database on disk
+(`database_directory`: chats, messages, contacts cache). This key
+encrypts that database at rest: TDLib decrypts it on start and encrypts
+it on exit. In code it is passed to `setTdlibParameters` as
+`database_encryption_key` (`src/telegram/AuthManager.cpp`).
+
+- It is **not** the Telegram account password, **not** `api_hash`, and
+  it plays no role in encrypting network traffic (MTProto has its own
+  encryption).
+- Its job is at-rest protection: if someone copies the database files,
+  they cannot read the contents without this key.
+- If the key is changed or lost, the existing local database cannot be
+  opened; TDLib has to rebuild it and re-sync state. Treat it as a
+  secret on the same level as `api_id` / `api_hash`.
+
+**`grpc.token` (`GRPC_TOKEN`) — an access card for the gRPC server.**
+This is the credential the client shows the server to prove it is
+allowed to use the `ImageProcessor` service. When a stream is created
+(`GrpcTransport::MakeContext`), a non-empty token is attached to the
+`ClientContext` as one metadata entry:
+`authorization: Bearer <token>`. The server validates it and rejects
+unauthenticated clients (`UNAUTHENTICATED` / `PERMISSION_DENIED`).
+
+- It is a different layer from TLS: `tls: true` encrypts the transport
+  (prevents eavesdropping); the token authenticates identity (prevents
+  unauthorized use). TLS alone lets anyone who connects call the
+  service; a token alone without TLS travels in cleartext and can be
+  intercepted.
+- If the server requires no authentication, leave the token empty and
+  the client sends no such metadata.
+
 ## Run
 
 ```bash

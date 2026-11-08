@@ -172,6 +172,217 @@ cmake --build build --target tdclient -j1
   它从没编过，会显示 Not Run。测试一律在 `build/tests/` 里跑
   （见 Test 一节）。
 
+## Architecture
+
+Design doc: `~/workspace/tdlib-grpc-architecture.md` (v5, settled 2026-11-07).
+This section is the short version for the README; the design doc is
+authoritative when the two disagree.
+
+### Design
+
+- **One client core, features on top.** The program is a Telegram client
+  first and a media pipeline second. Sending image/video thumbnails over
+  gRPC is only the first feature; more features attach the same way.
+  Language is C++ only, no Python.
+- **Layers.** `app` assembles and owns the lifecycle. `telegram` owns the
+  TDLib client, auth state machine, update dispatch and file downloads.
+  `features` holds one directory per feature, each an `IUpdateHandler`
+  registered in the dispatcher. `transport` owns the gRPC channel, the
+  async streamers and the stub clients. `infra` owns persistence
+  (SQLite Outbox) and file helpers. `common` owns logging and idempotency.
+  The core knows nothing about features; features get shared services
+  through `AppContext` (see Modules).
+- **In-process handoff, no JSON, no network, no queue.** Receive thread
+  gets `updateNewMessage` and dispatches only. A worker thread extracts
+  the media, calls `downloadFile`, waits for `updateFile`, reads the
+  thumbnail bytes from `local.path`, builds an `ImageRequest` and pushes
+  it to the streamer's bounded write queue. The CompletionQueue thread
+  writes it to the server. The SQLite Outbox is retry-only, not the
+  main path.
+- **At-least-once delivery, server dedup.** Every `ImageRequest` carries
+  `image_id = "<chat_id>:<message_id>:<file_unique_id>"` as the
+  idempotency key. On reconnect the Outbox replays unacked records by
+  `image_id` and the server deduplicates on that key.
+- **Triggers.** Nothing is sent automatically on receiving an image.
+  `ProcessImages` and `SearchImages` fire only on a command from a
+  specified bot in Telegram (mode (a): the bot itself is the sender,
+  verified by `sender_user_id == command_bot_user_id`). Phase 2 adds
+  auto-search: a user posting an image in a specified channel/group
+  triggers `SearchImages` only, never `ProcessImages`; disabled by
+  default.
+- **Proto.** `proto/image_stream.proto` is used verbatim (no package,
+  both RPCs bidirectional streaming). `memo` is caption only, no JSON.
+  `SearchReq` uses uint32 bare MTProto IDs, not TDLib dialog IDs: the
+  client converts (`channel: -chat_id - 1e12`, `basic group: -chat_id`,
+  `user: chat_id`) and range-checks to `0..4294967295`; out of range is
+  a loud error and the request is not sent, never silently truncated.
+  `SearchReq` is not replayed from the Outbox because its correlation
+  table `(oid, id) -> message` lives only in memory.
+- **Failure handling.** `downloadFile` timeout/failure retries 3 times
+  with backoff, then dead-letter. A full write queue blocks the worker
+  with a timeout and leaves the record PENDING for the retry thread.
+  A broken gRPC stream reconnects with backoff (1s → 2s → 4s … cap 30s)
+  and replays unacked Outbox records. `INVALID_ARGUMENT` /
+  `PERMISSION_DENIED` from the server dead-letters immediately without
+  retry.
+
+### Process and thread model
+
+- **One process, one binary `tg-client`, one TDLib client.** No separate
+  TDLib process, no IPC, no shared memory, no local socket, no broker
+  between TDLib and gRPC. They share C++ objects and thread-safe queues
+  in the same process.
+
+```
+tg-client (1 process)
+  Main thread (1)
+  TDLib Receive thread (1)
+  Worker Pool (4)
+  ProcessImages CQ thread (1)
+  SearchImages CQ thread (1)
+  Outbox Retry thread (1)
+  TDLib internal threads (N, owned by TDLib)
+```
+
+| Thread | Count | Does | Must never do |
+|---|---|---|---|
+| Main | 1 | Parse config, assemble `Application`, start threads, wait for SIGINT/SIGTERM, stop threads in order, join | Call `ClientManager::receive()`, call gRPC `Write` |
+| TDLib Receive | 1 | The only caller of `ClientManager::receive(10.0)`; routes responses to waiting futures by `request_id`, hands updates (`request_id == 0`) to `UpdateDispatcher` | Download, read disk, call gRPC, block for more than a few ms |
+| Worker Pool | 4 | Handler execution: pick tier, wait on download future, read file, hash, build `ImageRequest`, write Outbox, enqueue to streamer | Call `receive()`; call gRPC `Write`/`Read` directly (only `Enqueue`) |
+| ProcessImages CQ | 1 | Owns the `ProcessImages` CompletionQueue and `ClientAsyncReaderWriter`; loops `cq.Next()`, handles Write done, Read replies, Finish, reconnect | Call TDLib `send`/`receive` (use thread-safe `TelegramClient::Send`) |
+| SearchImages CQ | 1 | Same as above, for the `SearchImages` stream, its own CQ and stub | Same; the two streams are isolated, one breaking does not affect the other |
+| Outbox Retry | 1 | Every 10 s, re-enqueues PENDING/FAILED Outbox records whose retry time has come | Call gRPC `Write` directly (only `Enqueue`) |
+| TDLib internal | N | Actors, network, crypto, local database, created by TDLib | Not created, joined or driven by us |
+
+- **Async gRPC state machine (one per stream).**
+  `CREATE` (PrepareAsync + StartCall) → `CONNECTING`/`RUNNING`
+  (issue a Read immediately; Write when the queue is non-empty and no
+  Write is in flight) → `WRITE_DONE` (next Write) / `READ_DONE`
+  (handle the reply by `image_id`/`(oid, id)`, issue the next Read) →
+  `FINISH` (server closed the stream, error, or shutdown) →
+  `RECONNECT` (backoff 1s → 2s → 4s … cap 30s, then CREATE again).
+  Each stream gets a fresh `ClientContext` with auth metadata attached
+  once per stream, never per message. There is no per-message deadline;
+  the app-level ack timeout (30 s per `image_id`) decides replays.
+- **Synchronization.** `receive()` needs no lock because only one thread
+  calls it. `send()` is thread-safe in TDLib; `request_id` comes from an
+  atomic counter starting at 1. The `FileDownloader` map is guarded by
+  one mutex. Each streamer write queue is one mutex + condition
+  variable; only the CQ thread calls `Write`/`Read`/`Finish`, and only
+  one Write is in flight per stream. The Outbox uses one SQLite
+  connection in WAL mode behind one mutex. The search correlation table
+  is guarded by one mutex.
+- **Teardown contract.** `Finish()` must be the last operation on a
+  stream, and the stream object may only be destroyed once its Finish
+  tag has been delivered. `AsyncStreamer::Stop()` therefore lets the CQ
+  thread drain the stream (cancel → WritesDone → Finish → OnFinish)
+  and joins it before shutting the CQ down. Shutting the CQ down first
+  strands the stream with an outstanding Read and the server hangs in
+  `Read()` forever.
+- **Shutdown order.** (1) Stop dispatching new updates. (2) Drain the
+  worker pool with a timeout; unfinished work stays in the Outbox.
+  (3) Both streamers: `WritesDone()`, wait for `Finish()`, shut the CQ,
+  join the CQ thread. (4) `TelegramClient::Stop()`: `close()`, wait for
+  the Receive thread. (5) Flush the Outbox, join the retry thread, exit.
+
+### Third-party components
+
+All libraries come from Ubuntu 24.04 (`noble`) apt packages, except
+TDLib itself, which is a shallow git clone. No vcpkg, no source builds
+of libraries.
+
+| Component | Version | Purpose | How it enters the build |
+|---|---|---|---|
+| TDLib | commit `4c6377a` (shallow clone) | Telegram client core: MTProto, auth, updates, file download | `git clone --depth 1 https://github.com/tdlib/td third_party/td`, `add_subdirectory`, link only `Td::TdStatic` (never `Td::TdJson`) |
+| gRPC | 1.51.1 (`libgrpc++-dev`) | Fully-async C++ gRPC: `CompletionQueue`, bidirectional streams | apt, `find_package(gRPC CONFIG)` |
+| Protocol Buffers | 3.21.12 (`protobuf-compiler`) | `image_stream.proto` code generation (`--cpp_out`, `--grpc_out`) | apt, `find_package(Protobuf)` in module mode (no `protobuf-config.cmake` in 3.21) |
+| spdlog | 1.12.0 (`libspdlog-dev`) | Logging | apt |
+| SQLite3 | 3.45.1 (`libsqlite3-dev`) | Outbox persistence, WAL mode | apt |
+| GoogleTest | 1.14.0 (`libgtest-dev`) | Unit and end-to-end tests | apt, `find_package(GTest CONFIG)` |
+| OpenSSL | 3.0.13 (`libssl-dev`) | TLS for gRPC, crypto for TDLib | apt |
+| zlib | 1.3 (`zlib1g-dev`) | Compression for TDLib/gRPC | apt |
+| gperf | 3.1 | TDLib TL code generation | apt |
+| php-cli | 8.3 | TDLib `SplitSource.php` build step | apt |
+| ccache | 4.9.1 | Compile cache for incremental builds | apt, enabled by `TG_ENABLE_CCACHE` |
+| CMake | 3.28.3 | Build system, presets | apt |
+| build-essential, git, pkg-config | — | Compiler toolchain, source checkout, `pkg-config` lookups | apt |
+
+### Modules
+
+- `app/Application` — Assembles everything and owns the lifecycle.
+  Wires the streamer callbacks: `ImageReply` → Outbox `MarkDone` by
+  `image_id`; `SearchRsp` → correlation-table lookup; stream
+  (re)connected → Outbox sweep (replay unacked records). Owns the
+  shutdown order.
+- `app/Config` — Loads `config.yaml`, expands `${ENV}` placeholders.
+  Secrets (`api_id`/`api_hash`, TDLib encryption key, gRPC token, phone)
+  come only from the environment, never from code or git.
+- `app/AppContext` — The shared-services object passed to every handler:
+  `telegram`, `files`, `process_images`, `search_images`, `outbox`,
+  `config`. Owned by `Application`, outlives all workers.
+- `telegram/TelegramClient` — Owns the `td::ClientManager` and the
+  single client id. Runs the Receive thread, the only caller of
+  `receive()`. `Send()` is callable from any thread and routes each
+  response to its waiting future by `request_id`.
+- `telegram/AuthManager` — The login state machine: `setTdlibParameters`,
+  phone code, 2FA password (from env providers), ready/closed states.
+- `telegram/UpdateDispatcher` — Routes each `td_api::Update` to the
+  registered `IUpdateHandler`s by `CanHandle()`; each handler runs on a
+  worker thread.
+- `telegram/FileDownloader` — `Download(file_id)` returns a future that
+  resolves with the local path. It sends `downloadFile` (synchronous)
+  and completes on the response or on the matching `updateFile` when
+  `local.is_downloading_completed` is set. The caller enforces the 30 s
+  timeout.
+- `features/bot_command/BotCommandHandler` + `CommandParser` — Mode (a)
+  trigger. Verifies the sender is the configured bot
+  (`sender_user_id == command_bot_user_id`), parses the command and its
+  target (reply-to or `chat_id message_id` arguments), resolves the
+  target message with `getMessage`, then dispatches `/process` →
+  `ProcessImages` or `/search` → `SearchImages`. Command names are
+  placeholders until the user confirms the real ones.
+- `features/auto_search/AutoSearchHandler` — Phase 2, disabled by
+  default. Fires when a user posts an image/video in an allowlisted
+  chat (`auto_search.chats`); verifies only `chat_id`, not the sender
+  (channel posts may have no sender). Produces `SearchImages` only,
+  never `ProcessImages`. Dedups by `(oid, id)` with a 10-minute TTL.
+- `features/media_thumbnail/MediaExtractor` — Pure tier selection.
+  Photo: the largest size whose max edge is ≤ `max_edge_px` (320), else
+  the smallest size. Video/animation: the thumbnail only, never the
+  original file.
+- `features/media_thumbnail/MediaThumbnailHandler` — The `/process`
+  chain: extract → download → read bytes → SHA-256 (log only) → build
+  `ImageRequest` (`image_id`, thumbnail bytes, memo = caption,
+  `owner_id` = `chat_id`) → Outbox PENDING → enqueue to the
+  ProcessImages stream. Enqueue failure leaves the record PENDING for
+  the retry thread.
+- `features/media_thumbnail/SearchHandler` — The `/search` chain. Same
+  extraction/download path, but builds a `SearchReq` with the bare-ID
+  conversion and range checks, registers `(oid, id)` in the correlation
+  table, and enqueues to the SearchImages stream. Never writes to the
+  Outbox.
+- `transport/GrpcTransport` — One shared `grpc::Channel` for both
+  streams (never one channel per stream). TLS or insecure from config.
+  `MakeContext()` returns a fresh `ClientContext` with auth metadata
+  already applied.
+- `transport/AsyncStreamer` — Template for one fully-async bidi stream:
+  its own CompletionQueue and CQ thread, a bounded write queue, reconnect
+  with backoff, and the teardown contract above. Only the CQ thread
+  calls `Write`/`Read`/`Finish`; workers only `Enqueue`.
+- `transport/ProcessImagesClient`, `transport/SearchImagesClient` —
+  Thin owners of the `ImageProcessor::Stub` halves. Each produces the
+  `StartFn` (`PrepareAsync*`) its streamer uses. Reply handling lives
+  in `Application`, not here.
+- `infra/Outbox` — SQLite persistence in WAL mode: `Put`, `Get`,
+  `MarkDone`, `MarkDeadLetter`, `DueForRetry`. One connection behind
+  one mutex, shared by workers and the retry thread.
+- `infra/Sha256`, `infra/FileStore` — SHA-256 hex (log only) and
+  `ReadFileBytes` with a max-bytes cap.
+- `common/Idempotency` — `MakeImageId` (`<chat_id>:<message_id>:<file_unique_id>`)
+  and the bare-ID conversions `ToBareChatId` / `ToBareMessageId` with
+  range checks that fail loudly instead of truncating.
+- `common/Logger` — spdlog setup (level from config).
+
 ## gRPC code generation
 
 Integrated into the CMake build: `protoc --cpp_out` + `--grpc_out

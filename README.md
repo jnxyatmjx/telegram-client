@@ -85,6 +85,42 @@ lines. If a line still says `not found`, the package providing that
 `.so` is missing — look it up with `apt-file search <name>` or
 `dpkg -S <name>` on a machine that has it.
 
+#### Debian 13 (trixie) — runtime
+
+Same command shape, different spdlog generation (trixie ships spdlog
+1.15 and Abseil 20240722):
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  libgrpc++1.51t64 libprotobuf32t64 libspdlog1.15 \
+  libsqlite3-0 libssl3t64 zlib1g
+```
+
+`libgrpc++1.51t64` again pulls the Abseil set automatically
+(`libabsl20240722` on trixie); `libspdlog1.15` pulls `libfmt10`.
+
+> **Warning: this does NOT make the Ubuntu 24.04-built binary run on
+> Debian 13.** The loader needs exact SONAMEs, and two libraries
+> changed SONAME between the two distros:
+>
+> | library | Ubuntu 24.04 binary needs | Debian 13 provides |
+> |---|---|---|
+> | Abseil | `libabsl_*.so.20220623` | `libabsl_*.so.20240722` |
+> | spdlog | `libspdlog.so.1.12` (+ `libfmt.so.9`) | `libspdlog.so.1.15` (+ `libfmt.so.10`) |
+>
+> Everything else matches (gRPC 1.51.1, protobuf 3.21.12, OpenSSL 3,
+> SQLite 3, zlib), but those two mismatches are enough: on Debian 13
+> `ldd` will report the absl/spdlog lines as `not found` and the
+> binary will not start. To run on Debian 13, either:
+>
+> - **Rebuild on Debian 13** — the build-dependency command above
+>   works unchanged there (same `-dev` package names), and the
+>   resulting binary links against trixie's libraries; or
+> - **Bundle the Ubuntu `.so` files** next to the binary with
+>   `rpath=$ORIGIN` (the 41 absl libs, `libspdlog.so.1.12`,
+>   `libfmt.so.9`); or
+> - **Run the Ubuntu 24.04 Docker image** (see `Dockerfile`).
+
 ## Build
 
 构建目录是 `build/`，类型为 Release。日常开发只有两步：配置一次，之后改代码

@@ -20,6 +20,8 @@ api_id/api_hash、触发 bot 的 user_id 和命令名（见 Open items）。
 
 ## Dependencies (apt, Ubuntu 24.04 — no vcpkg, no source builds)
 
+### Build dependencies (compiling from source)
+
 ```bash
 apt-get update && apt-get install -y \
   build-essential cmake git gperf php-cli ccache pkg-config \
@@ -40,11 +42,48 @@ still found via `find_package(gRPC CONFIG)`. gRPC/protobuf come from
 apt (deviation from v5 §3.7's `vcpkg.json`: apt prebuilt packages were chosen
 per the task instructions; source builds are far too slow on this host).
 
-TDLib: shallow clone, not a submodule (this project has no git repo yet):
+TDLib: shallow clone, not a submodule:
 
 ```bash
 git clone --depth 1 https://github.com/tdlib/td third_party/td
 ```
+
+### Runtime dependencies (running the built binary on another machine)
+
+Only needed on a machine that runs the prebuilt `tg-client` without
+compiling it — no compiler, no CMake, no `-dev` packages. Ubuntu 24.04:
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  libgrpc++1.51t64 libprotobuf32t64 libspdlog1.12 \
+  libsqlite3-0 libssl3t64 zlib1g
+```
+
+What each package provides, and what comes along automatically:
+
+- `libgrpc++1.51t64` — `libgrpc++.so.1.51` and `libgrpc.so.29`. Also
+  pulls in `libgrpc29t64`, `libprotobuf32t64`, and the whole Abseil set
+  (`libabsl20220623t64`: all 41 `libabsl_*.so.20220623` files, including
+  `libabsl_synchronization`), plus `libcares2` and `libre2-10`.
+- `libprotobuf32t64` — `libprotobuf.so.32` (also a dependency of
+  `libgrpc++1.51t64`; listed here so the intent is explicit).
+- `libspdlog1.12` — `libspdlog.so.1.12`; also pulls in `libfmt9`
+  (`libfmt.so.9`).
+- `libsqlite3-0` — `libsqlite3.so.0`.
+- `libssl3t64` — `libssl.so.3`.
+- `zlib1g` — `libz.so.1`.
+- `libc6`, `libgcc-s1`, `libstdc++6` — the C/C++ runtime every Ubuntu
+  install already has; nothing to install.
+
+Watch out for the `t64` suffix: Ubuntu 24.04 renamed these libraries
+in the 64-bit `time_t` transition, so the plain names (`libgrpc++1`,
+`libprotobuf32`, `libssl3`) **do not exist** on 24.04 — `apt` answers
+`Unable to locate package`. Use the `t64` names above.
+
+Verify after installing: `ldd ./tg-client` must show no `not found`
+lines. If a line still says `not found`, the package providing that
+`.so` is missing — look it up with `apt-file search <name>` or
+`dpkg -S <name>` on a machine that has it.
 
 ## Build
 

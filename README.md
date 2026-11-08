@@ -555,6 +555,12 @@ and later runs log in without a code. For non-interactive use,
 `TG_TELEGRAM_CODE` and `TG_TELEGRAM_PASSWORD` may be set instead;
 the environment takes precedence over the prompt.
 
+To see everything Telegram sends, set `telegram.log_updates: true`
+in the config: every incoming TDLib update is then logged at info
+level as `telegram: update <type> {<fields>}` — update type and full
+content. It is very verbose (Telegram sends a firehose, especially
+on startup), so it defaults to off.
+
 Stop with Ctrl+C (SIGINT) or `kill <pid>` (SIGTERM): the program
 drains in-flight work, finishes the gRPC streams, closes the TDLib
 session and exits after printing `application: stopped cleanly`.

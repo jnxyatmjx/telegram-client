@@ -113,6 +113,10 @@ class TelegramClient : public ITdSender {
   td::ClientManager manager_;
   td::ClientManager::ClientId client_id_{0};
 
+  // Set from config in Start(). When true, every incoming update is logged
+  // (type + full content) before routing.
+  bool log_updates_{false};
+
   std::atomic<std::uint64_t> next_request_id_{1};
   std::mutex callbacks_mutex_;
   std::unordered_map<std::uint64_t, ResponseCallback> callbacks_;

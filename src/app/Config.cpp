@@ -259,6 +259,7 @@ Config Config::FromFile(const std::string& path) {
     cfg.telegram.database_directory = Str(*t, "database_directory", {});
     cfg.telegram.files_directory = Str(*t, "files_directory", {});
     cfg.telegram.encryption_key = Str(*t, "encryption_key", {});
+    cfg.telegram.log_updates = Bool(*t, "log_updates", false);
   }
 
   if (const YamlNode* g = root.Find("grpc")) {

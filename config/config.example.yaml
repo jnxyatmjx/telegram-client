@@ -12,6 +12,7 @@ telegram:
   database_directory: "/data/tdlib/db"    # chmod 700; TDLib database is encrypted
   files_directory: "/data/tdlib/files"
   encryption_key: "${TG_TDLIB_ENCRYPTION_KEY}"
+  log_updates: false   # true: log every incoming Telegram update (type + full content) at info level — very verbose
 
 grpc:
   target: "dns:///media.example.com:443"   # real server address pending (user)

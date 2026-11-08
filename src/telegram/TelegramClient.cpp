@@ -28,6 +28,7 @@ void TelegramClient::Start(const app::TelegramConfig& config) {
   client_id_ = manager_.create_client_id();
   // v5: request ids start at 1; 0 is reserved for updates.
   next_request_id_.store(1, std::memory_order_relaxed);
+  log_updates_ = config.log_updates;
   receive_thread_ = std::thread([this] { ReceiveLoop(); });
   // Bootstrap: TDLib only creates the Td actor — which emits the initial
   // updateAuthorizationState — on the first send() for a client id.
@@ -105,6 +106,19 @@ void TelegramClient::ReceiveLoop() {
 }
 
 void TelegramClient::HandleUpdate(td_api::object_ptr<td_api::Update>&& update) {
+  if (log_updates_) {
+    // td_api::to_string renders "updateNewMessage {...}": the type name
+    // first, then every field — i.e. both the update type and its content.
+    // Cap the line so one giant update (e.g. a max-length message) does
+    // not flood the log with tens of kilobytes.
+    std::string text = td_api::to_string(update);
+    constexpr std::size_t kMaxUpdateLogChars = 16384;
+    if (text.size() > kMaxUpdateLogChars) {
+      text.resize(kMaxUpdateLogChars);
+      text += "...[truncated]";
+    }
+    spdlog::info("telegram: update {}", text);
+  }
   switch (update->get_id()) {
     case td_api::updateAuthorizationState::ID: {
       auto auth_update =

@@ -17,6 +17,7 @@ telegram:
   database_directory: /data/tdlib/db
   files_directory: /data/tdlib/files
   encryption_key: ${TG_TEST_KEY}
+  log_updates: true
 
 grpc:
   target: "dns:///media.example.com:443"
@@ -103,6 +104,7 @@ TEST_F(ConfigFileTest, FromFileMapsEverything) {
   EXPECT_EQ(config.telegram.api_id, 123456);
   EXPECT_EQ(config.telegram.api_hash, "abc-hash");
   EXPECT_EQ(config.telegram.encryption_key, "secret-key");
+  EXPECT_TRUE(config.telegram.log_updates);
   EXPECT_EQ(config.grpc.target, "dns:///media.example.com:443");
   EXPECT_FALSE(config.grpc.tls);
   EXPECT_EQ(config.grpc.token, "grpc-token");

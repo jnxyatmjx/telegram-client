@@ -26,6 +26,10 @@ struct TelegramConfig {
   std::string database_directory;
   std::string files_directory;
   std::string encryption_key;
+  // Log every incoming TDLib update (type + full content) at info level.
+  // Very verbose (Telegram sends a firehose, especially on startup);
+  // off by default.
+  bool log_updates = false;
 };
 
 struct GrpcConfig {

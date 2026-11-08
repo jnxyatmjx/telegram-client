@@ -1,0 +1,262 @@
+#include "app/Application.h"
+
+#include <common/Logger.h>
+#include <telegram/AuthManager.h>
+
+#include <csignal>
+#include <chrono>
+#include <stdexcept>
+#include <utility>
+
+namespace tg::app {
+namespace td_api = td::td_api;  // shorthand for td::td_api::*
+namespace {
+
+using features::media_thumbnail::MediaExtractor;
+using features::media_thumbnail::MediaThumbnailHandler;
+using features::media_thumbnail::SearchHandler;
+
+constexpr auto kWorkerDrainTimeout = std::chrono::seconds(10);  // v5 §3.6
+constexpr auto kAuthReadyTimeout = std::chrono::seconds(300);
+constexpr auto kSignalPollInterval = std::chrono::milliseconds(200);
+constexpr std::size_t kSweepBatch = 100;
+
+// Permanent failures: retrying cannot help (v5 §2.5).
+bool IsPermanentGrpcError(const grpc::StatusCode code) {
+  switch (code) {
+    case grpc::StatusCode::INVALID_ARGUMENT:
+    case grpc::StatusCode::PERMISSION_DENIED:
+    case grpc::StatusCode::UNIMPLEMENTED:
+    case grpc::StatusCode::NOT_FOUND:
+      return true;
+    default:
+      return false;
+  }
+}
+
+std::int64_t NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+}  // namespace
+
+namespace {
+std::atomic<bool> g_global_stop{false};
+}  // namespace
+
+void RequestGlobalShutdown() {
+  g_global_stop.store(true, std::memory_order_relaxed);
+}
+
+Application::Application(Config config)
+    : config_(std::move(config)),
+      outbox_(config_.outbox.db_path),
+      workers_(std::make_shared<WorkerPool>(
+          static_cast<std::size_t>(config_.worker_count),
+          10'000,  // handler queue capacity
+          std::chrono::milliseconds(1'000))),
+      files_(telegram_),
+      transport_(config_.grpc),
+      process_client_(transport_),
+      search_client_(transport_),
+      process_streamer_([&] {
+        transport::AsyncStreamer<ImageRequest, ImageReply>::Options options;
+        options.name = "ProcessImages";
+        options.start_fn = process_client_.start_fn();
+        options.make_context = [this] { return transport_.MakeContext(); };
+        options.initial_backoff_ms = config_.grpc.reconnect_backoff_ms;
+        options.max_backoff_ms = config_.grpc.max_reconnect_backoff_ms;
+        options.queue_capacity =
+            static_cast<std::size_t>(config_.grpc.queue_capacity);
+        return options;
+      }()),
+      search_streamer_([&] {
+        transport::AsyncStreamer<SearchReq, SearchRsp>::Options options;
+        options.name = "SearchImages";
+        options.start_fn = search_client_.start_fn();
+        options.make_context = [this] { return transport_.MakeContext(); };
+        options.initial_backoff_ms = config_.grpc.reconnect_backoff_ms;
+        options.max_backoff_ms = config_.grpc.max_reconnect_backoff_ms;
+        options.queue_capacity =
+            static_cast<std::size_t>(config_.grpc.queue_capacity);
+        return options;
+      }()),
+      process_handler_(MediaExtractor(config_.media_thumbnail), telegram_,
+                       files_),
+      search_handler_(MediaExtractor(config_.media_thumbnail), telegram_,
+                      files_),
+      bot_command_handler_(config_.bot_command, process_handler_,
+                           search_handler_),
+      auto_search_handler_(std::make_shared<features::auto_search::AutoSearchHandler>(
+          config_.auto_search, search_handler_)),
+      dispatcher_(workers_) {
+  ctx_ = std::make_unique<AppContext>(AppContext{
+      telegram_, files_, process_streamer_, search_streamer_, outbox_,
+      config_});
+  WireHandlers();
+  WireStreamerCallbacks();
+}
+
+Application::~Application() {
+  StopOutboxRetryThread();
+  process_streamer_.Stop();
+  search_streamer_.Stop();
+  telegram_.Stop();
+  workers_->Stop(std::chrono::seconds(0));
+}
+
+void Application::WireHandlers() {
+  dispatcher_.Register(std::shared_ptr<telegram::IUpdateHandler>(
+      &bot_command_handler_, [](telegram::IUpdateHandler*) {}));  // non-owning
+  // Phase-2 trigger; disabled by default -> claims nothing.
+  dispatcher_.Register(auto_search_handler_);
+}
+
+void Application::WireStreamerCallbacks() {
+  // ImageReply -> Outbox DONE (v5 §2.4: log + metrics only, never reply into
+  // Telegram by default).
+  process_streamer_.SetReplyHandler(
+      [this](const ImageReply& reply) {
+        const bool known = outbox_.MarkDone(reply.image_id(), reply.result());
+        if (known) {
+          spdlog::info("process: DONE {} result: {:.200}", reply.image_id(),
+                       reply.result());
+        } else {
+          spdlog::warn("process: reply for unknown image_id {}", reply.image_id());
+        }
+      });
+
+  // SearchRsp -> correlation table lookup (v5 §2.4), log only.
+  search_streamer_.SetReplyHandler(
+      [this](const SearchRsp& reply) {
+        const auto entry = search_handler_.correlation().Lookup(
+            reply.oid(), reply.id());
+        if (entry.has_value()) {
+          spdlog::info("search: rsp for {} (oid={}, id={}) result: {:.200}",
+                       entry->image_id, reply.oid(), reply.id(), reply.result());
+        } else {
+          spdlog::warn("search: rsp for unknown (oid={}, id={})", reply.oid(),
+                       reply.id());
+        }
+      });
+
+  // Permanent gRPC failure -> dead-letter all pending (v5 §2.5).
+  process_streamer_.SetOnStreamFailed(
+      [this](const grpc::Status& status) {
+        if (!IsPermanentGrpcError(status.error_code())) return;
+        const auto pending = outbox_.DueForRetry(NowMs() + 24 * 3600 * 1000LL,
+                                                 10'000);
+        for (const auto& record : pending) {
+          outbox_.MarkDeadLetter(record.image_id, status.error_message());
+          spdlog::error("process: dead-lettered {} ({})", record.image_id,
+                        status.error_message());
+        }
+      });
+
+  // Stream (re)connected -> sweep the Outbox: unacked records replay by
+  // image_id, server dedupes (v5 §2.5).
+  process_streamer_.SetOnReconnected([this] { SweepOutbox(); });
+  search_streamer_.SetOnReconnected([this] { SweepOutbox(); });
+}
+
+void Application::SweepOutbox() {
+  const auto due = outbox_.DueForRetry(NowMs(), kSweepBatch);
+  for (const auto& record : due) {
+    ImageRequest request;
+    request.set_image_id(record.image_id);
+    request.set_image_data(record.image_data);
+    request.set_memo(record.memo);
+    request.set_owner_id(record.owner_id);
+    const bool enqueued = process_streamer_.Enqueue(
+        std::move(request),
+        std::chrono::milliseconds(config_.grpc.enqueue_timeout_ms));
+    if (enqueued) {
+      outbox_.MarkRequeued(record.image_id, config_.outbox.retry_backoff_ms,
+                           config_.outbox.max_attempts, "requeued for send");
+    } else {
+      spdlog::warn("outbox: retry sweep could not enqueue {} — will retry",
+                   record.image_id);
+    }
+  }
+}
+
+void Application::StartOutboxRetryThread() {
+  retry_running_.store(true, std::memory_order_release);
+  retry_thread_ = std::thread([this] {
+    const auto interval =
+        std::chrono::milliseconds(config_.outbox.retry_interval_ms);
+    while (retry_running_.load(std::memory_order_acquire)) {
+      SweepOutbox();
+      outbox_.PurgeDoneBefore(NowMs() -
+                              config_.outbox.purge_done_after_seconds * 1000LL);
+      const auto deadline = std::chrono::steady_clock::now() + interval;
+      while (retry_running_.load(std::memory_order_acquire) &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    }
+  });
+}
+
+void Application::StopOutboxRetryThread() {
+  if (!retry_running_.exchange(false, std::memory_order_acq_rel)) return;
+  if (retry_thread_.joinable()) {
+    retry_thread_.join();
+  }
+}
+
+int Application::WaitForAuthOrFailure() {
+  const bool ready = telegram_.auth().WaitForReady(kAuthReadyTimeout);
+  if (ready) return 0;
+  spdlog::error(
+      "telegram: authorization did not complete (state: {}). A live login "
+      "needs: api_id/api_hash, phone, TG_TELEGRAM_CODE (and "
+      "TG_TELEGRAM_PASSWORD for 2FA). Not retrying.",
+      telegram_.auth().StateDescription());
+  return 1;
+}
+
+int Application::Run() {
+  spdlog::info(
+      "application: starting — workers={}, outbox={}, grpc target={}",
+      config_.worker_count, config_.outbox.db_path, config_.grpc.target);
+
+  telegram_.SetUpdateSink(
+      [this](td_api::object_ptr<td_api::Update>&& update) {
+        dispatcher_.Dispatch(std::move(update), *ctx_);
+      });
+  telegram_.SetFileUpdateHook(
+      [this](const td_api::updateFile& file) { files_.OnUpdateFile(file); });
+
+  process_streamer_.Start();
+  search_streamer_.Start();
+  telegram_.Start(config_.telegram);
+
+  const int auth_result = WaitForAuthOrFailure();
+  if (auth_result != 0) {
+    return auth_result;
+  }
+
+  StartOutboxRetryThread();
+
+  // Signal wait: both stop paths are relaxed atomic stores (async-signal
+  // safe), polled here.
+  while (!ShutdownRequested() && !g_global_stop.load(std::memory_order_relaxed)) {
+    std::this_thread::sleep_for(kSignalPollInterval);
+  }
+
+  // v5 §3.6 ordered shutdown:
+  //  1. (updates already stopped being *executed* by draining the pool below)
+  workers_->Stop(kWorkerDrainTimeout);          // 2. drain in-flight work
+  process_streamer_.Stop();                     // 3. WritesDone/Finish/CQ join
+  search_streamer_.Stop();
+  telegram_.Stop();                             // 4. close TDLib session
+  StopOutboxRetryThread();                      // 5. flush + join retry
+  spdlog::info("application: stopped cleanly (outbox pending: {})",
+               outbox_.PendingCount());
+  return 0;
+}
+
+}  // namespace tg::app

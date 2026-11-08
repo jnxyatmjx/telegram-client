@@ -1,0 +1,47 @@
+# tg-client example configuration (architecture v5 §5.1).
+#
+# Copy to config.yaml and fill in real values. Values of the form ${VAR} are
+# read from the environment — never hardcode or commit secrets.
+# NOTE (chunk 1): this file documents the target schema; the Config loader
+# implementation lands in a later chunk.
+
+telegram:
+  api_id: 123456            # from https://my.telegram.org — supply via env
+  api_hash: "${TG_API_HASH}"
+  phone: "${TG_PHONE}"      # user account (not a bot token)
+  database_directory: "/data/tdlib/db"    # chmod 700; TDLib database is encrypted
+  files_directory: "/data/tdlib/files"
+  encryption_key: "${TG_TDLIB_ENCRYPTION_KEY}"
+
+grpc:
+  target: "dns:///media.example.com:443"   # real server address pending (user)
+  tls: true
+  token: "${GRPC_TOKEN}"
+  # Bidi streams have no per-message deadline; ack timeout is used instead.
+  ack_timeout_ms: 30000
+  reconnect_backoff_ms: 1000   # 1s -> 2s -> 4s ... capped at 30s
+
+features:
+  media_thumbnail:
+    enabled: true
+    max_thumb_bytes: 5242880
+    max_edge_px: 320           # photo size tier: largest edge <= 320px
+  bot_command:
+    # Trigger mode (a, final): the bot itself sends the command message;
+    # verify sender_user_id == command_bot_user_id.
+    command_bot_user_id: 123456789   # real value pending (user)
+    # Command names are placeholders until the user confirms them.
+    process_command: "/process"
+    search_command: "/search"
+  auto_search:
+    # Phase 2 trigger: user posts an image in an allowlisted channel/group.
+    # DISABLED by default; SearchImages only, never ProcessImages.
+    enabled: false
+    chats: []                  # TDLib dialog chat_ids (the -100... form)
+    dedup_ttl_seconds: 600     # (oid, id) recent-search dedup TTL
+
+outbox:
+  db_path: "/data/outbox.sqlite"   # SQLite, WAL mode; retry-only
+
+log:
+  level: "info"

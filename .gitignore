@@ -1,0 +1,27 @@
+# Build trees
+build/
+build-*/
+
+# Generated protobuf/gRPC code (CMake regenerates it into the build dir)
+generated/
+
+# Config with real secrets (only config.example.yaml is committed)
+config/config.yaml
+config/*.local.yaml
+
+# TDLib runtime data (database, downloaded files, outbox)
+/data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# TDLib vendored tree is expected as a (shallow) submodule / clone
+third_party/td/
+
+# Editors / tooling
+.vscode/
+.idea/
+compile_commands.json
+
+# Build / run logs (working records, not source)
+*.log

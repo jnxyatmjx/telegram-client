@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+service ImageProcessor {
+  rpc ProcessImages (stream ImageRequest) returns (stream ImageReply);
+  rpc SearchImages (stream SearchReq) returns (stream SearchRsp);
+}
+
+message ImageRequest {
+  string image_id = 1;
+  bytes image_data = 2;
+  string memo = 3;
+  int64 owner_id = 4; // message belong to this channel or group
+}
+
+message ImageReply {
+  string image_id = 1;
+  string result = 2;
+}
+// python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. image_stream.proto
+
+message SearchReq {
+  uint32 id = 1;
+  bytes image_data = 2;
+  uint32 oid = 3; //origin chat id
+}
+
+message SearchRsp {
+  uint32 id = 1;
+  string result = 2;
+  uint32 oid = 3; //origin chat id
+}

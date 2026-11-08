@@ -70,8 +70,8 @@ class AsyncStreamer {
 
   struct Options {
     std::string name;  // "ProcessImages" / "SearchImages"
-    StartFn start_fn;  // stub PrepareAsync method
-    std::function<std::unique_ptr<grpc::ClientContext>()> make_context;
+    StartFn start_fn{};  // stub PrepareAsync method
+    std::function<std::unique_ptr<grpc::ClientContext>()> make_context{};
     std::int64_t initial_backoff_ms = 1'000;  // v5 §2.5: 1s -> 2s -> 4s ...
     std::int64_t max_backoff_ms = 30'000;
     std::size_t queue_capacity = 1'000;  // bounded write queue (v5 §6)

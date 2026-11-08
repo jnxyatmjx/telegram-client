@@ -113,7 +113,7 @@ class AutoSearchTest : public ::testing::Test {
     thumb_path_ = "/tmp/tg_client_auto_thumb_" + std::to_string(getpid()) + ".jpg";
     {
       std::ofstream out(thumb_path_, std::ios::binary);
-      out << "\xFF\xD8fake-jpeg-thumb";
+      out << "\xFF\xD8" "fake-jpeg-thumb";
     }
     outbox_path_ =
         "/tmp/tg_client_auto_outbox_" + std::to_string(getpid()) + ".sqlite";

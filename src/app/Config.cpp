@@ -52,12 +52,6 @@ struct YamlLine {
   std::string text;
 };
 
-bool IsSpaceOnly(const std::string& line) {
-  return std::all_of(line.begin(), line.end(), [](char c) {
-    return std::isspace(static_cast<unsigned char>(c));
-  });
-}
-
 std::vector<YamlLine> ScanLines(const std::string& text) {
   std::vector<YamlLine> lines;
   std::istringstream in(text);

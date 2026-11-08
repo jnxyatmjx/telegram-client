@@ -94,7 +94,7 @@ struct YamlNode {
   std::vector<std::pair<std::string, YamlNode>> map;   // mapping form
   std::vector<YamlNode> list;                          // sequence form
 
-  bool IsScalar() const { return !scalar.empty() || map.empty() && list.empty(); }
+  bool IsScalar() const { return !scalar.empty() || (map.empty() && list.empty()); }
   const YamlNode* Find(const std::string& key) const;
   std::optional<std::string> AsString() const;
   std::optional<bool> AsBool() const;

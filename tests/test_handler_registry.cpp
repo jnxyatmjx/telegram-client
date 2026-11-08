@@ -31,7 +31,7 @@ namespace {
 
 class FakeTdSender : public tg::telegram::ITdSender {
  public:
-  std::int64_t Send(td_api::object_ptr<td_api::Function>&& request,
+  std::int64_t Send(td_api::object_ptr<td_api::Function>&&,
                     tg::telegram::ResponseCallback callback) override {
     td::ClientManager::Response response;
     response.request_id = next_id_++;

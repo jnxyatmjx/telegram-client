@@ -279,6 +279,9 @@ Config Config::FromFile(const std::string& path) {
     const auto capacity = Int(*g, "queue_capacity", cfg.grpc.queue_capacity);
     cfg.grpc.queue_capacity =
         static_cast<int>(capacity > 0 ? capacity : cfg.grpc.queue_capacity);
+    const auto connections = Int(*g, "connections", cfg.grpc.connections);
+    cfg.grpc.connections =
+        static_cast<int>(connections > 0 ? connections : cfg.grpc.connections);
   }
 
   if (const YamlNode* f = root.Find("features")) {

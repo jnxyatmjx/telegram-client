@@ -15,7 +15,8 @@ set(TG_TEST_SOURCES
   test_e2e_fake_server.cpp
   test_tdlib_bootstrap.cpp
   test_auth_prompt.cpp
-  test_update_logging.cpp)
+  test_update_logging.cpp
+  test_streamer_pool.cpp)
 
 foreach(src IN LISTS TG_TEST_SOURCES)
   get_filename_component(test_name "${src}" NAME_WE)
@@ -36,3 +37,5 @@ set_property(TEST test_tdlib_bootstrap PROPERTY TIMEOUT 60)
 set_property(TEST test_auth_prompt PROPERTY TIMEOUT 60)
 # The update-logging test creates a real TDLib client and captures its logs.
 set_property(TEST test_update_logging PROPERTY TIMEOUT 60)
+# The pool test opens 3 parallel streams against a fake server.
+set_property(TEST test_streamer_pool PROPERTY TIMEOUT 120)

@@ -12,14 +12,17 @@
 #include <telegram/TelegramClient.h>
 #include <transport/ProcessImagesClient.h>
 #include <transport/SearchImagesClient.h>
+#include <transport/StreamerPool.h>
 
 namespace tg::app {
 
 struct AppContext {
   telegram::ITdSender& telegram;
   telegram::FileDownloader& files;
-  transport::ProcessImagesStreamer& process_images;
-  transport::SearchImagesStreamer& search_images;
+  // Pools deal requests round-robin across grpc.connections lanes; the
+  // handlers only need Enqueue, so they are unchanged by the lane count.
+  transport::StreamerPool<ImageRequest, ImageReply>& process_images;
+  transport::StreamerPool<SearchReq, SearchRsp>& search_images;
   infra::Outbox& outbox;
   const Config& config;
 };

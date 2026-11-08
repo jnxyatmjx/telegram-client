@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <vector>
 #include <string>
 
 namespace td_api = td::td_api;  // shorthand for td::td_api::*
@@ -123,12 +124,15 @@ class AutoSearchTest : public ::testing::Test {
     files_ = std::make_unique<tg::telegram::FileDownloader>(sender_);
     search_handler_ = std::make_unique<media::SearchHandler>(
         media::MediaExtractor(config_.media_thumbnail), sender_, *files_);
+    // Single-lane pools: the handler tests inspect lane 0's queue.
     process_streamer_ = std::make_unique<
-        transport::ProcessImagesStreamer>(
-        transport::ProcessImagesStreamer::Options{"ProcessImages"});
+        transport::StreamerPool<ImageRequest, ImageReply>>(
+        std::vector<transport::ProcessImagesStreamer::Options>{
+            transport::ProcessImagesStreamer::Options{"ProcessImages"}});
     search_streamer_ = std::make_unique<
-        transport::SearchImagesStreamer>(
-        transport::SearchImagesStreamer::Options{"SearchImages"});
+        transport::StreamerPool<SearchReq, SearchRsp>>(
+        std::vector<transport::SearchImagesStreamer::Options>{
+            transport::SearchImagesStreamer::Options{"SearchImages"}});
     outbox_ = std::make_unique<tg::infra::Outbox>(outbox_path_);
     ctx_ = std::make_unique<app::AppContext>(app::AppContext{
         sender_, *files_, *process_streamer_, *search_streamer_, *outbox_,
@@ -158,8 +162,10 @@ class AutoSearchTest : public ::testing::Test {
   FakeTdSender sender_;
   std::unique_ptr<tg::telegram::FileDownloader> files_;
   std::unique_ptr<media::SearchHandler> search_handler_;
-  std::unique_ptr<transport::ProcessImagesStreamer> process_streamer_;
-  std::unique_ptr<transport::SearchImagesStreamer> search_streamer_;
+  std::unique_ptr<transport::StreamerPool<ImageRequest, ImageReply>>
+      process_streamer_;
+  std::unique_ptr<transport::StreamerPool<SearchReq, SearchRsp>>
+      search_streamer_;
   std::unique_ptr<tg::infra::Outbox> outbox_;
   std::unique_ptr<app::AppContext> ctx_;
 };
@@ -190,8 +196,8 @@ TEST_F(AutoSearchTest, EnabledAllowlistedMediaTriggersSearchOnly) {
   handler->Handle(base, *ctx_);
 
   // SearchImages got the request...
-  ASSERT_EQ(search_streamer_->QueuedCount(), 1u);
-  const auto request = search_streamer_->PeekFront();
+  ASSERT_EQ(search_streamer_->lane(0)->QueuedCount(), 1u);
+  const auto request = search_streamer_->lane(0)->PeekFront();
   ASSERT_TRUE(request.has_value());
   // ...with uint32 bare ids (supergroup -1001234567890 -> 1234567890, msg 555)
   EXPECT_EQ(request->oid(), 1234567890u);
@@ -201,7 +207,7 @@ TEST_F(AutoSearchTest, EnabledAllowlistedMediaTriggersSearchOnly) {
   EXPECT_TRUE(handler->RecentlySearched(1234567890u, 555u));
 
   // NEVER ProcessImages, NEVER Outbox (v5 §2.7 step 5).
-  EXPECT_EQ(process_streamer_->QueuedCount(), 0u);
+  EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 0u);
   EXPECT_EQ(outbox_->PendingCount(), 0);
 }
 
@@ -213,7 +219,7 @@ TEST_F(AutoSearchTest, NonAllowlistedChatIgnored) {
   td_api::object_ptr<td_api::Update> base = MakePhotoUpdate(-987654321LL);
   EXPECT_FALSE(handler->CanHandle(base));
   handler->Handle(base, *ctx_);
-  EXPECT_EQ(search_streamer_->QueuedCount(), 0u);
+  EXPECT_EQ(search_streamer_->lane(0)->QueuedCount(), 0u);
 }
 
 TEST_F(AutoSearchTest, NonMediaMessageIgnored) {
@@ -224,7 +230,7 @@ TEST_F(AutoSearchTest, NonMediaMessageIgnored) {
   td_api::object_ptr<td_api::Update> base = MakeTextUpdate(-1'001'234'567'890LL);
   EXPECT_FALSE(handler->CanHandle(base));
   handler->Handle(base, *ctx_);
-  EXPECT_EQ(search_streamer_->QueuedCount(), 0u);
+  EXPECT_EQ(search_streamer_->lane(0)->QueuedCount(), 0u);
 }
 
 TEST_F(AutoSearchTest, DedupSkipsSecondHandleWithinTtl) {
@@ -235,20 +241,20 @@ TEST_F(AutoSearchTest, DedupSkipsSecondHandleWithinTtl) {
   td_api::object_ptr<td_api::Update> first = MakePhotoUpdate(-1'001'234'567'890LL);
   ASSERT_TRUE(handler->CanHandle(first));
   handler->Handle(first, *ctx_);
-  ASSERT_EQ(search_streamer_->QueuedCount(), 1u);
+  ASSERT_EQ(search_streamer_->lane(0)->QueuedCount(), 1u);
 
   // Same (chat, message) again before TTL expiry: skipped.
   td_api::object_ptr<td_api::Update> second = MakePhotoUpdate(-1'001'234'567'890LL);
   ASSERT_TRUE(handler->CanHandle(second));  // claim ok; Handle dedupes
   handler->Handle(second, *ctx_);
-  EXPECT_EQ(search_streamer_->QueuedCount(), 1u);
+  EXPECT_EQ(search_streamer_->lane(0)->QueuedCount(), 1u);
   EXPECT_TRUE(handler->RecentlySearched(1234567890u, 555u));
 
   // A different message id in the same chat is NOT deduped.
   td_api::object_ptr<td_api::Update> third = MakePhotoUpdate(-1'001'234'567'890LL);
   static_cast<td_api::updateNewMessage&>(*third).message_->id_ = 557;
   handler->Handle(third, *ctx_);
-  EXPECT_EQ(search_streamer_->QueuedCount(), 2u);
+  EXPECT_EQ(search_streamer_->lane(0)->QueuedCount(), 2u);
 }
 
 TEST_F(AutoSearchTest, EmptyAllowlistClaimsNothingEvenWhenEnabled) {

@@ -26,6 +26,7 @@ grpc:
   ca_cert: /etc/ssl/tg-ca.crt
   ack_timeout_ms: 45000
   queue_capacity: 50
+  connections: 3
 
 features:
   media_thumbnail:
@@ -111,6 +112,7 @@ TEST_F(ConfigFileTest, FromFileMapsEverything) {
   EXPECT_EQ(config.grpc.ca_cert_path, "/etc/ssl/tg-ca.crt");
   EXPECT_EQ(config.grpc.ack_timeout_ms, 45000);
   EXPECT_EQ(config.grpc.queue_capacity, 50);
+  EXPECT_EQ(config.grpc.connections, 3);
   EXPECT_FALSE(config.media_thumbnail.enabled);
   EXPECT_EQ(config.media_thumbnail.max_edge_px, 256);
   EXPECT_EQ(config.bot_command.command_bot_user_id, 987654321);

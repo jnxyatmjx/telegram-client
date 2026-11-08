@@ -13,7 +13,7 @@ GrpcTransport::GrpcTransport(const app::GrpcConfig& config)
   if (config_.target.empty()) {
     // Legal for skeleton runs (e.g. unit tests); streams simply won't start
     // against a real server.
-    spdlog::warn("grpc: no target configured — channel will not be created");
+    spdlog::warn("grpc: no target configured — channels will not be created");
     return;
   }
   std::shared_ptr<grpc::ChannelCredentials> credentials;
@@ -36,9 +36,18 @@ GrpcTransport::GrpcTransport(const app::GrpcConfig& config)
   } else {
     credentials = grpc::SslCredentials(grpc::SslCredentialsOptions());
   }
-  channel_ = grpc::CreateChannel(config_.target, credentials);
-  spdlog::info("grpc: channel created for {} ({})", config_.target,
-               config_.tls ? "TLS" : "insecure");
+  // One Channel per lane: each is its own TCP/HTTP2 connection to the same
+  // target, so traffic actually spreads across connections (a single
+  // channel multiplexes streams but stays on one connection).
+  std::size_t lanes = static_cast<std::size_t>(
+      config_.connections > 0 ? config_.connections : 1);
+  if (lanes > kMaxLanes) lanes = kMaxLanes;
+  channels_.reserve(lanes);
+  for (std::size_t i = 0; i < lanes; ++i) {
+    channels_.push_back(grpc::CreateChannel(config_.target, credentials));
+  }
+  spdlog::info("grpc: {} channel(s) created for {} ({})", channels_.size(),
+               config_.target, config_.tls ? "TLS" : "insecure");
 }
 
 std::unique_ptr<grpc::ClientContext> GrpcTransport::MakeContext() const {

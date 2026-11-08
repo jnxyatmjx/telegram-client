@@ -2,8 +2,8 @@
 #define TG_APP_APPLICATION_H_
 
 // Application (v5 §3.1, §3.5, §3.6): owns every component, wires them, runs
-// the 9-thread structure (Main, TDLib Receive, 4 Workers, 2 CQ, Outbox
-// Retry) and performs the ordered shutdown.
+// the thread structure (Main, TDLib Receive, 4 Workers, 2 x grpc.connections
+// CQ, Outbox Retry) and performs the ordered shutdown.
 
 #include <app/AppContext.h>
 #include <app/Config.h>
@@ -20,12 +20,14 @@
 #include <transport/GrpcTransport.h>
 #include <transport/ProcessImagesClient.h>
 #include <transport/SearchImagesClient.h>
+#include <transport/StreamerPool.h>
 
 #include <atomic>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace tg::app {
 
@@ -71,10 +73,12 @@ class Application {
   telegram::TelegramClient telegram_;
   telegram::FileDownloader files_;
   transport::GrpcTransport transport_;
-  transport::ProcessImagesClient process_client_;
-  transport::SearchImagesClient search_client_;
-  transport::ProcessImagesStreamer process_streamer_;
-  transport::SearchImagesStreamer search_streamer_;
+  // One client + one stream per lane (grpc.connections lanes); the pools
+  // deal requests round-robin across lanes.
+  std::vector<std::unique_ptr<transport::ProcessImagesClient>> process_clients_;
+  std::vector<std::unique_ptr<transport::SearchImagesClient>> search_clients_;
+  transport::StreamerPool<ImageRequest, ImageReply> process_pool_;
+  transport::StreamerPool<SearchReq, SearchRsp> search_pool_;
   features::media_thumbnail::MediaThumbnailHandler process_handler_;
   features::media_thumbnail::SearchHandler search_handler_;
   features::bot_command::BotCommandHandler bot_command_handler_;

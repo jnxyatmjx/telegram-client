@@ -5,8 +5,12 @@
 namespace tg::transport {
 
 ProcessImagesClient::ProcessImagesClient(GrpcTransport& transport)
-    : stub_(transport.channel() != nullptr
-                ? ImageProcessor::NewStub(transport.channel())
+    : ProcessImagesClient(transport, 0) {}
+
+ProcessImagesClient::ProcessImagesClient(GrpcTransport& transport,
+                                         std::size_t lane)
+    : stub_(transport.channel(lane) != nullptr
+                ? ImageProcessor::NewStub(transport.channel(lane))
                 : nullptr),
       transport_(transport) {}
 

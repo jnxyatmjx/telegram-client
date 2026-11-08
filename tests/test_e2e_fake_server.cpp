@@ -240,8 +240,10 @@ class E2ETest : public ::testing::Test {
     process_options.pump_interval_ms = 10;
     process_options.initial_backoff_ms = 50;
     process_options.max_backoff_ms = 200;
-    process_streamer_ = std::make_unique<tg::transport::ProcessImagesStreamer>(
-        std::move(process_options));
+    process_streamer_ =
+        std::make_unique<tg::transport::StreamerPool<ImageRequest, ImageReply>>(
+            std::vector<tg::transport::ProcessImagesStreamer::Options>{
+                std::move(process_options)});
 
     tg::transport::SearchImagesStreamer::Options search_options;
     search_options.name = "SearchImages";
@@ -252,8 +254,10 @@ class E2ETest : public ::testing::Test {
     search_options.pump_interval_ms = 10;
     search_options.initial_backoff_ms = 50;
     search_options.max_backoff_ms = 200;
-    search_streamer_ = std::make_unique<tg::transport::SearchImagesStreamer>(
-        std::move(search_options));
+    search_streamer_ =
+        std::make_unique<tg::transport::StreamerPool<SearchReq, SearchRsp>>(
+            std::vector<tg::transport::SearchImagesStreamer::Options>{
+                std::move(search_options)});
 
     // Reply handlers wired exactly like Application::WireStreamerCallbacks.
     process_streamer_->SetReplyHandler([this](const ImageReply& reply) {
@@ -308,10 +312,11 @@ class E2ETest : public ::testing::Test {
     std::remove(db_path_.c_str());
   }
 
-  bool WaitForRunning(const tg::transport::ProcessImagesStreamer& s) {
+  bool WaitForRunning(
+      const tg::transport::StreamerPool<ImageRequest, ImageReply>& s) {
     return WaitForRunningImpl([&] { return s.IsStreamRunning(); });
   }
-  bool WaitForRunning(const tg::transport::SearchImagesStreamer& s) {
+  bool WaitForRunning(const tg::transport::StreamerPool<SearchReq, SearchRsp>& s) {
     return WaitForRunningImpl([&] { return s.IsStreamRunning(); });
   }
   template <typename Pred>
@@ -344,8 +349,10 @@ class E2ETest : public ::testing::Test {
   std::unique_ptr<tg::transport::GrpcTransport> transport_;
   std::unique_ptr<tg::transport::ProcessImagesClient> process_client_;
   std::unique_ptr<tg::transport::SearchImagesClient> search_client_;
-  std::unique_ptr<tg::transport::ProcessImagesStreamer> process_streamer_;
-  std::unique_ptr<tg::transport::SearchImagesStreamer> search_streamer_;
+  std::unique_ptr<tg::transport::StreamerPool<ImageRequest, ImageReply>>
+      process_streamer_;
+  std::unique_ptr<tg::transport::StreamerPool<SearchReq, SearchRsp>>
+      search_streamer_;
   FakeTdSender sender_;
   tg::telegram::FileDownloader files_{sender_};
   std::unique_ptr<infra::Outbox> outbox_;

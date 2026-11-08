@@ -313,8 +313,8 @@ tg-client (1 process)
   Main thread (1)
   TDLib Receive thread (1)
   Worker Pool (4)
-  ProcessImages CQ thread (1)
-  SearchImages CQ thread (1)
+  ProcessImages CQ threads (grpc.connections, 1 by default)
+  SearchImages CQ threads (grpc.connections, 1 by default)
   Outbox Retry thread (1)
   TDLib internal threads (N, owned by TDLib)
 ```
@@ -324,8 +324,8 @@ tg-client (1 process)
 | Main | 1 | Parse config, assemble `Application`, start threads, wait for SIGINT/SIGTERM, stop threads in order, join | Call `ClientManager::receive()`, call gRPC `Write` |
 | TDLib Receive | 1 | The only caller of `ClientManager::receive(10.0)`; routes responses to waiting futures by `request_id`, hands updates (`request_id == 0`) to `UpdateDispatcher` | Download, read disk, call gRPC, block for more than a few ms |
 | Worker Pool | 4 | Handler execution: pick tier, wait on download future, read file, hash, build `ImageRequest`, write Outbox, enqueue to streamer | Call `receive()`; call gRPC `Write`/`Read` directly (only `Enqueue`) |
-| ProcessImages CQ | 1 | Owns the `ProcessImages` CompletionQueue and `ClientAsyncReaderWriter`; loops `cq.Next()`, handles Write done, Read replies, Finish, reconnect | Call TDLib `send`/`receive` (use thread-safe `TelegramClient::Send`) |
-| SearchImages CQ | 1 | Same as above, for the `SearchImages` stream, its own CQ and stub | Same; the two streams are isolated, one breaking does not affect the other |
+| ProcessImages CQ | grpc.connections | One per lane: owns that lane's `ProcessImages` CompletionQueue and `ClientAsyncReaderWriter`; loops `cq.Next()`, handles Write done, Read replies, Finish, reconnect | Call TDLib `send`/`receive` (use thread-safe `TelegramClient::Send`) |
+| SearchImages CQ | grpc.connections | Same as above, for the `SearchImages` stream, its own CQ and stub per lane | Same; the two streams are isolated, one breaking does not affect the other |
 | Outbox Retry | 1 | Every 10 s, re-enqueues PENDING/FAILED Outbox records whose retry time has come | Call gRPC `Write` directly (only `Enqueue`) |
 | TDLib internal | N | Actors, network, crypto, local database, created by TDLib | Not created, joined or driven by us |
 
@@ -440,10 +440,14 @@ of libraries.
   conversion and range checks, registers `(oid, id)` in the correlation
   table, and enqueues to the SearchImages stream. Never writes to the
   Outbox.
-- `transport/GrpcTransport` — One shared `grpc::Channel` for both
-  streams (never one channel per stream). TLS or insecure from config.
-  `MakeContext()` returns a fresh `ClientContext` with auth metadata
-  already applied.
+- `transport/GrpcTransport` — A pool of `grpc.connections` Channels
+  (one per lane, one TCP/HTTP2 connection each, all to the same target;
+  1 by default). TLS or insecure from config. `MakeContext()` returns
+  a fresh `ClientContext` with auth metadata already applied.
+- `transport/StreamerPool` — N parallel connections ("lanes") for one
+  RPC: one `AsyncStreamer` per lane, requests dealt round-robin, reply
+  handlers installed on every lane. Replies are matched by id, so lane
+  order does not matter.
 - `transport/AsyncStreamer` — Template for one fully-async bidi stream:
   its own CompletionQueue and CQ thread, a bounded write queue, reconnect
   with backoff, and the teardown contract above. Only the CQ thread
@@ -587,8 +591,13 @@ ctest --test-dir build/tests --output-on-failure
 | test_handler_registry | dispatcher registration / dispatch |
 | test_async_streamer | CQ state machine vs in-process fake server: round-trip by image_id, bounded-queue backpressure, reconnect after server restart |
 | test_e2e_fake_server | **chunk 3 acceptance test**: a local thumbnail file through the real pipeline (MediaThumbnailHandler/SearchHandler -> FileDownloader -> GrpcTransport -> AsyncStreamers -> fake ImageProcessor server); ProcessImages reply round-trips by image_id and the Outbox record goes PENDING -> DONE; SearchImages reply round-trips by (oid, id) and resolves through the correlation table |
+| test_tdlib_bootstrap | real TDLib client delivers the first authorization state (regression test for the missing bootstrap request) |
+| test_auth_prompt | terminal prompts for the login code and 2FA password (env override, empty input fails fast) |
+| test_update_logging | `telegram.log_updates` logs every update with type + content, silent when off |
+| test_streamer_pool | 3-lane pool against a fake server: one stream per lane, 9 requests dealt 3 per lane, every reply round-trips |
 
-Note: the socket-based tests (test_async_streamer, test_e2e_fake_server)
+Note: the socket-based tests (test_async_streamer, test_e2e_fake_server,
+test_streamer_pool)
 use a Unix domain socket, not TCP loopback. This cloud VM's runtime
 intercepts direct TCP connections (`other_tcp` denied), so a 127.0.0.1
 loopback client receives the platform's block message instead of the
@@ -620,7 +629,8 @@ src/features/       bot_command/ (BotCommandHandler, CommandParser)
                     auto_search/ (AutoSearchHandler, disabled by default)
                     media_thumbnail/ (MediaThumbnailHandler, MediaExtractor, SearchHandler)
 src/transport/      GrpcTransport, AsyncStreamer (template),
-                    ProcessImagesClient, SearchImagesClient
+                    StreamerPool (template), ProcessImagesClient,
+                    SearchImagesClient
 src/infra/          Outbox (SQLite), Sha256, FileStore
 src/common/         Logger (spdlog), Idempotency (bare-ID conversion)
 tests/              GTest unit tests

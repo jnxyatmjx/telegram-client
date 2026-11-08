@@ -65,30 +65,6 @@ Application::Application(Config config)
           std::chrono::milliseconds(1'000))),
       files_(telegram_),
       transport_(config_.grpc),
-      process_client_(transport_),
-      search_client_(transport_),
-      process_streamer_([&] {
-        transport::AsyncStreamer<ImageRequest, ImageReply>::Options options;
-        options.name = "ProcessImages";
-        options.start_fn = process_client_.start_fn();
-        options.make_context = [this] { return transport_.MakeContext(); };
-        options.initial_backoff_ms = config_.grpc.reconnect_backoff_ms;
-        options.max_backoff_ms = config_.grpc.max_reconnect_backoff_ms;
-        options.queue_capacity =
-            static_cast<std::size_t>(config_.grpc.queue_capacity);
-        return options;
-      }()),
-      search_streamer_([&] {
-        transport::AsyncStreamer<SearchReq, SearchRsp>::Options options;
-        options.name = "SearchImages";
-        options.start_fn = search_client_.start_fn();
-        options.make_context = [this] { return transport_.MakeContext(); };
-        options.initial_backoff_ms = config_.grpc.reconnect_backoff_ms;
-        options.max_backoff_ms = config_.grpc.max_reconnect_backoff_ms;
-        options.queue_capacity =
-            static_cast<std::size_t>(config_.grpc.queue_capacity);
-        return options;
-      }()),
       process_handler_(MediaExtractor(config_.media_thumbnail), telegram_,
                        files_),
       search_handler_(MediaExtractor(config_.media_thumbnail), telegram_,
@@ -98,8 +74,37 @@ Application::Application(Config config)
       auto_search_handler_(std::make_shared<features::auto_search::AutoSearchHandler>(
           config_.auto_search, search_handler_)),
       dispatcher_(workers_) {
+  // Lanes: one channel + one ProcessImages stream + one SearchImages stream
+  // each (grpc.connections, default 1). The pools deal requests round-robin
+  // across lanes; reply matching is by id, so lane order does not matter.
+  const std::size_t lanes = transport_.lane_count();
+  for (std::size_t lane = 0; lane < lanes; ++lane) {
+    process_clients_.push_back(
+        std::make_unique<transport::ProcessImagesClient>(transport_, lane));
+    search_clients_.push_back(
+        std::make_unique<transport::SearchImagesClient>(transport_, lane));
+    transport::AsyncStreamer<ImageRequest, ImageReply>::Options process_options;
+    process_options.name = "ProcessImages#" + std::to_string(lane);
+    process_options.start_fn = process_clients_.back()->start_fn();
+    process_options.make_context = [this] { return transport_.MakeContext(); };
+    process_options.initial_backoff_ms = config_.grpc.reconnect_backoff_ms;
+    process_options.max_backoff_ms = config_.grpc.max_reconnect_backoff_ms;
+    process_options.queue_capacity =
+        static_cast<std::size_t>(config_.grpc.queue_capacity);
+    process_pool_.AddLane(std::move(process_options));
+    transport::AsyncStreamer<SearchReq, SearchRsp>::Options search_options;
+    search_options.name = "SearchImages#" + std::to_string(lane);
+    search_options.start_fn = search_clients_.back()->start_fn();
+    search_options.make_context = [this] { return transport_.MakeContext(); };
+    search_options.initial_backoff_ms = config_.grpc.reconnect_backoff_ms;
+    search_options.max_backoff_ms = config_.grpc.max_reconnect_backoff_ms;
+    search_options.queue_capacity =
+        static_cast<std::size_t>(config_.grpc.queue_capacity);
+    search_pool_.AddLane(std::move(search_options));
+  }
+
   ctx_ = std::make_unique<AppContext>(AppContext{
-      telegram_, files_, process_streamer_, search_streamer_, outbox_,
+      telegram_, files_, process_pool_, search_pool_, outbox_,
       config_});
   WireHandlers();
   WireStreamerCallbacks();
@@ -107,8 +112,8 @@ Application::Application(Config config)
 
 Application::~Application() {
   StopOutboxRetryThread();
-  process_streamer_.Stop();
-  search_streamer_.Stop();
+  process_pool_.Stop();
+  search_pool_.Stop();
   telegram_.Stop();
   workers_->Stop(std::chrono::seconds(0));
 }
@@ -123,7 +128,7 @@ void Application::WireHandlers() {
 void Application::WireStreamerCallbacks() {
   // ImageReply -> Outbox DONE (v5 §2.4: log + metrics only, never reply into
   // Telegram by default).
-  process_streamer_.SetReplyHandler(
+  process_pool_.SetReplyHandler(
       [this](const ImageReply& reply) {
         const bool known = outbox_.MarkDone(reply.image_id(), reply.result());
         if (known) {
@@ -135,7 +140,7 @@ void Application::WireStreamerCallbacks() {
       });
 
   // SearchRsp -> correlation table lookup (v5 §2.4), log only.
-  search_streamer_.SetReplyHandler(
+  search_pool_.SetReplyHandler(
       [this](const SearchRsp& reply) {
         const auto entry = search_handler_.correlation().Lookup(
             reply.oid(), reply.id());
@@ -149,7 +154,7 @@ void Application::WireStreamerCallbacks() {
       });
 
   // Permanent gRPC failure -> dead-letter all pending (v5 §2.5).
-  process_streamer_.SetOnStreamFailed(
+  process_pool_.SetOnStreamFailed(
       [this](const grpc::Status& status) {
         if (!IsPermanentGrpcError(status.error_code())) return;
         const auto pending = outbox_.DueForRetry(NowMs() + 24 * 3600 * 1000LL,
@@ -163,8 +168,8 @@ void Application::WireStreamerCallbacks() {
 
   // Stream (re)connected -> sweep the Outbox: unacked records replay by
   // image_id, server dedupes (v5 §2.5).
-  process_streamer_.SetOnReconnected([this] { SweepOutbox(); });
-  search_streamer_.SetOnReconnected([this] { SweepOutbox(); });
+  process_pool_.SetOnReconnected([this] { SweepOutbox(); });
+  search_pool_.SetOnReconnected([this] { SweepOutbox(); });
 }
 
 void Application::SweepOutbox() {
@@ -175,7 +180,7 @@ void Application::SweepOutbox() {
     request.set_image_data(record.image_data);
     request.set_memo(record.memo);
     request.set_owner_id(record.owner_id);
-    const bool enqueued = process_streamer_.Enqueue(
+    const bool enqueued = process_pool_.Enqueue(
         std::move(request),
         std::chrono::milliseconds(config_.grpc.enqueue_timeout_ms));
     if (enqueued) {
@@ -239,8 +244,9 @@ int Application::WaitForAuthOrFailure() {
 
 int Application::Run() {
   spdlog::info(
-      "application: starting — workers={}, outbox={}, grpc target={}",
-      config_.worker_count, config_.outbox.db_path, config_.grpc.target);
+      "application: starting — workers={}, outbox={}, grpc target={}, lanes={}",
+      config_.worker_count, config_.outbox.db_path, config_.grpc.target,
+      transport_.lane_count());
 
   telegram_.SetUpdateSink(
       [this](td_api::object_ptr<td_api::Update>&& update) {
@@ -249,8 +255,8 @@ int Application::Run() {
   telegram_.SetFileUpdateHook(
       [this](const td_api::updateFile& file) { files_.OnUpdateFile(file); });
 
-  process_streamer_.Start();
-  search_streamer_.Start();
+  process_pool_.Start();
+  search_pool_.Start();
   telegram_.Start(config_.telegram);
 
   const int auth_result = WaitForAuthOrFailure();
@@ -274,8 +280,8 @@ int Application::Run() {
   // v5 §3.6 ordered shutdown:
   //  1. (updates already stopped being *executed* by draining the pool below)
   workers_->Stop(kWorkerDrainTimeout);          // 2. drain in-flight work
-  process_streamer_.Stop();                     // 3. WritesDone/Finish/CQ join
-  search_streamer_.Stop();
+  process_pool_.Stop();                     // 3. WritesDone/Finish/CQ join
+  search_pool_.Stop();
   telegram_.Stop();                             // 4. close TDLib session
   StopOutboxRetryThread();                      // 5. flush + join retry
   spdlog::info("application: stopped cleanly (outbox pending: {})",

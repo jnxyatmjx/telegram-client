@@ -45,6 +45,10 @@ struct GrpcConfig {
   std::int64_t enqueue_timeout_ms = 5'000;       // streamer write-queue wait
   std::int64_t connect_timeout_ms = 10'000;
   int queue_capacity = 1'000;                    // bounded write queue (§6)
+  // Parallel gRPC connections ("lanes"): each lane is its own Channel with
+  // its own ProcessImages + SearchImages stream, and requests are dealt
+  // round-robin across lanes. 1 = previous single-connection behavior.
+  int connections = 1;
 };
 
 struct MediaThumbnailConfig {

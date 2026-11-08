@@ -15,7 +15,10 @@ namespace tg::transport {
 
 class SearchImagesClient {
  public:
+  // Stub on the transport's lane-0 channel.
   explicit SearchImagesClient(GrpcTransport& transport);
+  // Stub on the transport's channel for `lane`.
+  SearchImagesClient(GrpcTransport& transport, std::size_t lane);
 
   AsyncStreamer<SearchReq, SearchRsp>::StartFn start_fn() const;
 

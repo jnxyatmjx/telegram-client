@@ -22,6 +22,7 @@ grpc:
   # Bidi streams have no per-message deadline; ack timeout is used instead.
   ack_timeout_ms: 30000
   reconnect_backoff_ms: 1000   # 1s -> 2s -> 4s ... capped at 30s
+  connections: 1   # parallel gRPC connections (lanes); each lane has its own ProcessImages + SearchImages stream, requests round-robin across lanes
 
 features:
   media_thumbnail:

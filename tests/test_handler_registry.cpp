@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdio>
 #include <memory>
+#include <vector>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -112,10 +113,15 @@ class DispatcherTest : public ::testing::Test {
 
     pool_ = std::make_shared<app::WorkerPool>(2u);
     files_ = std::make_unique<tg::telegram::FileDownloader>(sender_);
-    process_streamer_ = std::make_unique<transport::ProcessImagesStreamer>(
-        transport::ProcessImagesStreamer::Options{"ProcessImages"});
-    search_streamer_ = std::make_unique<transport::SearchImagesStreamer>(
-        transport::SearchImagesStreamer::Options{"SearchImages"});
+    // Single-lane pools: the AppContext now holds pools.
+    process_streamer_ = std::make_unique<
+        transport::StreamerPool<ImageRequest, ImageReply>>(
+        std::vector<transport::ProcessImagesStreamer::Options>{
+            transport::ProcessImagesStreamer::Options{"ProcessImages"}});
+    search_streamer_ = std::make_unique<
+        transport::StreamerPool<SearchReq, SearchRsp>>(
+        std::vector<transport::SearchImagesStreamer::Options>{
+            transport::SearchImagesStreamer::Options{"SearchImages"}});
     outbox_ = std::make_unique<tg::infra::Outbox>(outbox_path_);
     ctx_ = std::make_unique<app::AppContext>(app::AppContext{
         sender_, *files_, *process_streamer_, *search_streamer_, *outbox_,
@@ -139,8 +145,10 @@ class DispatcherTest : public ::testing::Test {
   FakeTdSender sender_;
   std::shared_ptr<app::WorkerPool> pool_;
   std::unique_ptr<tg::telegram::FileDownloader> files_;
-  std::unique_ptr<transport::ProcessImagesStreamer> process_streamer_;
-  std::unique_ptr<transport::SearchImagesStreamer> search_streamer_;
+  std::unique_ptr<transport::StreamerPool<ImageRequest, ImageReply>>
+      process_streamer_;
+  std::unique_ptr<transport::StreamerPool<SearchReq, SearchRsp>>
+      search_streamer_;
   std::unique_ptr<tg::infra::Outbox> outbox_;
   std::unique_ptr<app::AppContext> ctx_;
   std::unique_ptr<tg::telegram::UpdateDispatcher> dispatcher_;

@@ -16,7 +16,10 @@ namespace tg::transport {
 
 class ProcessImagesClient {
  public:
+  // Stub on the transport's lane-0 channel.
   explicit ProcessImagesClient(GrpcTransport& transport);
+  // Stub on the transport's channel for `lane`.
+  ProcessImagesClient(GrpcTransport& transport, std::size_t lane);
 
   AsyncStreamer<ImageRequest, ImageReply>::StartFn start_fn() const;
 

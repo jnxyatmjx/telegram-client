@@ -19,6 +19,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <vector>
 #include <string>
 
 namespace td_api = td::td_api;  // shorthand for td::td_api::*
@@ -195,12 +196,15 @@ class BotCommandTest : public ::testing::Test {
                          thumb_path_));
 
     files_ = std::make_unique<tg::telegram::FileDownloader>(sender_);
+    // Single-lane pools: the handler tests inspect lane 0's queue.
     process_streamer_ = std::make_unique<
-        transport::AsyncStreamer<ImageRequest, ImageReply>>(
-        MakeStreamerOptions<ImageRequest, ImageReply>("ProcessImages"));
+        transport::StreamerPool<ImageRequest, ImageReply>>(
+        std::vector<transport::AsyncStreamer<ImageRequest, ImageReply>::Options>{
+            MakeStreamerOptions<ImageRequest, ImageReply>("ProcessImages")});
     search_streamer_ = std::make_unique<
-        transport::AsyncStreamer<SearchReq, SearchRsp>>(
-        MakeStreamerOptions<SearchReq, SearchRsp>("SearchImages"));
+        transport::StreamerPool<SearchReq, SearchRsp>>(
+        std::vector<transport::AsyncStreamer<SearchReq, SearchRsp>::Options>{
+            MakeStreamerOptions<SearchReq, SearchRsp>("SearchImages")});
     outbox_ = std::make_unique<tg::infra::Outbox>(outbox_path_);
     ctx_ = std::make_unique<app::AppContext>(app::AppContext{
         sender_, *files_, *process_streamer_, *search_streamer_, *outbox_,
@@ -232,9 +236,9 @@ class BotCommandTest : public ::testing::Test {
   app::Config config_;
   FakeTdSender sender_;
   std::unique_ptr<tg::telegram::FileDownloader> files_;
-  std::unique_ptr<transport::AsyncStreamer<ImageRequest, ImageReply>>
+  std::unique_ptr<transport::StreamerPool<ImageRequest, ImageReply>>
       process_streamer_;
-  std::unique_ptr<transport::AsyncStreamer<SearchReq, SearchRsp>>
+  std::unique_ptr<transport::StreamerPool<SearchReq, SearchRsp>>
       search_streamer_;
   std::unique_ptr<tg::infra::Outbox> outbox_;
   std::unique_ptr<app::AppContext> ctx_;
@@ -308,9 +312,9 @@ TEST_F(BotCommandTest, ProcessCommandFromConfiguredBotViaReplyTo) {
   handler_->Handle(base, *ctx_);
 
   EXPECT_EQ(sender_.sent_count("getMessage"), 1);
-  EXPECT_EQ(process_streamer_->QueuedCount(), 1);
+  EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 1);
 
-  const auto request = process_streamer_->PeekFront();
+  const auto request = process_streamer_->lane(0)->PeekFront();
   ASSERT_TRUE(request.has_value());
   // image_id = "<chat_id>:<message_id>:<file_unique_id>" (v5 §1.2)
   EXPECT_EQ(request->image_id(), "-1001234567890:42:uid-photo");
@@ -332,10 +336,10 @@ TEST_F(BotCommandTest, SearchCommandTargetsArgsGivenChatAndMessage) {
   ASSERT_TRUE(handler_->CanHandle(base));
   handler_->Handle(base, *ctx_);
 
-  ASSERT_EQ(search_streamer_->QueuedCount(), 1);
-  EXPECT_EQ(process_streamer_->QueuedCount(), 0);  // search never processes
+  ASSERT_EQ(search_streamer_->lane(0)->QueuedCount(), 1);
+  EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 0);  // search never processes
 
-  const auto request = search_streamer_->PeekFront();
+  const auto request = search_streamer_->lane(0)->PeekFront();
   ASSERT_TRUE(request.has_value());
   // bare-ID conversion: supergroup dialog -> bare oid, uint32 range-checked
   EXPECT_EQ(request->oid(), 1234567890u);
@@ -350,7 +354,7 @@ TEST_F(BotCommandTest, OtherSenderIsIgnored) {
   td_api::object_ptr<td_api::Update> base = std::move(update);
   EXPECT_FALSE(handler_->CanHandle(base));
   handler_->Handle(base, *ctx_);
-  EXPECT_EQ(process_streamer_->QueuedCount(), 0);
+  EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 0);
   EXPECT_EQ(sender_.sent_count("getMessage"), 0);
 }
 
@@ -359,7 +363,7 @@ TEST_F(BotCommandTest, UnknownCommandIsIgnored) {
   td_api::object_ptr<td_api::Update> base = std::move(update);
   EXPECT_FALSE(handler_->CanHandle(base));
   handler_->Handle(base, *ctx_);
-  EXPECT_EQ(process_streamer_->QueuedCount(), 0);
+  EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 0);
 }
 
 TEST_F(BotCommandTest, CommandWithoutTargetIsIgnored) {
@@ -368,7 +372,7 @@ TEST_F(BotCommandTest, CommandWithoutTargetIsIgnored) {
   EXPECT_TRUE(handler_->CanHandle(base));  // right sender + right command...
   handler_->Handle(base, *ctx_);           // ...but no target -> nothing sent
   EXPECT_EQ(sender_.sent_count("getMessage"), 0);
-  EXPECT_EQ(process_streamer_->QueuedCount(), 0);
+  EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 0);
 }
 
 TEST_F(BotCommandTest, GetMessageErrorIsSwallowed) {
@@ -376,7 +380,7 @@ TEST_F(BotCommandTest, GetMessageErrorIsSwallowed) {
   auto update = MakeCommandUpdate(777, -1'001'234'567'890LL, "/process", true, 42);
   td_api::object_ptr<td_api::Update> base = std::move(update);
   handler_->Handle(base, *ctx_);
-  EXPECT_EQ(process_streamer_->QueuedCount(), 0);
+  EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 0);
 }
 
 TEST_F(BotCommandTest, DisabledHandlerClaimsNothing) {

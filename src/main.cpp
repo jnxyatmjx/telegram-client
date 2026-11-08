@@ -11,6 +11,8 @@
 #include <app/Config.h>
 #include <common/Logger.h>
 
+#include <td/telegram/Log.h>
+
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
@@ -73,6 +75,12 @@ int main(int argc, char* argv[]) {
 
   std::signal(SIGINT, HandleSignal);
   std::signal(SIGTERM, HandleSignal);
+
+  // TDLib writes its own logs straight to stderr at its own default
+  // verbosity, independent of our spdlog level — that is the per-second
+  // "Begin/End to wait for updates" chatter. Warnings and errors only;
+  // our own spdlog lines still carry the auth state and progress.
+  td::Log::set_verbosity_level(2);
 
   app::Config config;
   try {

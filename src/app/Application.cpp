@@ -19,6 +19,12 @@ using features::media_thumbnail::SearchHandler;
 constexpr auto kWorkerDrainTimeout = std::chrono::seconds(10);  // v5 §3.6
 constexpr auto kAuthReadyTimeout = std::chrono::seconds(300);
 constexpr auto kSignalPollInterval = std::chrono::milliseconds(200);
+// Auth wait polls in slices of this length so a SIGINT/SIGTERM during the
+// (up to 300 s) auth wait is noticed promptly.
+constexpr auto kAuthPollInterval = std::chrono::milliseconds(200);
+// Distinct Run() result: shutdown was requested while waiting for auth.
+// (0 = authorized, 1 = auth failed/timed out.)
+constexpr int kAuthInterrupted = 2;
 constexpr std::size_t kSweepBatch = 100;
 
 // Permanent failures: retrying cannot help (v5 §2.5).
@@ -208,8 +214,21 @@ void Application::StopOutboxRetryThread() {
 }
 
 int Application::WaitForAuthOrFailure() {
-  const bool ready = telegram_.auth().WaitForReady(kAuthReadyTimeout);
-  if (ready) return 0;
+  // Poll in short slices: a plain 300 s WaitForReady() would swallow
+  // SIGINT/SIGTERM for the whole auth wait, because the signal handler
+  // only sets a flag that nothing checks until the wait returns.
+  const auto deadline = std::chrono::steady_clock::now() + kAuthReadyTimeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (ShutdownRequested() || g_global_stop.load(std::memory_order_relaxed)) {
+      spdlog::info("telegram: shutdown requested while waiting for authorization");
+      return kAuthInterrupted;
+    }
+    if (telegram_.auth().WaitForReady(kAuthPollInterval)) break;
+  }
+  if (telegram_.auth().IsReady()) return 0;
+  if (ShutdownRequested() || g_global_stop.load(std::memory_order_relaxed)) {
+    return kAuthInterrupted;
+  }
   spdlog::error(
       "telegram: authorization did not complete (state: {}). A live login "
       "needs: api_id/api_hash, phone, TG_TELEGRAM_CODE (and "
@@ -235,16 +254,21 @@ int Application::Run() {
   telegram_.Start(config_.telegram);
 
   const int auth_result = WaitForAuthOrFailure();
-  if (auth_result != 0) {
+  if (auth_result == kAuthInterrupted) {
+    // Shutdown requested during auth: skip straight to the ordered
+    // shutdown below. The retry thread was never started (its Stop is a
+    // no-op in that case); streamers and telegram were started above, so
+    // they still need their ordered Stop calls.
+  } else if (auth_result != 0) {
     return auth_result;
-  }
+  } else {
+    StartOutboxRetryThread();
 
-  StartOutboxRetryThread();
-
-  // Signal wait: both stop paths are relaxed atomic stores (async-signal
-  // safe), polled here.
-  while (!ShutdownRequested() && !g_global_stop.load(std::memory_order_relaxed)) {
-    std::this_thread::sleep_for(kSignalPollInterval);
+    // Signal wait: both stop paths are relaxed atomic stores (async-signal
+    // safe), polled here.
+    while (!ShutdownRequested() && !g_global_stop.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(kSignalPollInterval);
+    }
   }
 
   // v5 §3.6 ordered shutdown:

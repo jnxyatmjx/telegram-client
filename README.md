@@ -542,6 +542,19 @@ in the certificate.
 A live run needs a real config (see Open items below): Telegram
 api_id/api_hash, the target gRPC server, and the trigger bot's user_id.
 
+First login is a two-step flow: the login code is read from the
+environment (`TG_TELEGRAM_CODE`, and `TG_TELEGRAM_PASSWORD` for 2FA),
+so start once, read the SMS code Telegram sends, then restart with the
+code set — after that the session is stored in `database_directory`
+and later runs log in without a code.
+
+Stop with Ctrl+C (SIGINT) or `kill <pid>` (SIGTERM): the program
+drains in-flight work, finishes the gRPC streams, closes the TDLib
+session and exits after printing `application: stopped cleanly`.
+Never `kill -9` — it skips that shutdown. TDLib's own logging is
+silenced to warnings/errors at startup, so the console shows only the
+program's own log lines.
+
 ## Test
 
 ```bash

@@ -68,11 +68,15 @@ sudo apt-get update && sudo apt-get install -y \
   build-essential cmake git gperf php-cli ccache pkg-config \
   libssl-dev zlib1g-dev \
   libgrpc++-dev protobuf-compiler protobuf-compiler-grpc \
-  libspdlog-dev libsqlite3-dev libgtest-dev
+  libspdlog-dev libsqlite3-dev libgtest-dev libgmock-dev
 ```
 
-Same package names as Ubuntu 24.04; the installed versions are just
-older (gRPC 1.30.2, protobuf 3.12.4, spdlog 1.8.1, SQLite 3.34.1,
+Same package names as Ubuntu 24.04, plus `libgmock-dev`: Debian 11
+splits Google Mock into its own package — `libgtest-dev` ships only
+gtest, but its `GTestTargets.cmake` still references `libgmock.a`, so
+`find_package(GTest)` fails at configure time without it. (Ubuntu
+24.04's `libgtest-dev` includes gmock, so it isn't needed there.) The
+installed versions are just older (gRPC 1.30.2, protobuf 3.12.4, spdlog 1.8.1, SQLite 3.34.1,
 GTest 1.10.0, OpenSSL 1.1.1, CMake 3.18.4, GCC 10.2.1). The
 `pkg-config` package is required — it is how gRPC is found on
 bullseye.

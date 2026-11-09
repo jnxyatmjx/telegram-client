@@ -4,7 +4,7 @@
 #include <common/Logger.h>
 #include <features/bot_command/CommandParser.h>
 
-#include <chrono>
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -148,43 +148,50 @@ void BotCommandHandler::Handle(td_api::object_ptr<td_api::Update>& update,
   auto request = td_api::make_object<td_api::getMessage>();
   request->chat_id_ = target->first;
   request->message_id_ = target->second;
-  auto future = ctx.telegram.SendWithFuture(std::move(request));
 
-  const auto timeout = std::chrono::milliseconds(config_.get_message_timeout_ms);
-  if (future.wait_for(timeout) != std::future_status::ready) {
-    spdlog::error("bot_command: getMessage({}, {}) timed out", target->first,
-                  target->second);
-    return;
-  }
-  auto response = future.get();
-  if (response.object == nullptr) {
-    spdlog::error("bot_command: getMessage returned no object");
-    return;
-  }
-  if (response.object->get_id() == td_api::error::ID) {
-    const auto error = td_api::move_object_as<td_api::error>(response.object);
-    spdlog::error("bot_command: getMessage({}, {}) failed: code {}: {}",
-                  target->first, target->second, error->code_, error->message_);
-    return;
-  }
-  const auto target_message =
-      td_api::move_object_as<td_api::message>(std::move(response.object));
-
-  media_thumbnail::PipelineResult result;
-  if (action == Action::kProcess) {
-    result = process_.SendProcessImages(*target_message, ctx);
-  } else {
-    result = search_.SendSearchImages(*target_message, ctx);
-  }
-
-  if (result.ok) {
-    spdlog::info("bot_command: {} dispatched {}", action == Action::kProcess
-                                                    ? "process"
-                                                    : "search",
-                 result.image_id);
-  } else {
-    spdlog::error("bot_command: {} failed: {}", result.image_id, result.error);
-  }
+  // Async: send getMessage and return immediately — no worker thread waits
+  // for the reply. The callback (Receive thread) only posts the pipeline
+  // kick-off to the pool; the pipeline itself is async too, so one
+  // command's slow getMessage/download can never block another message.
+  // No timeout on the reply: a getMessage that never answers just means
+  // this command is dropped (the bot can re-issue it); TDLib answers or
+  // errors in practice.
+  const auto chat_id = target->first;
+  const auto message_id = target->second;
+  ctx.telegram.Send(
+      std::move(request),
+      [this, action, chat_id, message_id,
+       &ctx](td::ClientManager::Response&& response) {
+        if (response.object == nullptr) {
+          spdlog::error("bot_command: getMessage({}, {}) returned no object",
+                        chat_id, message_id);
+          return;
+        }
+        if (response.object->get_id() == td_api::error::ID) {
+          const auto error =
+              td_api::move_object_as<td_api::error>(response.object);
+          spdlog::error("bot_command: getMessage({}, {}) failed: code {}: {}",
+                        chat_id, message_id, error->code_, error->message_);
+          return;
+        }
+        // The message is move-only; ride it into the posted task via a
+        // shared_ptr (the task must stay copyable for std::function).
+        auto target_message = std::make_shared<
+            td_api::object_ptr<td_api::message>>(
+            td_api::move_object_as<td_api::message>(
+                std::move(response.object)));
+        if (!ctx.workers.Post([this, action, target_message, &ctx] {
+              if (action == Action::kProcess) {
+                process_.SendProcessImages(**target_message, ctx);
+              } else {
+                search_.SendSearchImages(**target_message, ctx);
+              }
+            })) {
+          spdlog::error("bot_command: worker pool rejected {} for ({}, {})",
+                        action == Action::kProcess ? "process" : "search",
+                        chat_id, message_id);
+        }
+      });
 }
 
 }  // namespace tg::features::bot_command

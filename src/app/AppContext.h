@@ -5,8 +5,16 @@
 // handler; references owned by Application, which outlives all workers.
 // Deviation from v5: `telegram` is the ITdSender& seam (TelegramClient
 // implements it) so handlers are unit-testable against a fake sender.
+//
+// Async rule (2026-11-09): message processing is fully async — no worker
+// thread ever blocks on a TDLib response or a download. A handler stage
+// that needs an async result (getMessage, downloadFile) registers a
+// callback and returns; the callback only POSTS the next stage to
+// `workers` (it runs on the TDLib Receive thread, so it must be cheap and
+// must never block). That is why the pool is in the context.
 
 #include <app/Config.h>
+#include <app/WorkerPool.h>
 #include <infra/Outbox.h>
 #include <telegram/FileDownloader.h>
 #include <telegram/TelegramClient.h>
@@ -17,6 +25,8 @@
 namespace tg::app {
 
 struct AppContext {
+  // Where continuations run: async callbacks post their next stage here.
+  WorkerPool& workers;
   telegram::ITdSender& telegram;
   telegram::FileDownloader& files;
   // Pools deal requests round-robin across grpc.connections lanes; the

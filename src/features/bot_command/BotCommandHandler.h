@@ -8,8 +8,10 @@
 // CanHandle (cheap, Receive thread): updateNewMessage + enabled + right
 // sender + messageText starting with a configured command.
 // Handle (worker thread): resolve the target message (reply-to, or
-// "chat_id message_id" args) via getMessage, then dispatch to
-// MediaThumbnailHandler (/process) or SearchHandler (/search).
+// "chat_id message_id" args) and send getMessage — then RETURN. The
+// getMessage reply arrives on the Receive thread, which posts the pipeline
+// kick-off (MediaThumbnailHandler / SearchHandler, both async) to the pool.
+// No stage ever blocks on another message's I/O (2026-11-09).
 
 #include <app/Config.h>
 #include <features/media_thumbnail/MediaThumbnailHandler.h>

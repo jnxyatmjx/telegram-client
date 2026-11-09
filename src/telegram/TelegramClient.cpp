@@ -83,16 +83,6 @@ std::int64_t TelegramClient::Send(td_api::object_ptr<td_api::Function>&& request
   return static_cast<std::int64_t>(request_id);
 }
 
-std::future<td::ClientManager::Response> TelegramClient::SendWithFuture(
-    td_api::object_ptr<td_api::Function>&& request) {
-  auto promise = std::make_shared<std::promise<td::ClientManager::Response>>();
-  auto future = promise->get_future();
-  Send(std::move(request), [promise](td::ClientManager::Response&& response) {
-    promise->set_value(std::move(response));
-  });
-  return future;
-}
-
 void TelegramClient::ReceiveLoop() {
   // Single caller of manager_.receive() in the whole process (v5 §3.3).
   // 1s poll: shutdown responsiveness over idle CPU (v5 sketches 10s; that

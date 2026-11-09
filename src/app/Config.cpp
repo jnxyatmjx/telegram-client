@@ -298,8 +298,6 @@ Config Config::FromFile(const std::string& path) {
           Int(*b, "command_bot_user_id", cfg.bot_command.command_bot_user_id);
       cfg.bot_command.process_command = Str(*b, "process_command", cfg.bot_command.process_command);
       cfg.bot_command.search_command = Str(*b, "search_command", cfg.bot_command.search_command);
-      cfg.bot_command.get_message_timeout_ms =
-          Int(*b, "get_message_timeout_ms", cfg.bot_command.get_message_timeout_ms);
     }
     if (const YamlNode* a = f->Find("auto_search")) {
       cfg.auto_search.enabled = Bool(*a, "enabled", cfg.auto_search.enabled);

@@ -5,19 +5,24 @@
 
 #include <stdexcept>
 #include <utility>
-#include <vector>
 
 namespace tg::telegram {
 
 FileDownloader::FileDownloader(ITdSender& sender) : sender_(sender) {}
 
-std::future<std::string> FileDownloader::Download(std::int32_t file_id,
-                                                  std::chrono::milliseconds timeout) {
-  std::promise<std::string> promise;
-  std::future<std::string> future = promise.get_future();
+void FileDownloader::DownloadAsync(std::int32_t file_id,
+                                   DownloadCallback on_done) {
+  bool already_pending = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    pending_.emplace(file_id, std::move(promise));
+    auto& callbacks = pending_[file_id];
+    callbacks.push_back(std::move(on_done));
+    already_pending = callbacks.size() > 1;
+  }
+  if (already_pending) {
+    // A downloadFile request for this file is already in flight; the
+    // callback rides along and fires when it completes. No second request.
+    return;
   }
 
   auto request = td_api::make_object<td_api::downloadFile>();
@@ -32,21 +37,12 @@ std::future<std::string> FileDownloader::Download(std::int32_t file_id,
   const std::int32_t id = file_id;
   sender_.Send(std::move(request), [this, id](td::ClientManager::Response&& response) {
     if (response.object == nullptr) {
-      return;  // shutdown filler; FailAll handles the promise
+      return;  // shutdown filler; FailAll completes the pending callbacks
     }
     if (response.object->get_id() == td_api::error::ID) {
-      std::promise<std::string> promise;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = pending_.find(id);
-        if (it == pending_.end()) return;
-        promise = std::move(it->second);
-        pending_.erase(it);
-      }
       const auto error = td_api::move_object_as<td_api::error>(response.object);
-      promise.set_exception(std::make_exception_ptr(std::runtime_error(
-          "downloadFile failed: code " + std::to_string(error->code_) + ": " +
-          error->message_)));
+      FailOne(id, "downloadFile failed: code " + std::to_string(error->code_) +
+                      ": " + error->message_);
       return;
     }
     if (response.object->get_id() == td_api::file::ID) {
@@ -54,8 +50,21 @@ std::future<std::string> FileDownloader::Download(std::int32_t file_id,
       MaybeComplete(id, *file);
     }
   });
+}
 
-  (void)timeout;  // enforced by the caller waiting on the future (v5 §2.2)
+std::future<std::string> FileDownloader::Download(
+    std::int32_t file_id, std::chrono::milliseconds /*timeout*/) {
+  // Timeout is enforced by the caller via future::wait_for, as before.
+  auto promise = std::make_shared<std::promise<std::string>>();
+  auto future = promise->get_future();
+  DownloadAsync(file_id, [promise](DownloadResult result) {
+    if (result.error.empty()) {
+      promise->set_value(std::move(result.local_path));
+    } else {
+      promise->set_exception(
+          std::make_exception_ptr(std::runtime_error(result.error)));
+    }
+  });
   return future;
 }
 
@@ -69,38 +78,49 @@ void FileDownloader::MaybeComplete(std::int32_t file_id, const td_api::file& fil
       file.local_->path_.empty()) {
     return;
   }
-  std::promise<std::string> promise;
-  bool found = false;
+  std::vector<DownloadCallback> callbacks;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = pending_.find(file_id);
-    if (it != pending_.end()) {
-      promise = std::move(it->second);
-      pending_.erase(it);
-      found = true;
-    }
+    if (it == pending_.end()) return;
+    callbacks = std::move(it->second);
+    pending_.erase(it);
   }
-  if (found) {
-    // set_value on a worker thread blocking in .get() — safe, no lock held.
-    promise.set_value(file.local_->path_);
-    spdlog::info("file_downloader: file {} ready at {}", file_id,
-                 file.local_->path_);
+  // Invoke WITHOUT holding the mutex: the callback posts to a worker pool
+  // and must never block the Receive thread.
+  const std::string path = file.local_->path_;
+  spdlog::info("file_downloader: file {} ready at {}", file_id, path);
+  for (auto& callback : callbacks) {
+    callback(DownloadResult{path, ""});
+  }
+}
+
+void FileDownloader::FailOne(std::int32_t file_id, const std::string& error) {
+  std::vector<DownloadCallback> callbacks;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = pending_.find(file_id);
+    if (it == pending_.end()) return;
+    callbacks = std::move(it->second);
+    pending_.erase(it);
+  }
+  for (auto& callback : callbacks) {
+    callback(DownloadResult{"", error});
   }
 }
 
 void FileDownloader::FailAll(const std::string& reason) {
-  std::vector<std::promise<std::string>> failed;
+  std::map<std::int32_t, std::vector<DownloadCallback>> failed;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    failed.reserve(pending_.size());
-    for (auto& [id, promise] : pending_) {
-      failed.push_back(std::move(promise));
-    }
+    failed = std::move(pending_);
     pending_.clear();
   }
-  for (auto& promise : failed) {
-    promise.set_exception(
-        std::make_exception_ptr(std::runtime_error("download aborted: " + reason)));
+  for (auto& [id, callbacks] : failed) {
+    (void)id;
+    for (auto& callback : callbacks) {
+      callback(DownloadResult{"", "download aborted: " + reason});
+    }
   }
 }
 

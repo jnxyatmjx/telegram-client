@@ -64,7 +64,6 @@ struct BotCommandConfig {
   std::int64_t command_bot_user_id = 0;
   std::string process_command = "/process";  // placeholder names (user TBD)
   std::string search_command = "/search";
-  std::int64_t get_message_timeout_ms = 10'000;
 };
 
 struct AutoSearchConfig {

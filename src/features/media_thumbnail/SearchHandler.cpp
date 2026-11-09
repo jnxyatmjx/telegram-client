@@ -13,8 +13,9 @@
 namespace tg::features::media_thumbnail {
 
 namespace {
-constexpr auto kDownloadTimeout = std::chrono::seconds(30);
-constexpr auto kEnqueueTimeout = std::chrono::seconds(5);
+// Non-blocking Enqueue attempt in the finish stage (same reason as
+// MediaThumbnailHandler: the worker must not wait on a full queue).
+constexpr auto kEnqueueTimeout = std::chrono::milliseconds(0);
 }  // namespace
 
 void SearchCorrelationTable::Register(std::uint32_t oid, std::uint32_t id,
@@ -41,55 +42,77 @@ SearchHandler::SearchHandler(MediaExtractor extractor,
                              telegram::FileDownloader& files)
     : extractor_(std::move(extractor)), sender_(sender), files_(files) {}
 
-PipelineResult SearchHandler::SendSearchImages(const td_api::message& target,
-                                               app::AppContext& ctx) const {
-  PipelineResult result;
-
+void SearchHandler::SendSearchImages(const td_api::message& target,
+                                     app::AppContext& ctx) const {
   std::string why;
   const auto media = extractor_.Extract(target, &why);
   if (!media) {
-    result.error = "extract failed: " + why;
-    return result;
+    spdlog::error("search: extract failed: {}", why);
+    return;
   }
 
-  // Bare-ID conversion WITH range checks (v5 §1.3 hard rule 1).
+  // Bare-ID conversion WITH range checks (v5 §1.3 hard rule 1). Pure
+  // computation — safe to do here, before the download starts.
   const auto oid = common::ToBareChatId(media->chat_id);
   if (!oid) {
-    result.error = "chat_id " + std::to_string(media->chat_id) +
-                   " does not fit uint32 bare id — NOT sending (no truncation)";
-    spdlog::error("search: {}", result.error);
-    return result;
+    spdlog::error("search: chat_id {} does not fit uint32 bare id — NOT "
+                  "sending (no truncation)", media->chat_id);
+    return;
   }
   const auto bare_message_id = common::ToBareMessageId(media->message_id);
   if (!bare_message_id) {
-    result.error = "message_id " + std::to_string(media->message_id) +
-                   " does not fit uint32 — NOT sending (no truncation)";
-    spdlog::error("search: {}", result.error);
-    return result;
+    spdlog::error("search: message_id {} does not fit uint32 — NOT sending "
+                  "(no truncation)", media->message_id);
+    return;
   }
 
-  auto future = files_.Download(media->file_id, kDownloadTimeout);
-  std::string local_path;
-  try {
-    if (future.wait_for(kDownloadTimeout) != std::future_status::ready) {
-      result.error = "download timed out after 30s";
-      return result;
-    }
-    local_path = future.get();
-  } catch (const std::exception& e) {
-    result.error = std::string("download failed: ") + e.what();
-    return result;
-  }
+  // Start the download and return immediately — the worker thread is free
+  // for the next message while this one downloads.
+  const ExtractedMedia media_copy = *media;
+  files_.DownloadAsync(
+      media->file_id,
+      [this, media_copy, &ctx](telegram::FileDownloader::DownloadResult result) {
+        OnDownloaded(media_copy, std::move(result), ctx);
+      });
+}
 
+void SearchHandler::OnDownloaded(
+    ExtractedMedia media, telegram::FileDownloader::DownloadResult result,
+    app::AppContext& ctx) const {
+  // Runs on the TDLib Receive thread (or inline, on the calling thread,
+  // when the sender answers synchronously, e.g. in tests). Cheap only:
+  // post the finish stage, do no I/O here.
+  if (!result.error.empty()) {
+    spdlog::error("search: download failed: {}", result.error);
+    return;
+  }
+  const std::string image_id = common::MakeImageId(
+      media.chat_id, media.message_id, media.file_unique_id);
+  if (!ctx.workers.Post([this, media, path = result.local_path,
+                         &ctx]() mutable {
+        FinishSearch(std::move(media), std::move(path), ctx);
+      })) {
+    spdlog::error("search: worker pool rejected finish stage for {}",
+                  image_id);
+  }
+}
+
+void SearchHandler::FinishSearch(ExtractedMedia media, std::string local_path,
+                                 app::AppContext& ctx) const {
   auto bytes =
       infra::ReadFileBytes(local_path, ctx.config.media_thumbnail.max_thumb_bytes);
   if (!bytes) {
-    result.error = "cannot read downloaded thumbnail: " + local_path;
-    return result;
+    spdlog::error("search: cannot read downloaded thumbnail: {}", local_path);
+    return;
   }
 
+  // Bare IDs again (same conversion as the kick-off stage; both are pure).
+  const auto oid = common::ToBareChatId(media.chat_id);
+  const auto bare_message_id = common::ToBareMessageId(media.message_id);
+  if (!oid || !bare_message_id) return;  // already checked; cannot happen
+
   const std::string image_id =
-      common::MakeImageId(media->chat_id, media->message_id, media->file_unique_id);
+      common::MakeImageId(media.chat_id, media.message_id, media.file_unique_id);
   spdlog::info("search: oid={} id={} {} {} bytes sha256={}", oid->oid,
                *bare_message_id, image_id, bytes->size(),
                infra::Sha256::Hex(*bytes));
@@ -100,19 +123,16 @@ PipelineResult SearchHandler::SendSearchImages(const td_api::message& target,
   request.set_image_data(std::move(*bytes));
 
   correlation_.Register(oid->oid, *bare_message_id,
-                        {media->chat_id, media->message_id, image_id});
+                        {media.chat_id, media.message_id, image_id});
 
   if (!ctx.search_images.Enqueue(std::move(request), kEnqueueTimeout)) {
     // SearchReq is not in the Outbox: re-triggering the search is the
     // recovery path (v5 §2.4).
-    result.image_id = image_id;
-    result.error = "write queue full/timeout; SearchReq dropped (not replayed)";
-    return result;
+    spdlog::warn("search: {} write queue full; SearchReq dropped (not replayed)",
+                 image_id);
+    return;
   }
-
-  result.ok = true;
-  result.image_id = image_id;
-  return result;
+  spdlog::info("search: dispatched {}", image_id);
 }
 
 }  // namespace tg::features::media_thumbnail

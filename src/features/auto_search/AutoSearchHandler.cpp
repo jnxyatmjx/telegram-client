@@ -99,13 +99,10 @@ void AutoSearchHandler::Handle(td_api::object_ptr<td_api::Update>& update,
     recent_[key] = std::chrono::steady_clock::now();
   }
 
-  // SearchImages ONLY (never ProcessImages, v5 §2.7 step 5).
-  const auto result = search_.SendSearchImages(*message, ctx);
-  if (result.ok) {
-    spdlog::info("auto_search: dispatched {}", result.image_id);
-  } else {
-    spdlog::error("auto_search: failed: {}", result.error);
-  }
+  // SearchImages ONLY (never ProcessImages, v5 §2.7 step 5). Async
+  // kick-off: returns immediately once the download starts; the outcome
+  // is logged by the pipeline's finish stage.
+  search_.SendSearchImages(*message, ctx);
 }
 
 }  // namespace tg::features::auto_search

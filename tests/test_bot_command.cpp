@@ -2,6 +2,7 @@
 // bot's commands are accepted; other senders / unknown commands ignored;
 // target resolution via reply-to and via "chat_id message_id" args.
 #include <app/AppContext.h>
+#include <app/WorkerPool.h>
 #include <features/bot_command/BotCommandHandler.h>
 #include <features/bot_command/CommandParser.h>
 #include <features/media_thumbnail/MediaExtractor.h>
@@ -15,10 +16,13 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <set>
+#include <thread>
 #include <vector>
 #include <string>
 
@@ -32,6 +36,9 @@ namespace transport = tg::transport;
 namespace {
 
 // Synchronous fake TDLib: answers getMessage and downloadFile inline.
+// For the async regression test it can also DELAY a downloadFile response:
+// the response is delivered later, from a background thread, which is how
+// a slow TDLib download really arrives (Send itself returns at once).
 class FakeTdSender : public tg::telegram::ITdSender {
  public:
   std::int64_t Send(td_api::object_ptr<td_api::Function>&& request,
@@ -41,8 +48,22 @@ class FakeTdSender : public tg::telegram::ITdSender {
     ++sent_[type];
     td::ClientManager::Response response;
     response.request_id = next_id_++;
+    const std::int32_t file_id =
+        request->get_id() == td_api::downloadFile::ID
+            ? static_cast<td_api::downloadFile*>(request.get())->file_id_
+            : 0;
     response.object = Answer(std::move(request));
-    callback(std::move(response));
+    if (file_id != 0 && slow_file_ids_.count(file_id) > 0) {
+      // Slow download: deliver the response later, from another thread.
+      slow_threads_.emplace_back(
+          [cb = std::move(callback), resp = std::move(response),
+           delay = slow_delay_ms_]() mutable {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            cb(std::move(resp));
+          });
+    } else {
+      callback(std::move(response));
+    }
     return static_cast<std::int64_t>(response.request_id);
   }
 
@@ -53,6 +74,24 @@ class FakeTdSender : public tg::telegram::ITdSender {
 
   void set_target_message(td_api::object_ptr<td_api::message> message) {
     target_message_ = std::move(message);
+  }
+
+  // Extra targets, looked up by message id for getMessage.
+  void add_target_message(td_api::object_ptr<td_api::message> message) {
+    targets_[message->id_] = std::move(message);
+  }
+
+  // file_ids whose downloadFile response is delayed (background thread).
+  void set_slow_downloads(std::set<std::int32_t> file_ids, int delay_ms) {
+    slow_file_ids_ = std::move(file_ids);
+    slow_delay_ms_ = delay_ms;
+  }
+
+  void join_slow_threads() {
+    for (auto& t : slow_threads_) {
+      if (t.joinable()) t.join();
+    }
+    slow_threads_.clear();
   }
 
   std::string thumbnail_path;
@@ -73,6 +112,14 @@ class FakeTdSender : public tg::telegram::ITdSender {
     switch (request->get_id()) {
       case td_api::getMessage::ID: {
         // One consumer per test: hand the canned message over (moved).
+        const auto message_id =
+            static_cast<td_api::getMessage*>(request.get())->message_id_;
+        const auto it = targets_.find(message_id);
+        if (it != targets_.end()) {
+          auto message = std::move(it->second);
+          targets_.erase(it);
+          return message;
+        }
         if (target_message_ == nullptr) {
           return td_api::make_object<td_api::error>(404, "Message not found");
         }
@@ -98,6 +145,10 @@ class FakeTdSender : public tg::telegram::ITdSender {
   std::uint64_t next_id_ = 1;
   std::map<std::string, int> sent_;
   td_api::object_ptr<td_api::message> target_message_;
+  std::map<std::int64_t, td_api::object_ptr<td_api::message>> targets_;
+  std::set<std::int32_t> slow_file_ids_;
+  int slow_delay_ms_ = 2000;
+  std::vector<std::thread> slow_threads_;
 };
 
 td_api::object_ptr<td_api::formattedText> MakeText(const std::string& text) {
@@ -122,7 +173,8 @@ td_api::object_ptr<td_api::file> MakeFile(int32_t id, const std::string& uid,
 
 // A target photo message: one 320x240 tier + caption.
 td_api::object_ptr<td_api::message> MakePhotoMessage(
-    std::int64_t chat_id, std::int64_t message_id, const std::string& thumb_path) {
+    std::int64_t chat_id, std::int64_t message_id, const std::string& thumb_path,
+    std::int32_t file_id = 4242, const std::string& uid = "uid-photo") {
   auto message = td_api::make_object<td_api::message>();
   message->id_ = message_id;
   message->chat_id_ = chat_id;
@@ -130,7 +182,7 @@ td_api::object_ptr<td_api::message> MakePhotoMessage(
   size->type_ = "m";
   size->width_ = 320;
   size->height_ = 240;
-  size->photo_ = MakeFile(4242, "uid-photo", thumb_path);
+  size->photo_ = MakeFile(file_id, uid, thumb_path);
   auto photo = td_api::make_object<td_api::photo>();
   photo->sizes_.push_back(std::move(size));
   auto content = td_api::make_object<td_api::messagePhoto>();
@@ -196,6 +248,8 @@ class BotCommandTest : public ::testing::Test {
                          thumb_path_));
 
     files_ = std::make_unique<tg::telegram::FileDownloader>(sender_);
+    // The async pipeline posts continuations here; the tests wait for them.
+    workers_ = std::make_unique<app::WorkerPool>(2u);
     // Single-lane pools: the handler tests inspect lane 0's queue.
     process_streamer_ = std::make_unique<
         transport::StreamerPool<ImageRequest, ImageReply>>(
@@ -207,8 +261,8 @@ class BotCommandTest : public ::testing::Test {
             MakeStreamerOptions<SearchReq, SearchRsp>("SearchImages")});
     outbox_ = std::make_unique<tg::infra::Outbox>(outbox_path_);
     ctx_ = std::make_unique<app::AppContext>(app::AppContext{
-        sender_, *files_, *process_streamer_, *search_streamer_, *outbox_,
-        config_});
+        *workers_, sender_, *files_, *process_streamer_, *search_streamer_,
+        *outbox_, config_});
 
     search_handler_ = std::make_unique<media::SearchHandler>(
         media::MediaExtractor(config_.media_thumbnail), sender_, *files_);
@@ -222,13 +276,29 @@ class BotCommandTest : public ::testing::Test {
   void TearDown() override {
     handler_.reset();
     search_handler_.reset();
+    // Drain the pool first: queued finish stages use ctx_/outbox_/streamers.
+    workers_.reset();
     ctx_.reset();
     outbox_.reset();
     process_streamer_.reset();
     search_streamer_.reset();
     files_.reset();
+    sender_.join_slow_threads();
     std::remove(thumb_path_.c_str());
     std::remove(outbox_path_.c_str());
+  }
+
+  // The pipeline is async: Handle returns after kicking it off, so the
+  // tests poll for the queued request instead of asserting immediately.
+  template <typename Pool>
+  bool WaitForQueued(Pool& pool, std::size_t count) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (pool.lane(0)->QueuedCount() >= count) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
   }
 
   std::string thumb_path_;
@@ -236,6 +306,7 @@ class BotCommandTest : public ::testing::Test {
   app::Config config_;
   FakeTdSender sender_;
   std::unique_ptr<tg::telegram::FileDownloader> files_;
+  std::unique_ptr<app::WorkerPool> workers_;
   std::unique_ptr<transport::StreamerPool<ImageRequest, ImageReply>>
       process_streamer_;
   std::unique_ptr<transport::StreamerPool<SearchReq, SearchRsp>>
@@ -312,6 +383,7 @@ TEST_F(BotCommandTest, ProcessCommandFromConfiguredBotViaReplyTo) {
   handler_->Handle(base, *ctx_);
 
   EXPECT_EQ(sender_.sent_count("getMessage"), 1);
+  ASSERT_TRUE(WaitForQueued(*process_streamer_, 1));
   EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 1);
 
   const auto request = process_streamer_->lane(0)->PeekFront();
@@ -336,7 +408,8 @@ TEST_F(BotCommandTest, SearchCommandTargetsArgsGivenChatAndMessage) {
   ASSERT_TRUE(handler_->CanHandle(base));
   handler_->Handle(base, *ctx_);
 
-  ASSERT_EQ(search_streamer_->lane(0)->QueuedCount(), 1);
+  ASSERT_TRUE(WaitForQueued(*search_streamer_, 1));
+  EXPECT_EQ(search_streamer_->lane(0)->QueuedCount(), 1);
   EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 0);  // search never processes
 
   const auto request = search_streamer_->lane(0)->PeekFront();
@@ -347,6 +420,40 @@ TEST_F(BotCommandTest, SearchCommandTargetsArgsGivenChatAndMessage) {
   EXPECT_FALSE(request->image_data().empty());
   // SearchReq is NOT in the Outbox (v5 §2.4)
   EXPECT_FALSE(outbox_->Get("-1001234567890:42:uid-photo").has_value());
+}
+
+TEST_F(BotCommandTest, SecondCommandCompletesWhileFirstDownloadPending) {
+  // Async regression test (2026-11-09): message A's download is slow
+  // (2 s), message B's is instant. With the old blocking pipeline the
+  // worker handling A sat in future::wait_for for the whole download, so
+  // B could not finish until A did. With the async pipeline, B's request
+  // reaches the streamer queue while A is still downloading.
+  sender_.set_slow_downloads({4242}, 2000);
+  sender_.add_target_message(MakePhotoMessage(sender_.target_chat_id_, 42,
+                                              thumb_path_, 4242, "uid-photo-a"));
+  sender_.add_target_message(MakePhotoMessage(sender_.target_chat_id_, 43,
+                                              thumb_path_, 4243, "uid-photo-b"));
+
+  auto update_a =
+      MakeCommandUpdate(777, -1'001'234'567'890LL, "/process", true, 42);
+  td_api::object_ptr<td_api::Update> base_a = std::move(update_a);
+  handler_->Handle(base_a, *ctx_);
+  auto update_b =
+      MakeCommandUpdate(777, -1'001'234'567'890LL, "/process", true, 43);
+  td_api::object_ptr<td_api::Update> base_b = std::move(update_b);
+  handler_->Handle(base_b, *ctx_);
+
+  // B finishes first: well before A's 2 s download, the queue holds
+  // exactly B's request.
+  ASSERT_TRUE(WaitForQueued(*process_streamer_, 1));
+  EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 1u);
+  const auto first = process_streamer_->lane(0)->PeekFront();
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(first->image_id(), "-1001234567890:43:uid-photo-b");
+
+  // A lands later, after its slow download completes.
+  ASSERT_TRUE(WaitForQueued(*process_streamer_, 2));
+  EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 2u);
 }
 
 TEST_F(BotCommandTest, OtherSenderIsIgnored) {

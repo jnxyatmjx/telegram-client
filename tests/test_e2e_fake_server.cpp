@@ -14,6 +14,7 @@
 
 #include <app/AppContext.h>
 #include <app/Config.h>
+#include <app/WorkerPool.h>
 #include <common/Idempotency.h>
 #include <features/media_thumbnail/MediaExtractor.h>
 #include <features/media_thumbnail/MediaThumbnailHandler.h>
@@ -277,14 +278,16 @@ class E2ETest : public ::testing::Test {
     });
 
     outbox_ = std::make_unique<infra::Outbox>(db_path_);
+    // The async pipeline posts continuations here.
+    workers_ = std::make_unique<app::WorkerPool>(2u);
     media::MediaExtractor extractor(config_.media_thumbnail);
     process_handler_ = std::make_unique<media::MediaThumbnailHandler>(
         extractor, sender_, files_);
     search_handler_ = std::make_unique<media::SearchHandler>(extractor, sender_,
                                                             files_);
     ctx_ = std::make_unique<app::AppContext>(app::AppContext{
-        sender_, files_, *process_streamer_, *search_streamer_, *outbox_,
-        config_});
+        *workers_, sender_, files_, *process_streamer_, *search_streamer_,
+        *outbox_, config_});
 
     process_streamer_->Start();
     search_streamer_->Start();
@@ -303,6 +306,8 @@ class E2ETest : public ::testing::Test {
       server_->Wait();
       server_.reset();
     }
+    // Drain the pool first: queued finish stages use ctx_/outbox_.
+    workers_.reset();
     ctx_.reset();
     search_handler_.reset();
     process_handler_.reset();
@@ -355,6 +360,7 @@ class E2ETest : public ::testing::Test {
       search_streamer_;
   FakeTdSender sender_;
   tg::telegram::FileDownloader files_{sender_};
+  std::unique_ptr<app::WorkerPool> workers_;
   std::unique_ptr<infra::Outbox> outbox_;
   std::unique_ptr<media::MediaThumbnailHandler> process_handler_;
   std::unique_ptr<media::SearchHandler> search_handler_;
@@ -372,9 +378,9 @@ TEST_F(E2ETest, ProcessImagesThumbnailFileRoundTrip) {
       tg::common::MakeImageId(kChatId, kMessageId, "u-m");
 
   auto message = MakePhotoMessage();
-  const auto result = process_handler_->SendProcessImages(*message, *ctx_);
-  ASSERT_TRUE(result.ok) << result.error;
-  EXPECT_EQ(result.image_id, expected_image_id);
+  // Async kick-off: returns once the download starts; the reply wait
+  // below is what proves the pipeline ran to completion.
+  process_handler_->SendProcessImages(*message, *ctx_);
 
   // The reply round-trips by image_id, and the Outbox record is DONE.
   ASSERT_TRUE(WaitForProcessReplies(1));
@@ -401,9 +407,9 @@ TEST_F(E2ETest, SearchImagesBareIdRoundTrip) {
       tg::common::MakeImageId(kChatId, kMessageId, "u-m");
 
   auto message = MakePhotoMessage();
-  const auto result = search_handler_->SendSearchImages(*message, *ctx_);
-  ASSERT_TRUE(result.ok) << result.error;
-  EXPECT_EQ(result.image_id, expected_image_id);
+  // Async kick-off: returns once the download starts; the reply wait
+  // below is what proves the pipeline ran to completion.
+  search_handler_->SendSearchImages(*message, *ctx_);
 
   // The reply round-trips by (oid, id) and resolves through the
   // correlation table back to the original message.

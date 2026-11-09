@@ -124,8 +124,8 @@ class DispatcherTest : public ::testing::Test {
             transport::SearchImagesStreamer::Options{"SearchImages"}});
     outbox_ = std::make_unique<tg::infra::Outbox>(outbox_path_);
     ctx_ = std::make_unique<app::AppContext>(app::AppContext{
-        sender_, *files_, *process_streamer_, *search_streamer_, *outbox_,
-        config_});
+        *pool_, sender_, *files_, *process_streamer_, *search_streamer_,
+        *outbox_, config_});
     dispatcher_ = std::make_unique<tg::telegram::UpdateDispatcher>(pool_);
   }
 

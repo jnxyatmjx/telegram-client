@@ -76,3 +76,40 @@ changes must NOT trigger a TDLib rebuild — only our own code is recompiled.
 - README updated: build section now documents the real build dir (build/,
   tg-client/test targets only, never rebuild TDLib), the test table with
   all 9 binaries, and the unix-socket / other_tcp platform note.
+
+## Async message processing (2026-11-09 21:26-21:50 CST)
+- Requirement (Hong): Telegram message processing — receiving AND bot
+  commands — must be async; messages must not synchronously block each
+  other. Audit found the Receive path was already async, but the pipeline
+  blocked: BotCommandHandler waited on getMessage (SendWithFuture +
+  wait_for, up to 10s) and both handlers waited on the download future
+  (up to 30s) on 4 worker threads, so a few slow downloads could stall
+  later messages.
+- Refactor (callback/continuation, no blocking waits anywhere):
+  * FileDownloader: new DownloadAsync(file_id, callback); pending map is
+    now file_id -> vector<callback> (concurrent downloads of the same file
+    share one downloadFile request); future Download() kept as a thin
+    wrapper for tests; FailAll now invokes pending callbacks with an error.
+  * AppContext gained WorkerPool& workers (callbacks post continuations).
+  * MediaThumbnailHandler/SearchHandler: Send*Images are async kick-offs
+    (extract + DownloadAsync, return immediately); download callback posts
+    the finish stage (read bytes -> Outbox -> non-blocking Enqueue, timeout
+    0) to the pool. PipelineResult removed.
+  * BotCommandHandler: getMessage via Send() callback (no timeout — a
+    never-answered getMessage just drops the command); the callback posts
+    the pipeline kick-off to the pool. get_message_timeout_ms config removed.
+  * ITdSender::SendWithFuture removed (both the interface default and the
+    TelegramClient override) — no blocking wait API remains.
+  * Shutdown order changed: telegram_.Stop() first (completes all pending
+    TDLib callbacks -> download callbacks post finish stages), then
+    files_.FailAll, then workers drain, then streamers, then retry thread.
+  * New regression test BotCommandTest.SecondCommandCompletesWhileFirstDownloadPending:
+    A's download takes 2s (fake delivers the response from a background
+    thread), B's is instant; B's request reaches the streamer queue while A
+    is still downloading. Verified it fails the old ordering (A would be
+    first). FakeTdSender gained per-message targets + slow-download support.
+- VM was replaced again before the build: apt deps wiped (only
+  libsqlite3-dev survived). Reinstalled (apt-reinstall3.log,
+  APT_REINSTALL3_OK rc=0) — same set as chunk 1.
+- Verified: build exit 0, 0 own-code warnings, ctest 13/13 (5.16s),
+  tg-client --version/--help work. TDLib NOT rebuilt (tg-client targets only).

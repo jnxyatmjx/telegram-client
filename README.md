@@ -425,13 +425,33 @@ tg-client (1 process)
 | Thread | Count | Does | Must never do |
 |---|---|---|---|
 | Main | 1 | Parse config, assemble `Application`, start threads, wait for SIGINT/SIGTERM, stop threads in order, join | Call `ClientManager::receive()`, call gRPC `Write` |
-| TDLib Receive | 1 | The only caller of `ClientManager::receive(10.0)`; routes responses to waiting futures by `request_id`, hands updates (`request_id == 0`) to `UpdateDispatcher` | Download, read disk, call gRPC, block for more than a few ms |
-| Worker Pool | 4 | Handler execution: pick tier, wait on download future, read file, hash, build `ImageRequest`, write Outbox, enqueue to streamer | Call `receive()`; call gRPC `Write`/`Read` directly (only `Enqueue`) |
+| TDLib Receive | 1 | The only caller of `ClientManager::receive(10.0)`; routes responses to their callbacks by `request_id`, hands updates (`request_id == 0`) to `UpdateDispatcher` | Download, read disk, call gRPC, block for more than a few ms |
+| Worker Pool | 4 | Handler stages (short, never blocking): extract tier, start download, finish stage (read file, hash, build `ImageRequest`, write Outbox, enqueue to streamer) | Call `receive()`; call gRPC `Write`/`Read` directly (only `Enqueue`); block on a TDLib response or a download |
 | ProcessImages CQ | grpc.connections | One per lane: owns that lane's `ProcessImages` CompletionQueue and `ClientAsyncReaderWriter`; loops `cq.Next()`, handles Write done, Read replies, Finish, reconnect | Call TDLib `send`/`receive` (use thread-safe `TelegramClient::Send`) |
 | SearchImages CQ | grpc.connections | Same as above, for the `SearchImages` stream, its own CQ and stub per lane | Same; the two streams are isolated, one breaking does not affect the other |
 | Outbox Retry | 1 | Every 10 s, re-enqueues PENDING/FAILED Outbox records whose retry time has come | Call gRPC `Write` directly (only `Enqueue`) |
 | TDLib internal | N | Actors, network, crypto, local database, created by TDLib | Not created, joined or driven by us |
 
+- **Async message processing — no message blocks another (2026-11-09).**
+  Receiving and bot commands are both fully async: a message's slow
+  getMessage or download must never occupy a thread another message
+  needs. The pipeline is a chain of short stages, each posted to the
+  worker pool, with callbacks in between — no stage ever waits:
+  `BotCommandHandler` sends `getMessage` and returns; its reply callback
+  (Receive thread) only posts the pipeline kick-off to the pool.
+  `MediaThumbnailHandler` / `SearchHandler` extract the media tier and
+  call `FileDownloader::DownloadAsync`, then return; the download
+  callback (Receive thread) only posts the finish stage, which reads the
+  file, builds the request, writes the Outbox and enqueues (one
+  non-blocking attempt — a full queue leaves the record PENDING for the
+  retry thread). `FileDownloader` has no timer: a download that never
+  completes simply never resolves, and no thread is blocked waiting for
+  it. There is no blocking wait API at all — `ITdSender::SendWithFuture`
+  was removed, and `FileDownloader::Download` (future) exists only for
+  tests. Regression test:
+  `BotCommandTest.SecondCommandCompletesWhileFirstDownloadPending`
+  (message A's download takes 2 s, B's is instant; B's request reaches
+  the streamer queue while A is still downloading).
 - **Async gRPC state machine (one per stream).**
   `CREATE` (PrepareAsync + StartCall) → `CONNECTING`/`RUNNING`
   (issue a Read immediately; Write when the queue is non-empty and no
@@ -685,26 +705,30 @@ of libraries.
   Secrets (`api_id`/`api_hash`, TDLib encryption key, gRPC token, phone)
   come only from the environment, never from code or git.
 - `app/AppContext` — The shared-services object passed to every handler:
-  `telegram`, `files`, `process_images`, `search_images`, `outbox`,
-  `config`. Owned by `Application`, outlives all workers.
+  `workers`, `telegram`, `files`, `process_images`, `search_images`,
+  `outbox`, `config`. Owned by `Application`, outlives all workers.
+  `workers` is how async callbacks post their next stage to the pool.
 - `telegram/TelegramClient` — Owns the `td::ClientManager` and the
   single client id. Runs the Receive thread, the only caller of
   `receive()`. `Send()` is callable from any thread and routes each
-  response to its waiting future by `request_id`. `Start()` sends a
-  bootstrap `getOption("version")` request: TDLib only creates the Td
-  actor (which emits the initial `updateAuthorizationState`) on the
-  first `send()` for a client id, so without it no update ever arrives
-  and login waits forever.
+  response to its callback by `request_id` (async only — no
+  `SendWithFuture`). `Start()` sends a bootstrap `getOption("version")`
+  request: TDLib only creates the Td actor (which emits the initial
+  `updateAuthorizationState`) on the first `send()` for a client id, so
+  without it no update ever arrives and login waits forever.
 - `telegram/AuthManager` — The login state machine: `setTdlibParameters`,
   phone code, 2FA password (from env providers), ready/closed states.
 - `telegram/UpdateDispatcher` — Routes each `td_api::Update` to the
   registered `IUpdateHandler`s by `CanHandle()`; each handler runs on a
   worker thread.
-- `telegram/FileDownloader` — `Download(file_id)` returns a future that
-  resolves with the local path. It sends `downloadFile` (synchronous)
-  and completes on the response or on the matching `updateFile` when
-  `local.is_downloading_completed` is set. The caller enforces the 30 s
-  timeout.
+- `telegram/FileDownloader` — Async: `DownloadAsync(file_id, on_done)`
+  registers the callback and returns immediately. It sends `downloadFile`
+  (synchronous) and completes on the response or on the matching
+  `updateFile` when `local.is_downloading_completed` is set; concurrent
+  downloads of the same file share one request and every callback fires.
+  The callback runs on the Receive thread and must only post the next
+  stage to the pool. `Download(file_id)` (future) is a thin wrapper for
+  tests; its timeout is enforced by the caller via `wait_for`.
 - `features/bot_command/BotCommandHandler` + `CommandParser` — Mode (a)
   trigger. Verifies the sender is the configured bot
   (`sender_user_id == command_bot_user_id`), parses the command and its
@@ -890,7 +914,7 @@ ctest --test-dir build/tests --output-on-failure
 | test_config | config parsing, env expansion |
 | test_media_extractor | photo tier selection (≤320px), video thumbnail-only |
 | test_outbox | PENDING -> DONE / retry / dead-letter / replay |
-| test_bot_command | only the configured bot's command accepted, arg parsing |
+| test_bot_command | only the configured bot's command accepted, arg parsing; `SecondCommandCompletesWhileFirstDownloadPending` proves async message processing (B completes while A's download is still pending) |
 | test_auto_search | allowlisted chat triggers Search only (disabled by default) |
 | test_handler_registry | dispatcher registration / dispatch |
 | test_async_streamer | CQ state machine vs in-process fake server: round-trip by image_id, bounded-queue backpressure, reconnect after server restart |

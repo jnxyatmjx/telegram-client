@@ -104,18 +104,25 @@ Application::Application(Config config)
   }
 
   ctx_ = std::make_unique<AppContext>(AppContext{
-      telegram_, files_, process_pool_, search_pool_, outbox_,
+      *workers_, telegram_, files_, process_pool_, search_pool_, outbox_,
       config_});
   WireHandlers();
   WireStreamerCallbacks();
 }
 
 Application::~Application() {
-  StopOutboxRetryThread();
+  // Async shutdown order (2026-11-09): stop the source of new work first.
+  // telegram_.Stop() completes every pending TDLib callback (getMessage,
+  // downloadFile), which fires the download callbacks, which post their
+  // finish stages to the pool — so the pool must still be running here,
+  // and is drained after. FailAll is the safety net for any download
+  // still pending after the TDLib callbacks completed.
+  telegram_.Stop();
+  files_.FailAll("shutting down");
+  workers_->Stop(std::chrono::seconds(0));
   process_pool_.Stop();
   search_pool_.Stop();
-  telegram_.Stop();
-  workers_->Stop(std::chrono::seconds(0));
+  StopOutboxRetryThread();
 }
 
 void Application::WireHandlers() {
@@ -277,12 +284,16 @@ int Application::Run() {
     }
   }
 
-  // v5 §3.6 ordered shutdown:
-  //  1. (updates already stopped being *executed* by draining the pool below)
-  workers_->Stop(kWorkerDrainTimeout);          // 2. drain in-flight work
-  process_pool_.Stop();                     // 3. WritesDone/Finish/CQ join
+  // v5 §3.6 ordered shutdown, async edition (2026-11-09): stop the
+  // source of new work first. telegram_.Stop() completes every pending
+  // TDLib callback, which fires the download callbacks, which post their
+  // finish stages to the pool — so the pool is drained AFTER telegram,
+  // and the streamers only after the pool (finish stages Enqueue to them).
+  telegram_.Stop();                             // 1. close TDLib session
+  files_.FailAll("shutting down");              // 2. safety net for downloads
+  workers_->Stop(kWorkerDrainTimeout);          // 3. drain in-flight work
+  process_pool_.Stop();                     // 4. WritesDone/Finish/CQ join
   search_pool_.Stop();
-  telegram_.Stop();                             // 4. close TDLib session
   StopOutboxRetryThread();                      // 5. flush + join retry
   spdlog::info("application: stopped cleanly (outbox pending: {})",
                outbox_.PendingCount());

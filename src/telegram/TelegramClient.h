@@ -5,7 +5,11 @@
 // and the TDLib Receive thread — the ONLY caller of ClientManager::receive().
 //
 // Thread rules:
-//  - Send() / SendWithFuture(): any thread (TDLib guarantees send is safe).
+//  - Send(): any thread (TDLib guarantees send is safe). Async only: the
+//    response arrives via a callback on the Receive thread — there is NO
+//    blocking wait API (SendWithFuture was removed 2026-11-09: a future
+//    invites a worker thread to block on a TDLib response, which is
+//    exactly the cross-message blocking this design forbids).
 //  - ReceiveLoop(): its own thread; hands updates to the update sink (the
 //    Dispatcher, which only posts to the worker pool), authorization updates
 //    to the AuthManager, and updateFile to the FileDownloader hook. It never
@@ -21,10 +25,10 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -46,22 +50,9 @@ class ITdSender {
  public:
   virtual ~ITdSender() = default;
   // Returns the request id (> 0, never 0 — TDLib uses 0 for updates).
+  // Async: the response arrives via `callback` on the Receive thread.
   virtual std::int64_t Send(td_api::object_ptr<td_api::Function>&& request,
                             ResponseCallback callback) = 0;
-
-  // Convenience for call sites that just want one response. Default
-  // implementation routes through Send(); TelegramClient overrides it.
-  virtual std::future<td::ClientManager::Response> SendWithFuture(
-      td_api::object_ptr<td_api::Function>&& request) {
-    auto promise =
-        std::make_shared<std::promise<td::ClientManager::Response>>();
-    auto future = promise->get_future();
-    Send(std::move(request),
-         [promise](td::ClientManager::Response&& response) {
-           promise->set_value(std::move(response));
-         });
-    return future;
-  }
 };
 
 class TelegramClient : public ITdSender {
@@ -82,10 +73,6 @@ class TelegramClient : public ITdSender {
 
   std::int64_t Send(td_api::object_ptr<td_api::Function>&& request,
                     ResponseCallback callback) override;
-
-  // Convenience for call sites that just want one response.
-  std::future<td::ClientManager::Response> SendWithFuture(
-      td_api::object_ptr<td_api::Function>&& request) override;
 
   bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 

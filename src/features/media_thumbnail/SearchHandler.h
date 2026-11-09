@@ -6,6 +6,13 @@
 // MediaThumbnailHandler, but produces a SearchReq and ONLY a SearchReq —
 // never ProcessImages.
 //
+// Fully async (2026-11-09), same stage shape as MediaThumbnailHandler:
+// extract + bare-ID conversion (worker) -> DownloadAsync (returns
+// immediately) -> download done (Receive thread callback, posts finish) ->
+// finish (worker): read bytes -> SearchReq -> register correlation ->
+// Enqueue (non-blocking try; a full queue drops the SearchReq, which is
+// NOT in the Outbox — re-trigger the command, v5 §2.4).
+//
 // SearchReq.id / SearchReq.oid are uint32 MTProto bare IDs (server side is
 // Telethon): the dialog-id -> bare-id conversion happens here, with range
 // checks. Out-of-range = loud error + NOT sent, never truncated (v5 §1.3).
@@ -15,7 +22,6 @@
 // dies with the process; a new search is simply triggered again by the bot.
 
 #include <features/media_thumbnail/MediaExtractor.h>
-#include <features/media_thumbnail/MediaThumbnailHandler.h>
 #include <telegram/FileDownloader.h>
 #include <telegram/TelegramClient.h>
 
@@ -60,13 +66,23 @@ class SearchHandler {
   SearchHandler(MediaExtractor extractor, telegram::ITdSender& sender,
                 telegram::FileDownloader& files);
 
-  // Blocking (runs on a worker thread).
-  PipelineResult SendSearchImages(const td_api::message& target,
-                                  app::AppContext& ctx) const;
+  // Async kick-off (runs on a worker thread): extracts + converts ids +
+  // starts the download, then returns immediately. Never blocks.
+  void SendSearchImages(const td_api::message& target,
+                        app::AppContext& ctx) const;
 
   SearchCorrelationTable& correlation() { return correlation_; }
 
  private:
+  // Receive-thread callback: download finished (or failed). Posts the
+  // finish stage to the pool; does no I/O itself.
+  void OnDownloaded(ExtractedMedia media,
+                    telegram::FileDownloader::DownloadResult result,
+                    app::AppContext& ctx) const;
+  // Worker-thread finish stage: read bytes -> SearchReq -> Enqueue.
+  void FinishSearch(ExtractedMedia media, std::string local_path,
+                    app::AppContext& ctx) const;
+
   MediaExtractor extractor_;
   telegram::ITdSender& sender_;
   telegram::FileDownloader& files_;

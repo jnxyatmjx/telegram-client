@@ -2,6 +2,7 @@
 // listed chat's media triggers SearchImages ONLY (never ProcessImages, never
 // Outbox); dedup within TTL.
 #include <app/AppContext.h>
+#include <app/WorkerPool.h>
 #include <features/auto_search/AutoSearchHandler.h>
 #include <features/media_thumbnail/SearchHandler.h>
 #include <infra/Outbox.h>
@@ -13,9 +14,11 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <thread>
 #include <vector>
 #include <string>
 
@@ -122,6 +125,8 @@ class AutoSearchTest : public ::testing::Test {
 
     sender_.thumbnail_path = thumb_path_;
     files_ = std::make_unique<tg::telegram::FileDownloader>(sender_);
+    // The async pipeline posts continuations here; the tests wait for them.
+    workers_ = std::make_unique<app::WorkerPool>(2u);
     search_handler_ = std::make_unique<media::SearchHandler>(
         media::MediaExtractor(config_.media_thumbnail), sender_, *files_);
     // Single-lane pools: the handler tests inspect lane 0's queue.
@@ -135,8 +140,8 @@ class AutoSearchTest : public ::testing::Test {
             transport::SearchImagesStreamer::Options{"SearchImages"}});
     outbox_ = std::make_unique<tg::infra::Outbox>(outbox_path_);
     ctx_ = std::make_unique<app::AppContext>(app::AppContext{
-        sender_, *files_, *process_streamer_, *search_streamer_, *outbox_,
-        config_});
+        *workers_, sender_, *files_, *process_streamer_, *search_streamer_,
+        *outbox_, config_});
   }
 
   // Fresh handler per config; tests tweak config_ first.
@@ -146,6 +151,8 @@ class AutoSearchTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    // Drain the pool first: queued finish stages use ctx_/outbox_/streamers.
+    workers_.reset();
     ctx_.reset();
     outbox_.reset();
     search_streamer_.reset();
@@ -156,11 +163,25 @@ class AutoSearchTest : public ::testing::Test {
     std::remove(outbox_path_.c_str());
   }
 
+  // The pipeline is async: Handle returns after kicking it off, so the
+  // tests poll for the queued request instead of asserting immediately.
+  template <typename Pool>
+  bool WaitForQueued(Pool& pool, std::size_t count) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (pool.lane(0)->QueuedCount() >= count) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+  }
+
   std::string thumb_path_;
   std::string outbox_path_;
   app::Config config_;
   FakeTdSender sender_;
   std::unique_ptr<tg::telegram::FileDownloader> files_;
+  std::unique_ptr<app::WorkerPool> workers_;
   std::unique_ptr<media::SearchHandler> search_handler_;
   std::unique_ptr<transport::StreamerPool<ImageRequest, ImageReply>>
       process_streamer_;
@@ -196,7 +217,8 @@ TEST_F(AutoSearchTest, EnabledAllowlistedMediaTriggersSearchOnly) {
   handler->Handle(base, *ctx_);
 
   // SearchImages got the request...
-  ASSERT_EQ(search_streamer_->lane(0)->QueuedCount(), 1u);
+  ASSERT_TRUE(WaitForQueued(*search_streamer_, 1u));
+  EXPECT_EQ(search_streamer_->lane(0)->QueuedCount(), 1u);
   const auto request = search_streamer_->lane(0)->PeekFront();
   ASSERT_TRUE(request.has_value());
   // ...with uint32 bare ids (supergroup -1001234567890 -> 1234567890, msg 555)
@@ -241,7 +263,7 @@ TEST_F(AutoSearchTest, DedupSkipsSecondHandleWithinTtl) {
   td_api::object_ptr<td_api::Update> first = MakePhotoUpdate(-1'001'234'567'890LL);
   ASSERT_TRUE(handler->CanHandle(first));
   handler->Handle(first, *ctx_);
-  ASSERT_EQ(search_streamer_->lane(0)->QueuedCount(), 1u);
+  ASSERT_TRUE(WaitForQueued(*search_streamer_, 1u));
 
   // Same (chat, message) again before TTL expiry: skipped.
   td_api::object_ptr<td_api::Update> second = MakePhotoUpdate(-1'001'234'567'890LL);
@@ -254,6 +276,7 @@ TEST_F(AutoSearchTest, DedupSkipsSecondHandleWithinTtl) {
   td_api::object_ptr<td_api::Update> third = MakePhotoUpdate(-1'001'234'567'890LL);
   static_cast<td_api::updateNewMessage&>(*third).message_->id_ = 557;
   handler->Handle(third, *ctx_);
+  ASSERT_TRUE(WaitForQueued(*search_streamer_, 2u));
   EXPECT_EQ(search_streamer_->lane(0)->QueuedCount(), 2u);
 }
 

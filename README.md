@@ -77,6 +77,28 @@ GTest 1.10.0, OpenSSL 1.1.1, CMake 3.18.4, GCC 10.2.1). The
 `pkg-config` package is required — it is how gRPC is found on
 bullseye.
 
+**The stock `sources.list` no longer works.** Debian 11 LTS ended
+2026-08-31, and `security.debian.org` has removed `bullseye-security`
+(every URL there now 404s), so `apt` cannot fetch the security updates
+(`libssl1.1` deb11u8, php7.4 deb11u12, …) and the install fails with
+unmet dependencies. Point apt at the archive instead, and disable the
+expired-Release check (the archived Release files are old):
+
+```bash
+cat > /etc/apt/sources.list << 'EOF'
+deb http://archive.debian.org/debian/ bullseye main
+deb http://archive.debian.org/debian/ bullseye-updates main
+deb http://archive.debian.org/debian-security/ bullseye-security main
+EOF
+echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10-no-check-valid-until
+apt-get update
+apt --fix-broken install
+```
+
+Then run the install command above. (Verified 2026-11-09: all three
+archive suites exist — bullseye 11.11, bullseye-updates, and
+bullseye-security with a 2026-09-12 snapshot.)
+
 Two caveats:
 
 - **Presets don't work with stock CMake 3.18.** `CMakePresets.json`

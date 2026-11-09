@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.18)
 
 project(tg-client
   VERSION 0.1.0
@@ -22,7 +22,23 @@ find_package(Threads REQUIRED)
 # Ubuntu's protobuf 3.21 ships no protobuf-config.cmake: use module mode
 # (CMake's builtin FindProtobuf, provides the protobuf::libprotobuf target).
 find_package(Protobuf REQUIRED)
-find_package(gRPC CONFIG REQUIRED)
+# gRPC: prefer the CMake config package (Ubuntu 24.04, Debian 13, ...).
+# Debian 11's grpc 1.30.2 packages ship headers, libs and pkg-config files
+# but no gRPCConfig.cmake, so fall back to pkg-config there. The link
+# target is kept in TG_GRPCPP_TARGET so tg_proto links the same way in
+# both cases. TG_GRPC_PKGCONFIG=ON forces the pkg-config path (also used
+# to test it on systems that do have the config package).
+option(TG_GRPC_PKGCONFIG "Find gRPC via pkg-config instead of the CMake config package" OFF)
+if(NOT TG_GRPC_PKGCONFIG)
+  find_package(gRPC CONFIG QUIET)
+endif()
+if(gRPC_FOUND)
+  set(TG_GRPCPP_TARGET gRPC::grpc++)
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(GRPCPP REQUIRED IMPORTED_TARGET grpc++)
+  set(TG_GRPCPP_TARGET PkgConfig::GRPCPP)
+endif()
 find_package(spdlog CONFIG REQUIRED)
 find_package(SQLite3 REQUIRED)
 
@@ -68,7 +84,7 @@ add_custom_command(
 
 add_library(tg_proto STATIC "${TG_PROTO_PB_CC}" "${TG_PROTO_GRPC_CC}")
 target_include_directories(tg_proto PUBLIC "${TG_GENERATED_DIR}")
-target_link_libraries(tg_proto PUBLIC gRPC::grpc++ protobuf::libprotobuf)
+target_link_libraries(tg_proto PUBLIC ${TG_GRPCPP_TARGET} protobuf::libprotobuf)
 
 # ---------------------------------------------------------------------------
 # Core library (skeleton: placeholder translation units, filled in by later

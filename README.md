@@ -18,7 +18,7 @@ api_id/api_hash、触发 bot 的 user_id 和命令名（见 Open items）。
   全异步 gRPC 流、SQLite Outbox、bare-ID 换算）。
 - 测试：9 个 GTest 二进制，含假服务器端到端测试，全部通过。
 
-## Dependencies (apt, Ubuntu 24.04 — no vcpkg, no source builds)
+## Dependencies (apt, Ubuntu 24.04 / Debian 11 — no vcpkg, no source builds)
 
 ### Build dependencies (compiling from source)
 
@@ -47,6 +47,54 @@ TDLib: shallow clone, not a submodule:
 ```bash
 git clone --depth 1 https://github.com/tdlib/td third_party/td
 ```
+
+#### Debian 11 (bullseye) — build
+
+Yes, it builds and runs on Debian 11. Two things needed changing
+(done in `CMakeLists.txt`): the project required CMake 3.20 but
+bullseye ships 3.18.4, so the minimum is now 3.18; and bullseye's
+grpc 1.30.2 packages ship headers, libraries and `grpc++.pc` but no
+`gRPCConfig.cmake`, so gRPC is now found via pkg-config when the CMake
+config package is absent (`TG_GRPC_PKGCONFIG=ON` forces that path, e.g.
+to test it on a machine that does have the config package). Everything
+else the project uses already exists in bullseye's versions: GCC 10.2
+(C++17), protobuf 3.12.4, spdlog 1.8.1, SQLite 3.34.1, GTest 1.10.0,
+OpenSSL 1.1.1, zlib 1.2.11, gperf 3.1, php-cli 7.4 (TDLib's code
+generator uses it), and TDLib itself only needs CMake ≥ 3.10, C++17,
+OpenSSL, zlib, gperf and php — all met.
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  build-essential cmake git gperf php-cli ccache pkg-config \
+  libssl-dev zlib1g-dev \
+  libgrpc++-dev protobuf-compiler protobuf-compiler-grpc \
+  libspdlog-dev libsqlite3-dev libgtest-dev
+```
+
+Same package names as Ubuntu 24.04; the installed versions are just
+older (gRPC 1.30.2, protobuf 3.12.4, spdlog 1.8.1, SQLite 3.34.1,
+GTest 1.10.0, OpenSSL 1.1.1, CMake 3.18.4, GCC 10.2.1). The
+`pkg-config` package is required — it is how gRPC is found on
+bullseye.
+
+Two caveats:
+
+- **Presets don't work with stock CMake 3.18.** `CMakePresets.json`
+  needs CMake ≥ 3.20, so `cmake --preset release` fails on bullseye.
+  Use the direct commands instead (`cmake -S . -B build
+  -DCMAKE_BUILD_TYPE=Release`, then `cmake --build build --target
+  tg-client -j1`, as in [Build](#build) below). To use the presets,
+  install a newer CMake, e.g. from Kitware's apt repository
+  (https://apt.kitware.com).
+- **The gRPC API used here predates 1.30**, so the older library is
+  fine: `CreateChannel`, `SslCredentials`, `ClientAsyncReaderWriter`,
+  `CompletionQueue::AsyncNext`, `ClientContext::TryCancel`,
+  `Server::Shutdown` and the generated `PrepareAsync*` stubs all exist
+  in 1.30.2. The full TDLib build on Debian 11 itself has not been run
+  here (it takes 20–60 min even on a fast host); the compatibility
+  claim rests on the version/API check above, plus the pkg-config
+  fallback being verified end-to-end (configure + build + 13/13
+  tests) on this host.
 
 ### Runtime dependencies (running the built binary on another machine)
 
@@ -120,6 +168,35 @@ sudo apt-get update && sudo apt-get install -y \
 >   `rpath=$ORIGIN` (the 41 absl libs, `libspdlog.so.1.12`,
 >   `libfmt.so.9`); or
 > - **Run the Ubuntu 24.04 Docker image** (see `Dockerfile`).
+
+#### Debian 11 (bullseye) — runtime
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  libgrpc++1 libspdlog1 libsqlite3-0 libssl1.1 zlib1g
+```
+
+What each package provides, and what comes along automatically:
+
+- `libgrpc++1` (1.30.2) — `libgrpc++.so.1.30`. Also pulls in
+  `libgrpc10` (`libgrpc.so.10`), `libabsl20200923` (the Abseil set,
+  `libabsl_*.so.20200923`) and `libprotobuf23`
+  (`libprotobuf.so.23`).
+- `libspdlog1` (1.8.1) — `libspdlog.so.1.8`; also pulls in `libfmt7`
+  (`libfmt.so.7`).
+- `libsqlite3-0` — `libsqlite3.so.0`.
+- `libssl1.1` — `libssl.so.1.1` (OpenSSL 1.1.1, not 3.x).
+- `zlib1g` — `libz.so.1`.
+- `libc6`, `libgcc-s1`, `libstdc++6` — base system libraries; nothing
+  to install.
+
+> **Warning: a binary built on Debian 11 will NOT run on Ubuntu 24.04
+> or Debian 13, and vice versa.** Every shared library above has a
+> different SONAME there (gRPC 1.30 vs 1.51, protobuf 23 vs 32,
+> spdlog 1.8 vs 1.12/1.15, OpenSSL 1.1 vs 3, Abseil 20200923 vs
+> 20220623/20240722). Rebuild on the target distro — the
+> build-dependency command above is the same package names everywhere,
+> only the versions differ.
 
 ## Build
 

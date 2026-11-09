@@ -491,7 +491,14 @@ lane 2:  Channel ── ProcessImages stream ──┘
 
 Everything is built per lane: `GrpcTransport` creates all N channels
 eagerly at startup (same credentials for every lane — TLS or insecure,
-plus the optional private CA from `grpc.ca_cert`); each lane gets its
+plus the optional private CA from `grpc.ca_cert`). Each channel is built
+with `CreateCustomChannel` and `GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL = 1`:
+plain `CreateChannel()` is not enough, because gRPC C-core shares
+subchannels (TCP connections) across channels with the same target and
+channel args through the global subchannel pool, so N plain channels
+collapse onto a single TCP connection — the "configured 3 lanes, only 1
+connection" symptom. The per-lane local subchannel pool is what makes
+each lane a genuinely separate TCP connection. Each lane gets its
 own pair of stubs (`ProcessImagesClient` / `SearchImagesClient`,
 constructed with that lane's channel) and its own pair of
 `AsyncStreamer`s, each with its own CompletionQueue and its own CQ

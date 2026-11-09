@@ -39,12 +39,24 @@ GrpcTransport::GrpcTransport(const app::GrpcConfig& config)
   // One Channel per lane: each is its own TCP/HTTP2 connection to the same
   // target, so traffic actually spreads across connections (a single
   // channel multiplexes streams but stays on one connection).
+  //
+  // Plain grpc::CreateChannel() is NOT enough for this: gRPC C-core shares
+  // subchannels (i.e. TCP connections) across channels with the same target
+  // + channel args through the global subchannel pool — "gRPC only opens one
+  // socket per destination+attributes combo". N channels created that way
+  // still collapse onto ONE TCP connection, which is exactly the "configured
+  // 3 lanes, only 1 connection" symptom. Each lane therefore gets its own
+  // local subchannel pool (GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL), which forces
+  // one TCP connection per channel.
   std::size_t lanes = static_cast<std::size_t>(
       config_.connections > 0 ? config_.connections : 1);
   if (lanes > kMaxLanes) lanes = kMaxLanes;
   channels_.reserve(lanes);
   for (std::size_t i = 0; i < lanes; ++i) {
-    channels_.push_back(grpc::CreateChannel(config_.target, credentials));
+    grpc::ChannelArguments args;
+    args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
+    channels_.push_back(
+        grpc::CreateCustomChannel(config_.target, credentials, args));
   }
   spdlog::info("grpc: {} channel(s) created for {} ({})", channels_.size(),
                config_.target, config_.tls ? "TLS" : "insecure");

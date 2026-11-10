@@ -283,13 +283,21 @@ bool RunTransition(sqlite3* db, Statement& statement) {
 
 bool Outbox::MarkDone(const std::string& image_id, const std::string& result) {
   std::lock_guard<std::mutex> lock(mutex_);
+  // Only a record still awaiting its reply transitions to DONE. A record
+  // already DONE stays DONE: a duplicate ImageReply for the same image_id
+  // (the server replied twice, or the request was re-sent before the
+  // ack timeout and both replies arrived) must NOT report a second DONE
+  // — the first reply already logged it. The caller distinguishes "already
+  // done" from "unknown" with Get().
   Statement statement(db_,
       "UPDATE outbox SET state = ?1, last_status = ?2, updated_at = ?3 "
-      "WHERE image_id = ?4");
+      "WHERE image_id = ?4 AND state IN (?5, ?6)");
   BindInt(statement.get(), 1, static_cast<std::int64_t>(OutboxState::kDone));
   BindText(statement.get(), 2, result);
   BindInt(statement.get(), 3, NowMs());
   BindText(statement.get(), 4, image_id);
+  BindInt(statement.get(), 5, static_cast<std::int64_t>(OutboxState::kPending));
+  BindInt(statement.get(), 6, static_cast<std::int64_t>(OutboxState::kFailed));
   return RunTransition(db_, statement);
 }
 

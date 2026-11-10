@@ -425,6 +425,32 @@ TEST_F(BotCommandTest, ProcessCommandFromConfiguredBotViaReplyTo) {
   EXPECT_EQ(DecryptMemoOrDie(record->memo), "thecaption");
 }
 
+TEST_F(BotCommandTest, ProcessedRecordNotDueForRetryUntilAckTimeout) {
+  // Regression (live test 2026-11-10): a freshly-sent record was Put with
+  // next_retry_at = 0, so the 10 s retry sweep re-sent it while the server
+  // was still processing the image; the server replied once per send and
+  // one /process logged several DONEs. The record must not be due for
+  // retry until the ack timeout (grpc.ack_timeout_ms) has elapsed.
+  auto update = MakeCommandUpdate(777, kTargetDialogId, "/process", true, 42);
+  td_api::object_ptr<td_api::Update> base = std::move(update);
+
+  ASSERT_TRUE(handler_->CanHandle(base));
+  handler_->Handle(base, *ctx_);
+  ASSERT_TRUE(WaitForQueued(*process_streamer_, 1));
+
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  // Still awaiting its reply: not due for the sweep yet.
+  EXPECT_TRUE(outbox_->DueForRetry(now_ms, 10).empty());
+  // Due once the ack timeout has elapsed with no reply.
+  const auto due = outbox_->DueForRetry(
+      now_ms + config_.grpc.ack_timeout_ms + 1000, 10);
+  ASSERT_EQ(due.size(), 1u);
+  EXPECT_EQ(due[0].image_id, "42");
+}
+
 TEST_F(BotCommandTest, SearchCommandTargetsArgsGivenChatAndMessage) {
   auto update = MakeCommandUpdate(777, -1'001'234'567'890LL,
                                   "/search -1001234567890 42", false);

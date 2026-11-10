@@ -64,6 +64,20 @@ TEST_F(OutboxTest, DoneOnReply) {
   EXPECT_EQ(outbox_->PendingCount(), 0);
 }
 
+TEST_F(OutboxTest, SecondMarkDoneIsNotADone) {
+  // A duplicate ImageReply for the same image_id (the server replied
+  // twice, or the request was re-sent and both replies arrived) must not
+  // report a second DONE: only a record still awaiting its reply
+  // transitions to DONE.
+  outbox_->Put(MakeRecord("c1:m1:uid"));
+  EXPECT_TRUE(outbox_->MarkDone("c1:m1:uid", "processed ok"));
+  EXPECT_FALSE(outbox_->MarkDone("c1:m1:uid", "processed ok"));
+  const auto record = outbox_->Get("c1:m1:uid");
+  ASSERT_TRUE(record.has_value());
+  EXPECT_EQ(record->state, infra::OutboxState::kDone);
+  EXPECT_EQ(record->last_status, "processed ok");
+}
+
 TEST_F(OutboxTest, UnknownIdTransitionsFail) {
   EXPECT_FALSE(outbox_->MarkDone("nope", "x"));
   EXPECT_FALSE(outbox_->MarkFailed("nope", "x", 1000));

@@ -129,12 +129,29 @@ void MediaThumbnailHandler::FinishProcess(ExtractedMedia media,
   // Outbox first (v5 §2.2 step [4]): if the enqueue fails the record stays
   // PENDING and the retry thread replays it by image_id (now the message id
   // string — message-level dedup, same replay semantics).
+  //
+  // next_retry_at is the ack deadline, NOT "due now": the request is about
+  // to be sent, so the retry sweep must not re-send it while the server
+  // still has time to reply. A record left at next_retry_at = 0 is
+  // immediately "due", so a server that takes longer than the 10 s sweep
+  // interval to process an image got the SAME request re-sent, the server
+  // replied once per send, and one /process logged several DONEs.
+  // grpc.ack_timeout_ms (default 30 s) is how long we wait for the reply
+  // before the sweep may retry; if the reply arrives, MarkDone takes the
+  // record out of the retry set. (If the Enqueue below fails, the first
+  // retry then also waits out the ack timeout — acceptable backpressure
+  // while the write queue is full.)
+  const std::int64_t now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
   infra::OutboxRecord record;
   record.image_id = image_id;
   record.image_data = request.image_data();
   record.memo = request.memo();
   record.owner_id = request.owner_id();
   record.state = infra::OutboxState::kPending;
+  record.next_retry_at_ms = now_ms + ctx.config.grpc.ack_timeout_ms;
   ctx.outbox.Put(record);
 
   if (!ctx.process_images.Enqueue(std::move(request), kEnqueueTimeout)) {

@@ -181,7 +181,20 @@ void Application::WireStreamerCallbacks() {
           spdlog::info("process: DONE {} result: {:.200}", reply.image_id(),
                        reply.result());
         } else {
-          spdlog::warn("process: reply for unknown image_id {}", reply.image_id());
+          // MarkDone only transitions PENDING/FAILED -> DONE, so a false
+          // here is either a duplicate reply for an already-completed
+          // send (log it quietly, the first DONE already covered it) or
+          // a reply for an id the outbox never saw (warn).
+          const auto existing = outbox_.Get(reply.image_id());
+          if (existing.has_value() &&
+              existing->state == infra::OutboxState::kDone) {
+            spdlog::info("process: duplicate reply for {} (already done) — "
+                         "ignored",
+                         reply.image_id());
+          } else {
+            spdlog::warn("process: reply for unknown image_id {}",
+                         reply.image_id());
+          }
         }
         const auto parsed =
             features::chat_state::ParseReplyResult(reply.result());

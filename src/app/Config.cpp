@@ -289,8 +289,7 @@ Config Config::FromFile(const std::string& path) {
       cfg.media_thumbnail.enabled = Bool(*m, "enabled", cfg.media_thumbnail.enabled);
       cfg.media_thumbnail.max_thumb_bytes =
           Int(*m, "max_thumb_bytes", cfg.media_thumbnail.max_thumb_bytes);
-      const auto edge = Int(*m, "max_edge_px", cfg.media_thumbnail.max_edge_px);
-      cfg.media_thumbnail.max_edge_px = static_cast<int>(edge);
+      cfg.media_thumbnail.keyme = Str(*m, "keyme", cfg.media_thumbnail.keyme);
     }
     if (const YamlNode* b = f->Find("bot_command")) {
       cfg.bot_command.enabled = Bool(*b, "enabled", cfg.bot_command.enabled);

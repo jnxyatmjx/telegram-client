@@ -16,6 +16,7 @@
 #include <app/Config.h>
 #include <app/WorkerPool.h>
 #include <common/Idempotency.h>
+#include <common/MemoCipher.h>
 #include <features/media_thumbnail/MediaExtractor.h>
 #include <features/media_thumbnail/MediaThumbnailHandler.h>
 #include <features/media_thumbnail/SearchHandler.h>
@@ -64,6 +65,9 @@ constexpr std::int64_t kChatId = -1'001'234'567'890LL;  // channel dialog id
 constexpr std::int64_t kMessageId = 777;
 constexpr std::uint32_t kBareOid = 1'234'567'890;  // -chat_id - 1e12
 constexpr std::uint32_t kBareId = 777;
+// Memo cipher seed: the wire memo is AES-GCM(keyme) of the caption
+// (Telethon migration Chunk 1), decryptable with the same seed.
+constexpr const char* kKeyme = "keyme-mig-chunk1-test-seed";
 
 std::string TempPath(const std::string& tag) {
   return "/tmp/tg-e2e-" + tag + "-" +
@@ -184,9 +188,9 @@ td_api::object_ptr<td_api::message> MakePhotoMessage() {
   auto photo = td_api::make_object<td_api::photo>();
   photo->has_stickers_ = false;
   photo->sizes_.push_back(MakeSize("s", 100, 100, 1, "u-s"));
-  photo->sizes_.push_back(MakeSize("m", 320, 240, 2, "u-m"));  // picked tier
+  photo->sizes_.push_back(MakeSize("m", 320, 240, 2, "u-m"));
   photo->sizes_.push_back(MakeSize("x", 640, 640, 3, "u-x"));
-  photo->sizes_.push_back(MakeSize("y", 1280, 1280, 4, "u-y"));
+  photo->sizes_.push_back(MakeSize("y", 1280, 1280, 4, "u-y"));  // picked: full image
   content->photo_ = std::move(photo);
   auto caption = td_api::make_object<td_api::formattedText>();
   caption->text_ = "hello caption";
@@ -280,9 +284,10 @@ class E2ETest : public ::testing::Test {
     outbox_ = std::make_unique<infra::Outbox>(db_path_);
     // The async pipeline posts continuations here.
     workers_ = std::make_unique<app::WorkerPool>(2u);
+    config_.media_thumbnail.keyme = kKeyme;
     media::MediaExtractor extractor(config_.media_thumbnail);
     process_handler_ = std::make_unique<media::MediaThumbnailHandler>(
-        extractor, sender_, files_);
+        extractor, sender_, files_, tg::common::MemoCipher(kKeyme));
     search_handler_ = std::make_unique<media::SearchHandler>(extractor, sender_,
                                                             files_);
     ctx_ = std::make_unique<app::AppContext>(app::AppContext{
@@ -374,8 +379,9 @@ class E2ETest : public ::testing::Test {
 };
 
 TEST_F(E2ETest, ProcessImagesThumbnailFileRoundTrip) {
+  // Wire image_id = str(message_id) (Telethon migration Chunk 1).
   const std::string expected_image_id =
-      tg::common::MakeImageId(kChatId, kMessageId, "u-m");
+      tg::common::MakeWireImageId(kMessageId);
 
   auto message = MakePhotoMessage();
   // Async kick-off: returns once the download starts; the reply wait
@@ -393,18 +399,25 @@ TEST_F(E2ETest, ProcessImagesThumbnailFileRoundTrip) {
   EXPECT_EQ(record->state, infra::OutboxState::kDone);
 
   // The server received exactly the request the pipeline built from the
-  // file: thumbnail bytes, caption-only memo, chat id as owner.
+  // file: full-image bytes, memo = AES-GCM(KEYME) of the caption, owner =
+  // bare MTProto id.
   const auto received = service_.process_requests();
   ASSERT_EQ(received.size(), 1u);
   EXPECT_EQ(received[0].image_id(), expected_image_id);
   EXPECT_EQ(received[0].image_data(), kThumbBytes);
-  EXPECT_EQ(received[0].memo(), "hello caption");
-  EXPECT_EQ(received[0].owner_id(), kChatId);
+  const tg::common::MemoCipher cipher(kKeyme);
+  const auto memo_plain = cipher.Decrypt(received[0].memo());
+  ASSERT_TRUE(memo_plain.has_value());
+  EXPECT_EQ(*memo_plain, "hellocaption");  // CLEANED caption (Python regex)
+  EXPECT_NE(received[0].memo(), "hellocaption");  // never plaintext
+  EXPECT_EQ(received[0].owner_id(), kBareOid);
 }
 
 TEST_F(E2ETest, SearchImagesBareIdRoundTrip) {
+  // Internal correlation id (SearchReq lane only): still the composite
+  // MakeImageId, now built from the picked "y" tier's unique id.
   const std::string expected_image_id =
-      tg::common::MakeImageId(kChatId, kMessageId, "u-m");
+      tg::common::MakeImageId(kChatId, kMessageId, "u-y");
 
   auto message = MakePhotoMessage();
   // Async kick-off: returns once the download starts; the reply wait

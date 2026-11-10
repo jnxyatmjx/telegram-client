@@ -378,9 +378,12 @@ authoritative when the two disagree.
   writes it to the server. The SQLite Outbox is retry-only, not the
   main path.
 - **At-least-once delivery, server dedup.** Every `ImageRequest` carries
-  `image_id = "<chat_id>:<message_id>:<file_unique_id>"` as the
-  idempotency key. On reconnect the Outbox replays unacked records by
-  `image_id` and the server deduplicates on that key.
+  `image_id = str(message_id)` (Telethon-migration chunk 1: the
+  message-level id the Python server uses; cross-chat collisions are
+  accepted, same as the Python client). On reconnect the Outbox replays
+  unacked records by `image_id` and the server deduplicates on that key.
+  The old composite `"<chat>:<msg>:<uid>"` form (`MakeImageId`) survives
+  only inside the in-memory SearchReq correlation table.
 - **Triggers.** Nothing is sent automatically on receiving an image.
   `ProcessImages` and `SearchImages` fire only on a command from a
   specified bot in Telegram (mode (a): the bot itself is the sender,
@@ -389,13 +392,24 @@ authoritative when the two disagree.
   triggers `SearchImages` only, never `ProcessImages`; disabled by
   default.
 - **Proto.** `proto/image_stream.proto` is used verbatim (no package,
-  both RPCs bidirectional streaming). `memo` is caption only, no JSON.
-  `SearchReq` uses uint32 bare MTProto IDs, not TDLib dialog IDs: the
-  client converts (`channel: -chat_id - 1e12`, `basic group: -chat_id`,
-  `user: chat_id`) and range-checks to `0..4294967295`; out of range is
-  a loud error and the request is not sent, never silently truncated.
-  `SearchReq` is not replayed from the Outbox because its correlation
-  table `(oid, id) -> message` lives only in memory.
+  both RPCs bidirectional streaming). Since the Telethon-migration
+  chunk 1 the wire protocol matches the Python server byte-for-byte:
+  `memo` is `base64(nonce[12] ‖ AES-256-GCM ciphertext ‖ tag[16])` of the
+  *cleaned* caption (key = SHA256(`KEYME`), the same scheme as the
+  Python `aes_gcm_encrypt`; the caption is cleaned with the Python regex
+  first — URLs, t.me links, whitespace and `[]*_ -` removed). Plaintext
+  is never sent: an unconfigured `KEYME` or a failed encryption means
+  the message is not sent at all. `owner_id` is the bare MTProto chat id
+  (same conversion as `SearchReq.oid`: channel `-chat_id - 1e12`,
+  basic group `-chat_id`, user `chat_id`), range-checked to
+  `0..4294967295` — out of range is a loud error, never truncated.
+  `SearchReq` uses the same uint32 bare MTProto IDs for `oid`/`id` and
+  is not replayed from the Outbox because its correlation table
+  `(oid, id) -> message` lives only in memory. `ImageReply.result` is
+  the server contract `{"cid": <bare id>, "mid": <msg id>}`; it is
+  parsed into the in-memory `ChatStateStore` (per-chat watermark,
+  on-demand chat-URL resolution) and a malformed result is logged and
+  dropped, never crashing the pipeline.
 - **Failure handling.** `downloadFile` timeout/failure retries 3 times
   with backoff, then dead-letter. A full write queue blocks the worker
   with a timeout and leaves the record PENDING for the retry thread.
@@ -686,7 +700,7 @@ of libraries.
 | spdlog | 1.12.0 (`libspdlog-dev`) | Logging | apt |
 | SQLite3 | 3.45.1 (`libsqlite3-dev`) | Outbox persistence, WAL mode | apt |
 | GoogleTest | 1.14.0 (`libgtest-dev`) | Unit and end-to-end tests | apt, `find_package(GTest CONFIG)` |
-| OpenSSL | 3.0.13 (`libssl-dev`) | TLS for gRPC, crypto for TDLib | apt |
+| OpenSSL | 3.0.13 (`libssl-dev`) | TLS for gRPC, crypto for TDLib, AES-256-GCM for `MemoCipher` (`OpenSSL::Crypto`) | apt |
 | zlib | 1.3 (`zlib1g-dev`) | Compression for TDLib/gRPC | apt |
 | gperf | 3.1 | TDLib TL code generation | apt |
 | php-cli | 8.3 | TDLib `SplitSource.php` build step | apt |
@@ -741,16 +755,22 @@ of libraries.
   chat (`auto_search.chats`); verifies only `chat_id`, not the sender
   (channel posts may have no sender). Produces `SearchImages` only,
   never `ProcessImages`. Dedups by `(oid, id)` with a 10-minute TTL.
-- `features/media_thumbnail/MediaExtractor` — Pure tier selection.
-  Photo: the largest size whose max edge is ≤ `max_edge_px` (320), else
-  the smallest size. Video/animation: the thumbnail only, never the
-  original file.
+- `features/media_thumbnail/MediaExtractor` — Pure tier selection
+  (Telethon-migration chunk 1 semantics). Photo: the LARGEST tier — the
+  full-resolution original, no size cap (ties by larger max edge;
+  file-less tiers are skipped). Video/animation: the thumbnail only,
+  never the original file. Document: by MIME type — `image/*` sends the
+  document file itself, `video/*` its thumbnail, anything else is
+  rejected with a reason.
 - `features/media_thumbnail/MediaThumbnailHandler` — The `/process`
   chain: extract → download → read bytes → SHA-256 (log only) → build
-  `ImageRequest` (`image_id`, thumbnail bytes, memo = caption,
-  `owner_id` = `chat_id`) → Outbox PENDING → enqueue to the
-  ProcessImages stream. Enqueue failure leaves the record PENDING for
-  the retry thread.
+  `ImageRequest` (`image_id = str(message_id)`, media bytes, `memo` =
+  AES-256-GCM ciphertext of the cleaned caption, `owner_id` = bare
+  chat id) → Outbox PENDING → enqueue to the ProcessImages stream.
+  Fails fast before downloading when the chat id does not fit the bare
+  uint32 range or `KEYME` is unconfigured; an encryption failure sends
+  nothing. Enqueue failure leaves the record PENDING for the retry
+  thread.
 - `features/media_thumbnail/SearchHandler` — The `/search` chain. Same
   extraction/download path, but builds a `SearchReq` with the bare-ID
   conversion and range checks, registers `(oid, id)` in the correlation
@@ -777,9 +797,27 @@ of libraries.
   one mutex, shared by workers and the retry thread.
 - `infra/Sha256`, `infra/FileStore` — SHA-256 hex (log only) and
   `ReadFileBytes` with a max-bytes cap.
-- `common/Idempotency` — `MakeImageId` (`<chat_id>:<message_id>:<file_unique_id>`)
-  and the bare-ID conversions `ToBareChatId` / `ToBareMessageId` with
-  range checks that fail loudly instead of truncating.
+- `common/Idempotency` — `MakeWireImageId` (`str(message_id)`, the wire
+  image_id since chunk 1), `MakeImageId`
+  (`<chat_id>:<message_id>:<file_unique_id>` — internal SearchReq
+  correlation only) and the bare-ID conversions `ToBareChatId` /
+  `ToBareMessageId` with range checks that fail loudly instead of
+  truncating.
+- `common/MemoCipher` — AES-256-GCM memo encryption, byte-compatible
+  with the Python server (`base64(nonce[12] ‖ ct ‖ tag[16])`, key =
+  SHA256(KEYME), 12 random nonce bytes per message). `Clean` applies
+  the Python caption-cleaning regex (URLs, t.me links, Unicode
+  whitespace, `[]*_ -`). `EncryptWithNonce` exists for the fixed-nonce
+  cross-language test vectors only. Uses OpenSSL `EVP` (linked as
+  `OpenSSL::Crypto`).
+- `features/chat_state/ChatStateStore` — In-memory per-bare-chat-id
+  state fed by `ImageReply.result` (`{"cid","mid"}` JSON, parsed by
+  `ParseReplyResult`): watermark `offset_id` that only increases, a
+  `chat_url` resolved on demand over TDLib (getChat candidates
+  supergroup → basic group → user, then getSupergroup usernames /
+  getBasicGroup upgrade; failures land on the `>>>>Nrror><id>`
+  placeholder and are never retried), and `last_seen`. Memory-only in
+  chunk 1; persistence is chunk 2.
 - `common/Logger` — spdlog setup (level from config).
 
 ## gRPC code generation
@@ -806,8 +844,8 @@ command above still writes an in-tree `generated/` if you run it).
 
 Copy `config/config.example.yaml` to `config/config.yaml` and fill in real
 values. Secrets (`TG_API_HASH`, `TG_TDLIB_ENCRYPTION_KEY`, `GRPC_TOKEN`,
-phone) come from environment variables — never hardcoded, never committed
-(`.gitignore` excludes `config/config.yaml`).
+`KEYME`, phone) come from environment variables — never hardcoded, never
+committed (`.gitignore` excludes `config/config.yaml`).
 
 ### Secrets — what each one does
 
@@ -842,6 +880,21 @@ unauthenticated clients (`UNAUTHENTICATED` / `PERMISSION_DENIED`).
   intercepted.
 - If the server requires no authentication, leave the token empty and
   the client sends no such metadata.
+
+**`media_thumbnail.keyme` (`KEYME`) — the memo cipher seed.** Since the
+Telethon-migration chunk 1 the `memo` field on the wire is not the
+caption text but `base64(nonce ‖ ciphertext ‖ tag)`, AES-256-GCM with
+`key = SHA256(KEYME)` — byte-compatible with the Python server's
+`aes_gcm_encrypt`/`aes_gcm_decrypt` (both directions verified with
+computed test vectors; see `tests/test_memo_cipher.cpp` and
+`mig-chunk1.log`). Before encryption the caption is cleaned with the
+same regex the Python client applies (URLs, `t.me` links, Unicode
+whitespace, `[]*_ -` all removed). The server must hold the same
+`KEYME` to decrypt the memo. Treat it as a secret on the level of
+`api_hash`: env only, never code, never git, never logs. If it is
+unset or encryption fails, the message is NOT sent (fail loud) —
+the record stays in the Outbox and the retry thread re-encounters the
+error each pass.
 
 ### Private CA (grpc.ca_cert)
 
@@ -906,19 +959,21 @@ program's own log lines.
 ctest --test-dir build/tests --output-on-failure
 ```
 
-9 test binaries, all green (2026-11-08, 2.59 s total):
+15 test binaries, all green (2026-11-10, ~5.3 s total):
 
 | test | covers |
 |---|---|
-| test_idempotency | image_id formation, memo = caption only |
-| test_config | config parsing, env expansion |
-| test_media_extractor | photo tier selection (≤320px), video thumbnail-only |
+| test_idempotency | image_id formation (`MakeImageId`/`MakeWireImageId`), bare-ID conversions |
+| test_config | config parsing, env expansion (`keyme` included) |
+| test_memo_cipher | chunk 1: Python-compatible caption cleaning (case by case), cross-language AES-GCM vectors in BOTH directions (Python ciphertext decrypted here; fixed-nonce C++ ciphertext byte-equal to Python's), round-trips incl. every base64 padding length, tamper/wrong-key rejection, a DISABLED live token dump for re-running the C++→Python check |
+| test_chat_state | chunk 1: `{"cid","mid"}` parsing, watermark only increases, supergroup/basic/user URL forms, migrated group follows its supergroup, placeholder on failure with NO retry storm, single in-flight resolution |
+| test_media_extractor | photo largest-tier (full image), tier tie-break, file-less tier skip, video/animation thumbnail-only, document `image/*`/`video/*`/reject |
 | test_outbox | PENDING -> DONE / retry / dead-letter / replay |
-| test_bot_command | only the configured bot's command accepted, arg parsing; `SecondCommandCompletesWhileFirstDownloadPending` proves async message processing (B completes while A's download is still pending) |
+| test_bot_command | only the configured bot's command accepted, arg parsing; wire request checks: `image_id = str(message_id)`, `memo` = KEYME-encrypted cleaned caption (decrypt-verified), `owner_id` = bare id; `SecondCommandCompletesWhileFirstDownloadPending` proves async message processing (B completes while A's download is still pending) |
 | test_auto_search | allowlisted chat triggers Search only (disabled by default) |
 | test_handler_registry | dispatcher registration / dispatch |
 | test_async_streamer | CQ state machine vs in-process fake server: round-trip by image_id, bounded-queue backpressure, reconnect after server restart |
-| test_e2e_fake_server | **chunk 3 acceptance test**: a local thumbnail file through the real pipeline (MediaThumbnailHandler/SearchHandler -> FileDownloader -> GrpcTransport -> AsyncStreamers -> fake ImageProcessor server); ProcessImages reply round-trips by image_id and the Outbox record goes PENDING -> DONE; SearchImages reply round-trips by (oid, id) and resolves through the correlation table |
+| test_e2e_fake_server | **chunk 3 acceptance test**: a local thumbnail file through the real pipeline (MediaThumbnailHandler/SearchHandler -> FileDownloader -> GrpcTransport -> AsyncStreamers -> fake ImageProcessor server); ProcessImages reply round-trips by `str(message_id)`, the memo arrives as KEYME ciphertext (decrypt-verified) and `owner_id` as the bare id, the Outbox record goes PENDING -> DONE; SearchImages reply round-trips by (oid, id) and resolves through the correlation table |
 | test_tdlib_bootstrap | real TDLib client delivers the first authorization state (regression test for the missing bootstrap request) |
 | test_auth_prompt | terminal prompts for the login code and 2FA password (env override, empty input fails fast) |
 | test_update_logging | `telegram.log_updates` logs every update with type + content, silent when off |
@@ -955,12 +1010,16 @@ src/telegram/       TelegramClient, AuthManager, UpdateDispatcher,
                     UpdateHandler, FileDownloader
 src/features/       bot_command/ (BotCommandHandler, CommandParser)
                     auto_search/ (AutoSearchHandler, disabled by default)
+                    chat_state/ (ChatStateStore: {"cid","mid"} watermarks,
+                    chat-URL resolution — chunk 1, in-memory)
                     media_thumbnail/ (MediaThumbnailHandler, MediaExtractor, SearchHandler)
 src/transport/      GrpcTransport, AsyncStreamer (template),
                     StreamerPool (template), ProcessImagesClient,
                     SearchImagesClient
 src/infra/          Outbox (SQLite), Sha256, FileStore
-src/common/         Logger (spdlog), Idempotency (bare-ID conversion)
+src/common/         Logger (spdlog), Idempotency (bare-ID conversion,
+                    MakeImageId/MakeWireImageId), MemoCipher (AES-256-GCM
+                    memo, chunk 1)
 tests/              GTest unit tests
 config/             config.example.yaml
 third_party/td/     TDLib shallow clone (commit 4c6377a; built 2026-11-08,

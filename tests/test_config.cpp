@@ -32,7 +32,7 @@ features:
   media_thumbnail:
     enabled: false
     max_thumb_bytes: 1048576
-    max_edge_px: 256
+    keyme: "${TG_TEST_KEYME}"   # AES-GCM memo seed (secret, env-supplied)
   bot_command:
     enabled: true
     command_bot_user_id: 987654321
@@ -99,6 +99,7 @@ class ConfigFileTest : public ::testing::Test {
 TEST_F(ConfigFileTest, FromFileMapsEverything) {
   setenv("TG_TEST_KEY", "secret-key", 1);
   setenv("TG_TEST_TOKEN", "grpc-token", 1);
+  setenv("TG_TEST_KEYME", "memo-seed-secret", 1);
 
   const app::Config config = app::Config::FromFile(path_);
 
@@ -114,7 +115,7 @@ TEST_F(ConfigFileTest, FromFileMapsEverything) {
   EXPECT_EQ(config.grpc.queue_capacity, 50);
   EXPECT_EQ(config.grpc.connections, 3);
   EXPECT_FALSE(config.media_thumbnail.enabled);
-  EXPECT_EQ(config.media_thumbnail.max_edge_px, 256);
+  EXPECT_EQ(config.media_thumbnail.keyme, "memo-seed-secret");
   EXPECT_EQ(config.bot_command.command_bot_user_id, 987654321);
   EXPECT_TRUE(config.auto_search.enabled);
   EXPECT_EQ(config.auto_search.chats.size(), 2u);
@@ -124,6 +125,7 @@ TEST_F(ConfigFileTest, FromFileMapsEverything) {
 
   unsetenv("TG_TEST_KEY");
   unsetenv("TG_TEST_TOKEN");
+  unsetenv("TG_TEST_KEYME");
 }
 
 TEST_F(ConfigFileTest, MissingFileThrows) {

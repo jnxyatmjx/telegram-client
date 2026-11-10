@@ -28,7 +28,10 @@ features:
   media_thumbnail:
     enabled: true
     max_thumb_bytes: 5242880
-    max_edge_px: 320           # photo size tier: largest edge <= 320px
+    # Memo cipher seed (Python KEYME, Telethon migration Chunk 1): the
+    # AES-256-GCM key is SHA256(keyme); the server must run the same KEYME
+    # to decrypt the memo. Secret — keep it in the environment only.
+    keyme: "${KEYME}"
   bot_command:
     # Trigger mode (a, final): the bot itself sends the command message;
     # verify sender_user_id == command_bot_user_id.

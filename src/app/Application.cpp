@@ -65,8 +65,10 @@ Application::Application(Config config)
           std::chrono::milliseconds(1'000))),
       files_(telegram_),
       transport_(config_.grpc),
+      chat_state_(telegram_),
       process_handler_(MediaExtractor(config_.media_thumbnail), telegram_,
-                       files_),
+                       files_,
+                       common::MemoCipher(config_.media_thumbnail.keyme)),
       search_handler_(MediaExtractor(config_.media_thumbnail), telegram_,
                       files_),
       bot_command_handler_(config_.bot_command, process_handler_,
@@ -134,7 +136,9 @@ void Application::WireHandlers() {
 
 void Application::WireStreamerCallbacks() {
   // ImageReply -> Outbox DONE (v5 §2.4: log + metrics only, never reply into
-  // Telegram by default).
+  // Telegram by default) + the {"cid","mid"} watermark update (Telethon
+  // migration Chunk 1: parse result; a malformed result is logged and
+  // dropped, never crashes the pipeline).
   process_pool_.SetReplyHandler(
       [this](const ImageReply& reply) {
         const bool known = outbox_.MarkDone(reply.image_id(), reply.result());
@@ -144,6 +148,17 @@ void Application::WireStreamerCallbacks() {
         } else {
           spdlog::warn("process: reply for unknown image_id {}", reply.image_id());
         }
+        const auto parsed =
+            features::chat_state::ParseReplyResult(reply.result());
+        if (!parsed.has_value()) {
+          // The server contract is {"cid": <bare id>, "mid": <msg id>}
+          // (Python insertIdUpdate logs a decode failure the same way).
+          spdlog::warn("process: reply result for {} is not a {{\"cid\","
+                       "\"mid\"}} JSON — watermark not updated",
+                       reply.image_id());
+          return;
+        }
+        chat_state_.ApplyReply(parsed->cid, parsed->mid);
       });
 
   // SearchRsp -> correlation table lookup (v5 §2.4), log only.

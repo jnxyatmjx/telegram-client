@@ -41,6 +41,8 @@ else()
 endif()
 find_package(spdlog CONFIG REQUIRED)
 find_package(SQLite3 REQUIRED)
+# AES-256-GCM memo encryption (MemoCipher) and RAND_bytes come from OpenSSL.
+find_package(OpenSSL REQUIRED)
 
 find_program(PROTOC_EXECUTABLE NAMES protoc REQUIRED)
 find_program(GRPC_CPP_PLUGIN_EXECUTABLE NAMES grpc_cpp_plugin REQUIRED)
@@ -109,11 +111,14 @@ add_library(tg_core STATIC
   src/infra/Outbox.cpp
   src/infra/Sha256.cpp
   src/infra/FileStore.cpp
-  src/common/Idempotency.cpp)
+  src/common/Idempotency.cpp
+  src/common/MemoCipher.cpp
+  src/features/chat_state/ChatStateStore.cpp)
 
 target_include_directories(tg_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(tg_core
-  PUBLIC tg_proto Threads::Threads spdlog::spdlog SQLite::SQLite3)
+  PUBLIC tg_proto Threads::Threads spdlog::spdlog SQLite::SQLite3
+         OpenSSL::Crypto)
 target_compile_options(tg_core PRIVATE -Wall -Wextra)
 
 # TDLib is wired in here but not built by chunk 1. The build happens later;

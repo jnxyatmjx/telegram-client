@@ -54,7 +54,11 @@ struct GrpcConfig {
 struct MediaThumbnailConfig {
   bool enabled = true;
   std::int64_t max_thumb_bytes = 5 * 1024 * 1024;
-  int max_edge_px = 320;  // photo size tier: largest edge <= this
+  // AES-GCM memo seed (Python KEYME): SHA256(keyme) is the AES-256 key. A
+  // secret — configure as ${KEYME} from the environment, never commit it.
+  // Empty = memo encryption is not configured; ProcessImages sends are
+  // refused loudly (the server expects ciphertext).
+  std::string keyme;
 };
 
 struct BotCommandConfig {

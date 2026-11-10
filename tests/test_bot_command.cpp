@@ -3,6 +3,7 @@
 // target resolution via reply-to and via "chat_id message_id" args.
 #include <app/AppContext.h>
 #include <app/WorkerPool.h>
+#include <common/MemoCipher.h>
 #include <features/bot_command/BotCommandHandler.h>
 #include <features/bot_command/CommandParser.h>
 #include <features/media_thumbnail/MediaExtractor.h>
@@ -34,6 +35,23 @@ namespace media = tg::features::media_thumbnail;
 namespace transport = tg::transport;
 
 namespace {
+
+// Memo cipher seed for this test; the wire memo is AES-GCM(keyme) of the
+// caption (Telethon migration Chunk 1).
+constexpr const char* kKeyme = "keyme-mig-chunk1-test-seed";
+constexpr std::int64_t kTargetDialogId = -1'001'234'567'890LL;
+// Bare MTProto id the wire owner_id must carry (supergroup dialog - 1e12).
+constexpr std::int64_t kExpectedOwnerId = 1'234'567'890;
+
+// Decrypts what the handler put on the wire: memo must be ciphertext of the
+// caption under KEYME, never the plaintext (fail-loud protocol).
+std::string DecryptMemoOrDie(const std::string& memo) {
+  const tg::common::MemoCipher cipher(kKeyme);
+  const auto plain = cipher.Decrypt(memo);
+  EXPECT_TRUE(plain.has_value())
+      << "memo is not decryptable with KEYME; memo='" << memo << "'";
+  return plain.has_value() ? *plain : std::string{};
+}
 
 // Synchronous fake TDLib: answers getMessage and downloadFile inline.
 // For the async regression test it can also DELAY a downloadFile response:
@@ -239,9 +257,10 @@ class BotCommandTest : public ::testing::Test {
 
     config_.bot_command.command_bot_user_id = 777;  // the command bot (mode a)
     config_.media_thumbnail.max_thumb_bytes = 1024 * 1024;
+    config_.media_thumbnail.keyme = kKeyme;
 
     sender_.thumbnail_path = thumb_path_;
-    sender_.target_chat_id_ = -1'001'234'567'890LL;
+    sender_.target_chat_id_ = kTargetDialogId;
     sender_.target_message_id_ = 42;
     sender_.set_target_message(
         MakePhotoMessage(sender_.target_chat_id_, sender_.target_message_id_,
@@ -269,7 +288,8 @@ class BotCommandTest : public ::testing::Test {
     handler_ = std::make_unique<bot_command::BotCommandHandler>(
         config_.bot_command,
         media::MediaThumbnailHandler(
-            media::MediaExtractor(config_.media_thumbnail), sender_, *files_),
+            media::MediaExtractor(config_.media_thumbnail), sender_, *files_,
+            tg::common::MemoCipher(config_.media_thumbnail.keyme)),
         *search_handler_);
   }
 
@@ -376,7 +396,7 @@ TEST(BotCommandClassify, KnownAndUnknownCommands) {
 // --- Handler behaviour -----------------------------------------------------
 
 TEST_F(BotCommandTest, ProcessCommandFromConfiguredBotViaReplyTo) {
-  auto update = MakeCommandUpdate(777, -1'001'234'567'890LL, "/process", true, 42);
+  auto update = MakeCommandUpdate(777, kTargetDialogId, "/process", true, 42);
   td_api::object_ptr<td_api::Update> base = std::move(update);
 
   ASSERT_TRUE(handler_->CanHandle(base));
@@ -388,16 +408,21 @@ TEST_F(BotCommandTest, ProcessCommandFromConfiguredBotViaReplyTo) {
 
   const auto request = process_streamer_->lane(0)->PeekFront();
   ASSERT_TRUE(request.has_value());
-  // image_id = "<chat_id>:<message_id>:<file_unique_id>" (v5 §1.2)
-  EXPECT_EQ(request->image_id(), "-1001234567890:42:uid-photo");
-  EXPECT_EQ(request->memo(), "the caption");  // memo = caption ONLY
-  EXPECT_EQ(request->owner_id(), -1'001'234'567'890LL);  // int64, no conversion
+  // image_id = str(message_id) — the wire protocol's message-level id
+  // (Telethon migration Chunk 1); MakeImageId stays internal to SearchReq.
+  EXPECT_EQ(request->image_id(), "42");
+  // memo = AES-GCM(KEYME) of the CLEANED caption — decryptable with KEYME,
+  // never plaintext (the cleaning matches Python's pre-encryption regex).
+  EXPECT_EQ(DecryptMemoOrDie(request->memo()), "thecaption");
+  EXPECT_NE(request->memo(), "thecaption");
+  // owner_id = bare MTProto id (uint32-ranged), not the TDLib dialog id.
+  EXPECT_EQ(request->owner_id(), kExpectedOwnerId);
 
   // Outbox got the PENDING record for retry (v5 §2.2).
   const auto record = outbox_->Get(request->image_id());
   ASSERT_TRUE(record.has_value());
   EXPECT_EQ(record->state, tg::infra::OutboxState::kPending);
-  EXPECT_EQ(record->memo, "the caption");
+  EXPECT_EQ(DecryptMemoOrDie(record->memo), "thecaption");
 }
 
 TEST_F(BotCommandTest, SearchCommandTargetsArgsGivenChatAndMessage) {
@@ -419,7 +444,7 @@ TEST_F(BotCommandTest, SearchCommandTargetsArgsGivenChatAndMessage) {
   EXPECT_EQ(request->id(), 42u);
   EXPECT_FALSE(request->image_data().empty());
   // SearchReq is NOT in the Outbox (v5 §2.4)
-  EXPECT_FALSE(outbox_->Get("-1001234567890:42:uid-photo").has_value());
+  EXPECT_FALSE(outbox_->Get("42").has_value());
 }
 
 TEST_F(BotCommandTest, SecondCommandCompletesWhileFirstDownloadPending) {
@@ -434,12 +459,10 @@ TEST_F(BotCommandTest, SecondCommandCompletesWhileFirstDownloadPending) {
   sender_.add_target_message(MakePhotoMessage(sender_.target_chat_id_, 43,
                                               thumb_path_, 4243, "uid-photo-b"));
 
-  auto update_a =
-      MakeCommandUpdate(777, -1'001'234'567'890LL, "/process", true, 42);
+  auto update_a = MakeCommandUpdate(777, kTargetDialogId, "/process", true, 42);
   td_api::object_ptr<td_api::Update> base_a = std::move(update_a);
   handler_->Handle(base_a, *ctx_);
-  auto update_b =
-      MakeCommandUpdate(777, -1'001'234'567'890LL, "/process", true, 43);
+  auto update_b = MakeCommandUpdate(777, kTargetDialogId, "/process", true, 43);
   td_api::object_ptr<td_api::Update> base_b = std::move(update_b);
   handler_->Handle(base_b, *ctx_);
 
@@ -449,7 +472,7 @@ TEST_F(BotCommandTest, SecondCommandCompletesWhileFirstDownloadPending) {
   EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 1u);
   const auto first = process_streamer_->lane(0)->PeekFront();
   ASSERT_TRUE(first.has_value());
-  EXPECT_EQ(first->image_id(), "-1001234567890:43:uid-photo-b");
+  EXPECT_EQ(first->image_id(), "43");  // str(message_id)
 
   // A lands later, after its slow download completes.
   ASSERT_TRUE(WaitForQueued(*process_streamer_, 2));
@@ -457,7 +480,7 @@ TEST_F(BotCommandTest, SecondCommandCompletesWhileFirstDownloadPending) {
 }
 
 TEST_F(BotCommandTest, OtherSenderIsIgnored) {
-  auto update = MakeCommandUpdate(111, -1'001'234'567'890LL, "/process", true, 42);
+  auto update = MakeCommandUpdate(111, kTargetDialogId, "/process", true, 42);
   td_api::object_ptr<td_api::Update> base = std::move(update);
   EXPECT_FALSE(handler_->CanHandle(base));
   handler_->Handle(base, *ctx_);
@@ -466,7 +489,7 @@ TEST_F(BotCommandTest, OtherSenderIsIgnored) {
 }
 
 TEST_F(BotCommandTest, UnknownCommandIsIgnored) {
-  auto update = MakeCommandUpdate(777, -1'001'234'567'890LL, "/boom", true, 42);
+  auto update = MakeCommandUpdate(777, kTargetDialogId, "/boom", true, 42);
   td_api::object_ptr<td_api::Update> base = std::move(update);
   EXPECT_FALSE(handler_->CanHandle(base));
   handler_->Handle(base, *ctx_);
@@ -474,7 +497,7 @@ TEST_F(BotCommandTest, UnknownCommandIsIgnored) {
 }
 
 TEST_F(BotCommandTest, CommandWithoutTargetIsIgnored) {
-  auto update = MakeCommandUpdate(777, -1'001'234'567'890LL, "/process", false);
+  auto update = MakeCommandUpdate(777, kTargetDialogId, "/process", false);
   td_api::object_ptr<td_api::Update> base = std::move(update);
   EXPECT_TRUE(handler_->CanHandle(base));  // right sender + right command...
   handler_->Handle(base, *ctx_);           // ...but no target -> nothing sent
@@ -484,7 +507,7 @@ TEST_F(BotCommandTest, CommandWithoutTargetIsIgnored) {
 
 TEST_F(BotCommandTest, GetMessageErrorIsSwallowed) {
   sender_.set_target_message(nullptr);  // fake answers 404
-  auto update = MakeCommandUpdate(777, -1'001'234'567'890LL, "/process", true, 42);
+  auto update = MakeCommandUpdate(777, kTargetDialogId, "/process", true, 42);
   td_api::object_ptr<td_api::Update> base = std::move(update);
   handler_->Handle(base, *ctx_);
   EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 0);
@@ -497,9 +520,10 @@ TEST_F(BotCommandTest, DisabledHandlerClaimsNothing) {
   auto disabled = std::make_unique<bot_command::BotCommandHandler>(
       config_.bot_command,
       media::MediaThumbnailHandler(
-          media::MediaExtractor(config_.media_thumbnail), sender_, *files_),
+          media::MediaExtractor(config_.media_thumbnail), sender_, *files_,
+          tg::common::MemoCipher(config_.media_thumbnail.keyme)),
       search_handler);
-  auto update = MakeCommandUpdate(777, -1'001'234'567'890LL, "/process", true, 42);
+  auto update = MakeCommandUpdate(777, kTargetDialogId, "/process", true, 42);
   td_api::object_ptr<td_api::Update> base = std::move(update);
   EXPECT_FALSE(disabled->CanHandle(base));
 }

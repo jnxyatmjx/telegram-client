@@ -6,6 +6,8 @@ find_package(GTest CONFIG REQUIRED)
 set(TG_TEST_SOURCES
   test_idempotency.cpp
   test_config.cpp
+  test_memo_cipher.cpp
+  test_chat_state.cpp
   test_media_extractor.cpp
   test_outbox.cpp
   test_bot_command.cpp

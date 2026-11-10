@@ -4,7 +4,6 @@
 #include <common/Idempotency.h>
 #include <common/Logger.h>
 #include <infra/FileStore.h>
-#include <infra/Outbox.h>
 #include <infra/Sha256.h>
 #include <transport/AsyncStreamer.h>
 
@@ -22,8 +21,12 @@ constexpr auto kEnqueueTimeout = std::chrono::milliseconds(0);
 
 MediaThumbnailHandler::MediaThumbnailHandler(MediaExtractor extractor,
                                              telegram::ITdSender& sender,
-                                             telegram::FileDownloader& files)
-    : extractor_(std::move(extractor)), sender_(sender), files_(files) {}
+                                             telegram::FileDownloader& files,
+                                             common::MemoCipher memo_cipher)
+    : extractor_(std::move(extractor)),
+      sender_(sender),
+      files_(files),
+      memo_cipher_(std::move(memo_cipher)) {}
 
 void MediaThumbnailHandler::SendProcessImages(
     const td_api::message& target, app::AppContext& ctx) const {
@@ -31,6 +34,20 @@ void MediaThumbnailHandler::SendProcessImages(
   const auto media = extractor_.Extract(target, &why);
   if (!media) {
     spdlog::error("process: extract failed: {}", why);
+    return;
+  }
+  // Fail BEFORE downloading when the request could never be built anyway:
+  // owner_id needs a bare chat id in uint32 range (v5 §1.3 hard rule), and
+  // the memo needs a configured KEYME (the server expects ciphertext).
+  if (!common::ToBareChatId(media->chat_id)) {
+    spdlog::error("process: chat_id {} does not fit uint32 bare id — NOT "
+                  "sending (no truncation)", media->chat_id);
+    return;
+  }
+  if (!memo_cipher_.IsConfigured()) {
+    spdlog::error("process: KEYME not configured — cannot encrypt memo, "
+                  "NOT sending message {} (never send plaintext)",
+                  media->message_id);
     return;
   }
 
@@ -54,8 +71,7 @@ void MediaThumbnailHandler::OnDownloaded(
     spdlog::error("process: download failed: {}", result.error);
     return;
   }
-  const std::string image_id = common::MakeImageId(
-      media.chat_id, media.message_id, media.file_unique_id);
+  const std::string image_id = common::MakeWireImageId(media.message_id);
   if (!ctx.workers.Post([this, media, path = result.local_path,
                          &ctx]() mutable {
         FinishProcess(std::move(media), std::move(path), ctx);
@@ -71,25 +87,43 @@ void MediaThumbnailHandler::FinishProcess(ExtractedMedia media,
   // [3] read bytes, hash (log only), build the request.
   auto bytes = infra::ReadFileBytes(local_path, ctx.config.media_thumbnail.max_thumb_bytes);
   if (!bytes) {
-    spdlog::error("process: cannot read downloaded thumbnail: {}", local_path);
+    spdlog::error("process: cannot read downloaded media: {}", local_path);
     return;
   }
 
-  const std::string image_id =
-      common::MakeImageId(media.chat_id, media.message_id, media.file_unique_id);
-  spdlog::info("process: {} {}x{} {} bytes sha256={} memo_len={}",
-               image_id, media.width, media.height, bytes->size(),
-               infra::Sha256::Hex(*bytes),
-               media.caption.size());
+  // Protocol alignment (Telethon migration Chunk 1):
+  //   owner_id: bare MTProto chat id, uint32 range-checked (the server and
+  //     the reply {"cid"} both live in the bare-id world).
+  const auto bare = common::ToBareChatId(media.chat_id);
+  if (!bare) {
+    spdlog::error("process: chat_id {} does not fit uint32 bare id — NOT "
+                  "sending (no truncation)", media.chat_id);
+    return;
+  }
+  //   image_id: str(message_id) — message-level dedup, Python protocol.
+  const std::string image_id = common::MakeWireImageId(media.message_id);
+  //   memo: AES-256-GCM ciphertext of the cleaned caption.
+  auto memo = memo_cipher_.Encrypt(media.caption);
+  if (!memo) {
+    spdlog::error("process: memo encryption failed for message {} — NOT "
+                  "sending (never send plaintext)", media.message_id);
+    return;
+  }
+
+  spdlog::info("process: msg {} {}x{} {} bytes sha256={} owner={} (bare) "
+               "memo_len={}", image_id, media.width, media.height,
+               bytes->size(), infra::Sha256::Hex(*bytes), bare->oid,
+               memo->size());
 
   ImageRequest request;
   request.set_image_id(image_id);
   request.set_image_data(std::move(*bytes));  // move, no extra copy (v5 §2.3)
-  request.set_memo(media.caption);           // caption ONLY (v5 §1.2)
-  request.set_owner_id(media.chat_id);       // int64, no conversion
+  request.set_memo(std::move(*memo));
+  request.set_owner_id(static_cast<std::int64_t>(bare->oid));
 
   // Outbox first (v5 §2.2 step [4]): if the enqueue fails the record stays
-  // PENDING and the retry thread replays it by image_id.
+  // PENDING and the retry thread replays it by image_id (now the message id
+  // string — message-level dedup, same replay semantics).
   infra::OutboxRecord record;
   record.image_id = image_id;
   record.image_data = request.image_data();

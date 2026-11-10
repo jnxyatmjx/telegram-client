@@ -10,6 +10,7 @@
 #include <app/WorkerPool.h>
 #include <features/auto_search/AutoSearchHandler.h>
 #include <features/bot_command/BotCommandHandler.h>
+#include <features/chat_state/ChatStateStore.h>
 #include <features/media_thumbnail/MediaExtractor.h>
 #include <features/media_thumbnail/MediaThumbnailHandler.h>
 #include <features/media_thumbnail/SearchHandler.h>
@@ -79,6 +80,11 @@ class Application {
   std::vector<std::unique_ptr<transport::SearchImagesClient>> search_clients_;
   transport::StreamerPool<ImageRequest, ImageReply> process_pool_;
   transport::StreamerPool<SearchReq, SearchRsp> search_pool_;
+  // Per-chat watermark/link state driven by ImageReply.result (Chunk 1:
+  // in-memory). Declared after telegram_: its TDLib resolution callbacks
+  // complete during telegram_.Stop() in the destructor body, before members
+  // are destroyed.
+  features::chat_state::ChatStateStore chat_state_;
   features::media_thumbnail::MediaThumbnailHandler process_handler_;
   features::media_thumbnail::SearchHandler search_handler_;
   features::bot_command::BotCommandHandler bot_command_handler_;

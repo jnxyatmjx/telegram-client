@@ -41,14 +41,26 @@ std::optional<BareChatId> ToBareChatId(std::int64_t chat_id);
 // number, a positive 32-bit value. Out of range -> nullopt.
 std::optional<std::uint32_t> ToBareMessageId(std::int64_t message_id);
 
-// image_id = "<chat_id>:<message_id>:<file_unique_id>" — the idempotency +
-// correlation key for ProcessImages (server dedupes on it). chat_id here is
-// the TDLib dialog id in string form (no conversion; image_id is a string
-// and not bound by the uint32 limit). file_unique_id is the TDLib
-// remoteFile.unique_id (the Bot API file_unique_id analogue); callers pass
-// whatever identity their media provides.
+// image_id = "<chat_id>:<message_id>:<file_unique_id>" — INTERNAL identity
+// used by the SearchReq correlation table bookkeeping (search requests carry
+// no image_id on the wire; this is the log/correlation form). file_unique_id
+// is the TDLib remoteFile.unique_id (the Bot API file_unique_id analogue).
+//
+// NOTE (Telethon migration, Chunk 1): ImageRequest.image_id on the wire is
+// NOT this anymore — see MakeWireImageId below.
 std::string MakeImageId(std::int64_t chat_id, std::int64_t message_id,
                         const std::string& file_unique_id);
+
+// ImageRequest.image_id on the wire: str(message_id) — the decimal message
+// id string, exactly what the Python client sends (app_client.py:1388). The
+// server dedupes on it at MESSAGE level: the same Telegram message always
+// maps to the same key, so a retry/replay is deduped server-side, while two
+// different messages never collide (MTProto message ids are per-chat, so two
+// chats CAN carry the same number — Python accepted that and so do we; the
+// server's key space is the message id string, not a per-chat tuple).
+inline std::string MakeWireImageId(std::int64_t message_id) {
+  return std::to_string(message_id);
+}
 
 }  // namespace tg::common
 

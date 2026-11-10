@@ -64,7 +64,14 @@ Application::Application(Config config)
           static_cast<std::size_t>(config_.worker_count),
           10'000,  // handler queue capacity
           std::chrono::milliseconds(1'000))),
-      files_(telegram_),
+      // One shared FloodWait scheduler; the pad is the Telethon "+1" (the
+      // same knob HistoryBackfill and DialogScanner pause with). fallback /
+      // attempt cap stay at the FloodRetry defaults (5 s / 3).
+      flood_retry_(telegram::FloodRetry::Options{
+          config_.history_backfill.flood_pad_seconds,
+          /*fallback_seconds=*/5,
+          /*max_attempts=*/3}),
+      files_(telegram_, &flood_retry_),
       transport_(config_.grpc),
       // chat_state.enabled=false keeps the store memory-only (Chunk 1
       // behaviour); otherwise the Python `chathis` SQLite schema backs it.
@@ -78,7 +85,7 @@ Application::Application(Config config)
                        common::MemoCipher(config_.media_thumbnail.keyme)),
       search_handler_(MediaExtractor(config_.media_thumbnail), telegram_,
                       files_),
-      messenger_(telegram_),
+      messenger_(telegram_, &flood_retry_),
       backfill_(telegram_, process_handler_, chat_state_, messenger_,
                 features::history_backfill::HistoryBackfillConfig{
                     config_.history_backfill.enabled,
@@ -94,7 +101,7 @@ Application::Application(Config config)
           std::make_shared<features::media_channels::MediaChannelHandler>(
               config_.media_channels, process_handler_, search_handler_)),
       bot_command_handler_(config_.bot_command, process_handler_,
-                           search_handler_),
+                           search_handler_, &flood_retry_),
       auto_search_handler_(std::make_shared<features::auto_search::AutoSearchHandler>(
           config_.auto_search, search_handler_)),
       dispatcher_(workers_) {
@@ -136,13 +143,16 @@ Application::Application(Config config)
 
 Application::~Application() {
   // Async shutdown order (2026-11-09): stop the source of new work first.
-  // backfill_.Shutdown() / dialog_scanner_.Shutdown() refuse new TDLib
+  // flood_retry_.Shutdown() drops every pending FloodWait re-send (chunk 3)
+  // so none fires against a closed TDLib session; backfill_.Shutdown() /
+  // dialog_scanner_.Shutdown() refuse new TDLib
   // sends, so pending callbacks during telegram_.Stop() no-op cleanly.
   // telegram_.Stop() completes every pending TDLib callback (getMessage,
   // downloadFile), which fires the download callbacks, which post their
   // finish stages to the pool — so the pool must still be running here,
   // and is drained after. FailAll is the safety net for any download
   // still pending after the TDLib callbacks completed.
+  flood_retry_.Shutdown();
   backfill_.Shutdown();
   dialog_scanner_.Shutdown();
   telegram_.Stop();
@@ -403,6 +413,7 @@ int Application::Run() {
   // after the pool (finish stages Enqueue to them).
   backfill_.Shutdown();                         // 0. refuse new jobs/pages
   dialog_scanner_.Shutdown();                   //    (pending callbacks no-op)
+  flood_retry_.Shutdown();                      //    drop FloodWait re-sends
   telegram_.Stop();                             // 1. close TDLib session
   files_.FailAll("shutting down");              // 2. safety net for downloads
   workers_->Stop(kWorkerDrainTimeout);          // 3. drain in-flight work

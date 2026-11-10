@@ -9,6 +9,12 @@
 //
 // Metadata (token) is attached at stream creation via MakeContext() — one
 // ClientContext per stream, never reused, never per-message (v5 §3.4).
+//
+// Channel args (Telethon migration chunk 3): every lane gets the same set
+// from MakeChannelArgs — local subchannel pool (one TCP connection per
+// lane), HTTP/2 keepalive, 64 MiB max message length (full images must fit,
+// same headroom as the Python client's max_send_message_length) and the
+// HTTP/2 lookahead / write-buffer sizing for multi-MB messages.
 
 #include <app/Config.h>
 #include <grpcpp/grpcpp.h>
@@ -18,6 +24,13 @@
 #include <vector>
 
 namespace tg::transport {
+
+// Channel args for one lane from the grpc config. Public + pure so the
+// exact arg set is unit-testable without opening sockets (tests/
+// test_grpc_channel_args.cpp). Always sets GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL;
+// keepalive / message-length / window args are set when their config value
+// is > 0 (0 = keep gRPC's default).
+grpc::ChannelArguments MakeChannelArgs(const app::GrpcConfig& config);
 
 class GrpcTransport {
  public:

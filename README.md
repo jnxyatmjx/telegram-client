@@ -5,7 +5,7 @@ async gRPC media transport (`ImageProcessor::ProcessImages` /
 `SearchImages`, bidirectional streaming, `grpc::CompletionQueue`).
 Architecture: `~/workspace/tdlib-grpc-architecture.md` (v5).
 
-## Status — chunks 1–3 complete (2026-11-08); Telethon migration chunk 2 complete (2026-11-10)
+## Status — build complete (2026-11-08); Telethon migration chunks 1–3 complete (2026-11-10)
 
 构建任务已全部完成：TDLib 已编好（2026-11-08），tg-client 真实实现已完成，
 二进制 `tg-client 0.1.0` 可正常运行 `--help` / `--version`。唯一还没做的是
@@ -16,14 +16,15 @@ Architecture: `~/workspace/tdlib-grpc-architecture.md` (v5).
   此后绝不再重编（见 Build 一节铁律）。
 - 真实实现：登录、接收、派发、下载、两个触发器、全异步 gRPC 流、
   SQLite Outbox、bare-ID 换算。
-- 测试：21 个 GTest 二进制，含假服务器端到端测试，全部通过
+- 测试：23 个 GTest 二进制，含假服务器端到端测试，全部通过
   （见 Test 一节）。
 - **Telethon 迁移**：chunk 1（线上协议对齐：memo AES-256-GCM、
   `image_id = str(message_id)`、bare owner_id、`ImageReply.result`
   JSON、整图发送）已合入（commit a939e0b）；chunk 2（状态持久化、
   控制命令面 `/rsme` `/rsor` `/xm` 族、历史回填引擎、媒体频道白名单、
   Outbox 旧 id 迁移）已实现并通过全部测试；chunk 3（gRPC channel args
-  健壮性 + 文档收尾）未开始。
+  健壮性 + 统一 FloodWait 处理 + 扩展文档）已实现并通过全部测试
+  （见 §Extending）。改动未提交，等 Hong 验收。
 
 ## Dependencies (apt, Ubuntu 24.04 / Debian 11 — no vcpkg, no source builds)
 
@@ -748,7 +749,12 @@ of libraries.
   `updateFile` when `local.is_downloading_completed` is set; concurrent
   downloads of the same file share one request and every callback fires.
   The callback runs on the Receive thread and must only post the next
-  stage to the pool. `Download(file_id)` (future) is a thin wrapper for
+  stage to the pool. Since chunk 3 a `downloadFile` FloodWait (TDLib 429)
+  is retried through the shared `telegram/FloodRetry` (bounded attempts;
+  while a retry is pending, later downloads of the same file ride along —
+  there is never a second request before retry-after passes; without a
+  scheduler the old fail-fast behaviour stays).
+  `Download(file_id)` (future) is a thin wrapper for
   tests; its timeout is enforced by the caller via `wait_for`.
 - `features/bot_command/BotCommandHandler` + `CommandParser` — Mode (a)
   trigger. Verifies the sender is the configured bot
@@ -785,7 +791,10 @@ of libraries.
   Outbox.
 - `transport/GrpcTransport` — A pool of `grpc.connections` Channels
   (one per lane, one TCP/HTTP2 connection each, all to the same target;
-  1 by default). TLS or insecure from config. `MakeContext()` returns
+  1 by default). TLS or insecure from config. Every channel is built with
+  `MakeChannelArgs` (chunk 3): the per-lane subchannel-pool flag plus the
+  configurable keepalive / 64 MiB message caps / HTTP-2 window args (see
+  Configure → gRPC channel args). `MakeContext()` returns
   a fresh `ClientContext` with auth metadata already applied.
 - `transport/StreamerPool` — N parallel connections ("lanes") for one
   RPC: one `AsyncStreamer` per lane, requests dealt round-robin, reply
@@ -899,12 +908,30 @@ of libraries.
   (line boundaries preferred — Telethon's 45-line batches can exceed
   the limit and TDLib has no auto-split), disables link previews on
   every chunk, sends markdown fire-and-forget (a failed reply is a
-  lost reply; the command can be re-issued — matching Python).
-- `telegram/TdErrors` — TDLib 429 classification for the rate-limited
-  calls added in chunk 2: TDLib embeds retry-after in the error MESSAGE
-  text (`"Too Many Requests: retry after <seconds>"` — no structured
+  lost reply; the command can be re-issued — matching Python). Since
+  chunk 3 each chunk that comes back 429 is re-sent once the retry-after
+  passes via the shared `telegram/FloodRetry` (bounded; a 429 was
+  rejected, never applied, so re-sending cannot duplicate).
+- `telegram/TdErrors` — TDLib 429 classification (chunk 2): TDLib embeds
+  retry-after in the error MESSAGE text
+  (`"Too Many Requests: retry after <seconds>"` — no structured
   field in this TDLib version); `RetryAfterSeconds` parses it,
-  `IsFloodWait` matches code 429.
+  `IsFloodWait` matches code 429, `RetryAfterOr` adds the fallback.
+  The single place error text is parsed — call sites never do it
+  themselves.
+- `telegram/FloodRetry` — The shared FloodWait scheduler (chunk 3).
+  One instance owned by `Application`, wired into `FileDownloader`,
+  `MessageSender` and `BotCommandHandler`. `Schedule(error, attempt,
+  retry)` runs `retry` on its timer thread after retry-after + pad
+  (pad = `history_backfill.flood_pad_seconds`), up to
+  `max_attempts` (3) re-issues, then the caller gives up and logs.
+  TDLib requests are move-only and cannot be cloned, so the retry
+  closure rebuilds its request explicitly — parsing is centralized in
+  `TdErrors`, scheduling here; there is deliberately no generic
+  send-retry decorator. `Shutdown()` drops pending retries (called
+  first in Application teardown, before `telegram_.Stop()`). Feature
+  jobs that pause WHOLE tasks (`HistoryBackfill`, `DialogScanner`)
+  keep their own `ResumeTimer` pause instead.
 - `common/Gmt8` — Fixed-offset GMT+8 civil time (chunk 2), the analogue
   of Python's `gmt8_now()` + strftime: `Gmt8Date` (`YYYYMMDD`),
   `Gmt8Clock` (`HH:MM:SS`), `Gmt8DateTime` (`YYYY-MM-DD HH:MM:SS`) —
@@ -913,7 +940,8 @@ of libraries.
   FloodWait backoff: Telethon does `await asyncio.sleep(e.seconds + 1)`;
   the C++ side has no event loop and no thread may block on I/O, so the
   pause is a deadline and this thread fires when it passes. Used by
-  `HistoryBackfill` and `DialogScanner`.
+  `HistoryBackfill`, `DialogScanner` and, since chunk 3, internally by
+  `telegram/FloodRetry`.
 - `common/Logger` — spdlog setup (level from config).
 
 ## gRPC code generation
@@ -1016,6 +1044,28 @@ single connection, or when you want one dead connection to cost only
 spread, and exactly what breaks and recovers when a connection dies —
 is documented under Architecture → "Parallel gRPC connections (lanes)".
 
+### gRPC channel args (chunk 3)
+
+Every lane channel is built through `GrpcTransport::MakeChannelArgs`
+(`src/transport/GrpcTransport.cpp`) with the per-lane subchannel-pool
+flag (what keeps N lanes on N TCP connections) plus the following
+configurable args — each `0`/absent keeps the gRPC default, so the
+defaults below are what a fresh `config.yaml` gets:
+
+| key | default | channel arg | why |
+|---|---|---|---|
+| `grpc.keepalive_ms` | 60000 | `GRPC_ARG_KEEPALIVE_TIME_MS` | ping an idle lane every 60 s so NAT/LB doesn't drop the long-lived streams. If the server answers `too_many_pings`, RAISE this — never lower it |
+| `grpc.keepalive_timeout_ms` | 20000 | `GRPC_ARG_KEEPALIVE_TIMEOUT_MS` | a ping unanswered this long marks the connection dead (reconnect takes over) |
+| `grpc.keepalive_permit_without_calls` | true | `GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS` | keep the lane TCP healthy even with no call in flight |
+| `grpc.max_message_bytes` | 67108864 (64 MiB) | `GRPC_ARG_MAX_SEND_MESSAGE_LENGTH` + `GRPC_ARG_MAX_RECEIVE_MESSAGE_LENGTH` | matches the Python client's `max_send_message_length=64 MiB`; full images must fit in one message |
+| `grpc.http2_lookahead_bytes` | 1048576 (1 MiB) | `GRPC_ARG_HTTP2_STREAM_LOOKAHEAD_BYTES` | how far ahead gRPC requests stream data (gRPC default 64 KiB) — larger = fewer flow-control stalls on big image sends |
+| `grpc.http2_write_buffer_bytes` | 524288 (512 KiB) | `GRPC_ARG_HTTP2_WRITE_BUFFER_SIZE` | per-call write buffer, smooths large sends |
+
+`grpc.ack_timeout_ms` is NOT one of these: it was already wired in an
+earlier change — it sets the Outbox ack deadline (PENDING → DONE when
+the `image_id` ack arrives, else MarkRequeued). It is app-level, not a
+channel arg, and chunk 3 did not change its behaviour.
+
 ### Feature toggles (Telethon migration chunk 2)
 
 Four new config blocks (all documented inline in
@@ -1040,6 +1090,131 @@ is set):
   `active_window_seconds` (45 s), schema and GMT+8 fields byte-compatible
   with the Python `chathis` table. The D1 backend arrives later behind the
   same interface (`docs/state-persistence-and-d1.md`).
+
+## Extending the client — how to add a new feature
+
+This is the recipe for the three most common extensions, with the real
+file paths. The authoritative (Chinese) version is §4 of
+`~/workspace/tdlib-grpc-architecture.md`. Existing features to copy from:
+a small handler is `features/media_channels/MediaChannelHandler`, a
+command is `/rsme` in `features/commands/ControlCommandsHandler`, an RPC
+is `SearchImages`.
+
+### Ground rules (every scenario)
+
+- **Threads — never block.** Handler and callback code runs on the
+  Receive thread or a worker thread. Never call
+  `ClientManager::receive()` (only `TelegramClient`'s Receive thread
+  does), never call gRPC `Write` directly (only a streamer's CQ thread
+  does — everyone else `Enqueue`s), never wait on a TDLib response or a
+  download. Send the request, return, and continue in the response
+  callback — and that callback must only post the next stage to
+  `AppContext::workers`. There is no blocking-wait API anywhere by
+  design.
+- **TDLib access** goes only through `ITdSender::Send`
+  (`src/telegram/TelegramClient.h`). Never create your own
+  `td::ClientManager`; never send a request a core path already owns
+  (sendMessage → `MessageSender`, downloadFile → `FileDownloader`) —
+  add there, don't bypass.
+- **FloodWait (TDLib 429).** Parse with `telegram/TdErrors.h`
+  (`IsFloodWait`, `RetryAfterSeconds`/`RetryAfterOr`) — never match the
+  error text yourself. For one-shot requests (a sendMessage, a
+  getMessage, a downloadFile) schedule bounded re-issues through the
+  shared `telegram/FloodRetry` instance — `Application` owns it and
+  passes the pointer to constructors (see `FileDownloader`,
+  `MessageSender`, `BotCommandHandler`). TDLib requests are move-only
+  and can't be cloned, so each retry closure rebuilds its request
+  explicitly; there is deliberately no generic send-retry decorator. A
+  long-running scan job instead pauses the WHOLE job via
+  `common/ResumeTimer` (copy `HistoryBackfill`). A 429 means the request
+  was rejected — re-sending it can never duplicate anything, even for
+  sendMessage.
+- **Secrets** are `${ENV}` placeholders in config only (`KEYME`,
+  `GRPC_TOKEN`, `TG_API_HASH`, …) — never a default value, never git,
+  never logs.
+- **Never rebuild TDLib.** Build only your targets:
+  `cmake --build build --target test_<feature> -j1`; run tests from
+  `build/tests/` (never top-level `build/` — TDLib's never-built
+  `run_all_tests` lives there). TDLib's `TlObject.h` prints
+  `-Wunused-parameter` noise on every compile — filter it with
+  `| grep -v third_party` before counting your own warnings.
+
+### Scenario 1 — a new update handler (react to a class of Telegram updates)
+
+1. Create `src/features/<feature>/<Feature>Handler.{h,cpp}` implementing
+   `telegram::IUpdateHandler` (`src/telegram/UpdateHandler.h`):
+   `CanHandle()` claims only your update type(s). Registration order is
+   first-claimant-wins — that is how `media_channels` and `auto_search`
+   resolve a chat claimed by both.
+2. Take shared services from `AppContext` (`src/app/AppContext.h`):
+   `workers`, `telegram`, `files`, `process_images`, `search_images`,
+   `outbox`, `config`. Handlers never reach into `Application`.
+3. Register in `src/app/Application.cpp`: construct the handler with its
+   dependencies (including `&flood_retry_` if it sends rate-limited
+   TDLib calls) and `Register` it on the dispatcher next to the others.
+4. Config: struct + defaults in `src/app/Config.h` (default OFF unless
+   the Python twin was always-on), parse in `src/app/Config.cpp`, comment
+   into `config/config.example.yaml`, assert in `tests/test_config.cpp`.
+5. Test `tests/test_<feature>.cpp` with a fake `ITdSender` (a minimal one
+   is `FloodFakeSender` in `tests/test_flood_retry.cpp`; handler-level
+   fixtures are in `tests/test_bot_command.cpp`). Add the file to
+   `tests/CMakeLists.txt` (the foreach picks it up), build
+   `--target test_<feature>`, run `ctest -R test_<feature>` from
+   `build/tests/`. Set a `TIMEOUT` test property if it waits on real
+   timers/sockets.
+
+### Scenario 2 — a new control command (e.g. `/ping`)
+
+1. Add the command name to `CommandsConfig` (`src/app/Config.h`, e.g.
+   `ping_command: "/ping"` with a default), parse it
+   (`src/app/Config.cpp`), document it (`config/config.example.yaml`),
+   assert it (`tests/test_config.cpp`).
+2. Classify it where `/rsme` & co are classified in
+   `src/features/commands/ControlCommandsHandler.cpp`; the trigger
+   directions (self-commands / configured bot) already exist there.
+3. Reply through `telegram/MessageSender::SendMarkdown` — never a raw
+   `sendMessage` (that path owns the 4096 split, link-preview disabling
+   and FloodWait retry).
+4. Enumeration or lookup needs go through `TelegramClient::Send` with
+   one outstanding request at a time and a `ResumeTimer` FloodWait pause
+   — copy `DialogScanner`. `ChatStateStore`'s placeholder URL resolution
+   is the deliberate counter-example: it never retries, to avoid flood
+   storms — keep that in mind when you add retries to bulk work.
+5. Test in `tests/test_control_commands.cpp` (fixtures and fake sender
+   already exist there).
+
+### Scenario 3 — a new gRPC RPC
+
+1. New `proto/<service>.proto` — keep `proto/image_stream.proto`
+   verbatim (it is the server's contract). Copy the existing `protoc`
+   custom command in `CMakeLists.txt` for codegen.
+2. `src/transport/<X>Client.h` — a stub owner that only produces the
+   `StartFn` its streamer uses; copy `SearchImagesClient`. Reply handling
+   lives in `Application`, never in the client wrapper.
+3. Instantiate `transport/AsyncStreamer` (template — use it, don't
+   modify it), one per lane, exposed through `GrpcTransport` next to the
+   existing pools. Reuse each lane's existing Channel — never create
+   your own channel, or you lose the one-TCP-per-lane guarantee (see
+   `GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL` in `MakeChannelArgs`). New
+   streams inherit the lane channel args (keepalive, 64 MiB caps,
+   window) automatically.
+4. Decide replay semantics up front: at-least-once ⇒ `Outbox.Put`
+   BEFORE `Enqueue`, ack ⇒ `MarkDone` (the ProcessImages pattern); no
+   replay ⇒ say so in the header and accept loss on a dead lane (the
+   SearchImages pattern — its correlation table is memory-only).
+5. Test against the in-process fake server: `tests/test_async_streamer.cpp`
+   for the CQ state machine, `tests/test_e2e_fake_server.cpp` for the
+   full pipeline (both use a Unix domain socket — see the note in
+   Test).
+
+### Adding a config item (all scenarios)
+
+`src/app/Config.h` (struct field + default) → `src/app/Config.cpp`
+(parse) → `config/config.example.yaml` (commented doc, Chinese) →
+`tests/test_config.cpp` (sample-file assertion + defaults assertion).
+Keys are immutable once shipped — grep `src/app/Config.cpp` first so a
+new key doesn't collide with an existing name, and never rename one
+(configs in the field would silently fall back to defaults).
 
 ## Run
 
@@ -1080,7 +1255,7 @@ program's own log lines.
 ctest --test-dir build/tests --output-on-failure
 ```
 
-21 test binaries, all green (2026-11-10, Telethon migration chunk 2):
+23 test binaries, all green (2026-11-10, Telethon migration chunk 3):
 
 | test | covers |
 |---|---|
@@ -1099,12 +1274,14 @@ ctest --test-dir build/tests --output-on-failure
 | test_auth_prompt | terminal prompts for the login code and 2FA password (env override, empty input fails fast) |
 | test_update_logging | `telegram.log_updates` logs every update with type + content, silent when off |
 | test_streamer_pool | 3-lane pool against a fake server: one stream per lane, 9 requests dealt 3 per lane, every reply round-trips |
-| test_message_sender | chunk 2: 4096-char split (line boundaries kept intact, hard-split oversized lines, empty text), multi-message sends, errors logged not thrown |
+| test_message_sender | chunk 2: 4096-char split (line boundaries kept intact, hard-split oversized lines, empty text), multi-message sends, errors logged not thrown; chunk 3: a 429'd chunk is retried until it lands (no duplicates), the cap drops it after initial + 3 re-issues, split chunks retry independently (flooded chunk doesn't block the others), no retry without a scheduler |
 | test_chat_state_backend | chunk 2: `common/Gmt8` formats (fixed offset, UTC-midnight date roll, parse round-trip/garbage), SQLite backend upsert/load/reopen, flush→restore round trip (url + watermark), 45 s active window skips quiet chats, flushed fields match the Python `chathis` shape |
 | test_history_backfill | chunk 2: gap replay through the realtime pipeline (oldest first, `str(message_id)`), watermark terminates collection, per-batch watermark re-read skips covered messages, FloodWait pauses and the resume timer continues, unknown peer dropped with a notice BEFORE any search, duplicate Start refused while a job is active, invalid bare ids refused, disabled engine refuses everything |
 | test_dialog_scan | chunk 2: `loadChats`/`getChats` enumeration for all chat kinds, supergroup full-info audit findings, migrated groups listed as their supergroup, FloodWait retries the same step, enumeration failure aborts, unnamed/broken chats skipped, second scan refused while running; view-model wording/links match Python |
 | test_control_commands | chunk 2: command classification, `/rsme` batching (users first, one line per dialog, empty input), `/rsor` clean + findings reports (capped), trigger directions (self-commands / bot), backfill start through the pipeline + refusals |
 | test_media_channels | chunk 2: disabled by default never claims, only whitelisted chats and only media claimed, `rpc: process` runs the realtime pipeline, `rpc: search` queues a search request |
+| test_flood_retry | chunk 3: `TdErrors` 429/retry-after parsing (code match, wire-text parse, unparseable → `RetryAfterOr` fallback); `FloodRetry` (fires after retry-after + pad, fallback delay when the text carries no number, attempt cap drops, Shutdown drops pending, Schedule after Shutdown refused, multiple pending all run); FileDownloader flood path (same-file retry lands once, cap gives up and fails the future, ride-along callbacks fail with the give-up, null scheduler keeps the old fail-fast, no double send while a retry is pending) |
+| test_grpc_channel_args | chunk 3: `MakeChannelArgs` — keepalive trio, 64 MiB send/receive caps, HTTP/2 lookahead + write buffer, per-lane subchannel-pool flag; `0` keeps the gRPC default for that arg; config values reach the raw `grpc_channel_args` (read back via `c_channel_args()` — gRPC 1.51 has no getter API) |
 
 Note: the socket-based tests (test_async_streamer, test_e2e_fake_server,
 test_streamer_pool)
@@ -1141,7 +1318,8 @@ src/main.cpp
 src/app/            Application, Config, AppContext
 src/telegram/       TelegramClient, AuthManager, UpdateDispatcher,
                     UpdateHandler, FileDownloader, MessageSender (chunk 2),
-                    TdErrors (chunk 2: 429/retry-after parsing)
+                    TdErrors (chunk 2: 429/retry-after parsing),
+                    FloodRetry (chunk 3: shared bounded 429 scheduler)
 src/features/       bot_command/ (BotCommandHandler, CommandParser)
                     auto_search/ (AutoSearchHandler, disabled by default)
                     chat_state/ (ChatStateStore: {"cid","mid"} watermarks,

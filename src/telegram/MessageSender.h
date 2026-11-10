@@ -15,8 +15,13 @@
 // §8.5-1).
 //
 // Fire-and-forget: sends are async, errors are logged with the chat id and
-// the first 200 chars of the chunk. No retry — a failed reply is a lost
-// reply (the command can be re-issued), matching the Python client.
+// the first 200 chars of the chunk. No retry for ordinary errors — a failed
+// reply is a lost reply (the command can be re-issued), matching the Python
+// client. The one exception (Telethon migration chunk 3): a TDLib 429
+// FloodWait is retried through the shared telegram::FloodRetry — the
+// rejected chunk is re-sent after retry-after + pad, at most max_attempts
+// times, then dropped with an error log. A 429 means the message was never
+// accepted by Telegram, so re-sending it cannot duplicate.
 
 #include <telegram/TelegramClient.h>
 
@@ -26,12 +31,17 @@
 
 namespace tg::telegram {
 
+class FloodRetry;
+
 class MessageSender {
  public:
   // Telegram's hard per-message limit in characters.
   static constexpr std::size_t kMaxMessageChars = 4096;
 
-  explicit MessageSender(ITdSender& sender);
+  // `flood_retry` is the shared 429 scheduler (Application passes one);
+  // null keeps the pre-chunk-3 behaviour — a 429 is logged and the chunk
+  // dropped. Production code MUST pass a FloodRetry.
+  explicit MessageSender(ITdSender& sender, FloodRetry* flood_retry = nullptr);
 
   // Splits `text` into chunks of at most max_chars characters: whole lines
   // are kept together while they fit; a single line longer than the limit
@@ -46,7 +56,13 @@ class MessageSender {
   void SendMarkdown(std::int64_t chat_id, const std::string& text) const;
 
  private:
+  // Sends one chunk (attempt 1 from SendMarkdown; the flood retry path
+  // re-enters with attempt + 1).
+  void SendChunk(std::int64_t chat_id, const std::string& chunk,
+                 int attempt) const;
+
   ITdSender& sender_;
+  FloodRetry* flood_retry_;  // not owned; may be null (see ctor comment)
 };
 
 }  // namespace tg::telegram

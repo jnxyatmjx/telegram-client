@@ -24,6 +24,14 @@
 // completes simply never resolves its callback, and no thread is blocked
 // waiting for it (TDLib itself completes or fails the download).
 //
+// FloodWait (chunk 3): a 429 on downloadFile does NOT fail the request.
+// The callbacks stay registered and the SAME downloadFile is re-issued
+// after retry-after + pad through the shared telegram::FloodRetry, at most
+// max_attempts times; giving up fails the callbacks with an error naming
+// the flood limit. While the retry is pending, new DownloadAsync calls for
+// the same file ride along (they only append callbacks), so a rate-limited
+// burst cannot spin: nothing is re-sent before retry-after passes.
+//
 // Receive thread rules: OnUpdateFile only completes callbacks (cheap); the
 // map is guarded by one mutex (v5 §3.3). Callbacks are always invoked
 // WITHOUT holding the mutex.
@@ -43,6 +51,7 @@ namespace tg::telegram {
 namespace td_api = td::td_api;  // shorthand for td::td_api::*
 
 class ITdSender;
+class FloodRetry;
 
 class FileDownloader {
  public:
@@ -53,7 +62,10 @@ class FileDownloader {
   };
   using DownloadCallback = std::function<void(DownloadResult result)>;
 
-  explicit FileDownloader(ITdSender& sender);
+  // `flood_retry` is the shared 429 scheduler (Application passes one for
+  // every instance); null keeps the pre-chunk-3 behaviour — a 429 fails the
+  // download immediately. Production code MUST pass a FloodRetry.
+  explicit FileDownloader(ITdSender& sender, FloodRetry* flood_retry = nullptr);
 
   // Async: registers on_done and returns immediately. No thread blocks.
   void DownloadAsync(std::int32_t file_id, DownloadCallback on_done);
@@ -77,12 +89,22 @@ class FileDownloader {
  private:
   void MaybeComplete(std::int32_t file_id, const td_api::file& file);
   void FailOne(std::int32_t file_id, const std::string& error);
+  // Sends one downloadFile for `file_id` (initial attempt or flood retry).
+  void SendDownloadFile(std::int32_t file_id);
+  // Response callback saw a 429: schedule the re-send (or give up).
+  void HandleFloodWait(std::int32_t file_id, const td_api::error& error);
 
   ITdSender& sender_;
+  FloodRetry* flood_retry_;  // not owned; may be null (see ctor comment)
   mutable std::mutex mutex_;
   // One downloadFile request per file_id; every registered callback fires
   // on completion (concurrent downloads of the same file share the request).
   std::map<std::int32_t, std::vector<DownloadCallback>> pending_;
+  // FloodWait re-issue count per file_id; a file_id with entries here still
+  // has its callbacks in `pending_` (they are only removed by
+  // MaybeComplete/FailOne), which is what keeps concurrent callers from
+  // double-sending while a flood retry is scheduled.
+  std::map<std::int32_t, int> flood_attempts_;
 };
 
 }  // namespace tg::telegram

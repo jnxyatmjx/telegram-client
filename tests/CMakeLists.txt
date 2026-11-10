@@ -24,7 +24,9 @@ set(TG_TEST_SOURCES
   test_history_backfill.cpp
   test_dialog_scan.cpp
   test_control_commands.cpp
-  test_media_channels.cpp)
+  test_media_channels.cpp
+  test_flood_retry.cpp
+  test_grpc_channel_args.cpp)
 
 foreach(src IN LISTS TG_TEST_SOURCES)
   get_filename_component(test_name "${src}" NAME_WE)
@@ -47,3 +49,5 @@ set_property(TEST test_auth_prompt PROPERTY TIMEOUT 60)
 set_property(TEST test_update_logging PROPERTY TIMEOUT 60)
 # The pool test opens 3 parallel streams against a fake server.
 set_property(TEST test_streamer_pool PROPERTY TIMEOUT 120)
+# The flood tests wait on real (zero/one-second) backoff timers.
+set_property(TEST test_flood_retry PROPERTY TIMEOUT 60)

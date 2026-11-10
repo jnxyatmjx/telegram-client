@@ -10,6 +10,7 @@
 #include <infra/FileStore.h>
 #include <infra/Outbox.h>
 #include <telegram/FileDownloader.h>
+#include <telegram/FloodRetry.h>
 #include <telegram/TelegramClient.h>
 #include <transport/AsyncStreamer.h>
 
@@ -115,6 +116,7 @@ class FakeTdSender : public tg::telegram::ITdSender {
   std::string thumbnail_path;
   std::int64_t target_chat_id_ = 0;
   std::int64_t target_message_id_ = 0;
+  int getmessage_flood_left = 0;  // 429 the next N getMessage requests
 
  private:
   static std::string TypeOf(td_api::object_ptr<td_api::Function>& request) {
@@ -129,6 +131,13 @@ class FakeTdSender : public tg::telegram::ITdSender {
       td_api::object_ptr<td_api::Function>&& request) {
     switch (request->get_id()) {
       case td_api::getMessage::ID: {
+        // Rate-limit simulation: the next N lookups are refused (retry
+        // after 0) before the real answer — the flood-retry tests.
+        if (getmessage_flood_left > 0) {
+          --getmessage_flood_left;
+          return td_api::make_object<td_api::error>(
+              429, "Too Many Requests: retry after 0");
+        }
         // One consumer per test: hand the canned message over (moved).
         const auto message_id =
             static_cast<td_api::getMessage*>(request.get())->message_id_;
@@ -266,7 +275,14 @@ class BotCommandTest : public ::testing::Test {
         MakePhotoMessage(sender_.target_chat_id_, sender_.target_message_id_,
                          thumb_path_));
 
-    files_ = std::make_unique<tg::telegram::FileDownloader>(sender_);
+    // Shared flood scheduler with zero pad: the flood-retry tests run at
+    // full speed; every component gets the same instance as in production.
+    flood_retry_ = std::make_unique<tg::telegram::FloodRetry>(
+        tg::telegram::FloodRetry::Options{/*pad_seconds=*/0,
+                                          /*fallback_seconds=*/5,
+                                          /*max_attempts=*/3});
+    files_ = std::make_unique<tg::telegram::FileDownloader>(sender_,
+                                                            flood_retry_.get());
     // The async pipeline posts continuations here; the tests wait for them.
     workers_ = std::make_unique<app::WorkerPool>(2u);
     // Single-lane pools: the handler tests inspect lane 0's queue.
@@ -290,10 +306,13 @@ class BotCommandTest : public ::testing::Test {
         media::MediaThumbnailHandler(
             media::MediaExtractor(config_.media_thumbnail), sender_, *files_,
             tg::common::MemoCipher(config_.media_thumbnail.keyme)),
-        *search_handler_);
+        *search_handler_, flood_retry_.get());
   }
 
   void TearDown() override {
+    // Stop the flood scheduler FIRST: a pending retry closure references
+    // the handler and ctx below.
+    flood_retry_.reset();
     handler_.reset();
     search_handler_.reset();
     // Drain the pool first: queued finish stages use ctx_/outbox_/streamers.
@@ -325,6 +344,7 @@ class BotCommandTest : public ::testing::Test {
   std::string outbox_path_;
   app::Config config_;
   FakeTdSender sender_;
+  std::unique_ptr<tg::telegram::FloodRetry> flood_retry_;
   std::unique_ptr<tg::telegram::FileDownloader> files_;
   std::unique_ptr<app::WorkerPool> workers_;
   std::unique_ptr<transport::StreamerPool<ImageRequest, ImageReply>>
@@ -536,6 +556,43 @@ TEST_F(BotCommandTest, GetMessageErrorIsSwallowed) {
   auto update = MakeCommandUpdate(777, kTargetDialogId, "/process", true, 42);
   td_api::object_ptr<td_api::Update> base = std::move(update);
   handler_->Handle(base, *ctx_);
+  EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 0);
+}
+
+// FloodWait on the getMessage lookup (chunk 3): the SAME lookup is re-sent
+// after retry-after through the shared FloodRetry, then the pipeline
+// proceeds; beyond the attempt cap the command is dropped, not spun.
+TEST_F(BotCommandTest, GetMessageFloodWaitRetriesThenProceeds) {
+  sender_.getmessage_flood_left = 1;  // first lookup refused
+  auto update = MakeCommandUpdate(777, kTargetDialogId, "/process", true, 42);
+  td_api::object_ptr<td_api::Update> base = std::move(update);
+  handler_->Handle(base, *ctx_);
+
+  // The retried lookup lands, and the pipeline runs exactly once.
+  ASSERT_TRUE(WaitForQueued(*process_streamer_, 1));
+  EXPECT_EQ(sender_.sent_count("getMessage"), 2);
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  EXPECT_EQ(sender_.sent_count("getMessage"), 2);  // no further retry
+  EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 1);
+}
+
+TEST_F(BotCommandTest, GetMessageFloodWaitGivesUpAfterTheCap) {
+  sender_.getmessage_flood_left = 100;  // always rate-limited
+  auto update = MakeCommandUpdate(777, kTargetDialogId, "/process", true, 42);
+  td_api::object_ptr<td_api::Update> base = std::move(update);
+  handler_->Handle(base, *ctx_);
+
+  // Initial attempt + 3 re-issues (max_attempts=3), then the command is
+  // dropped: nothing reaches the pipeline.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < deadline &&
+         sender_.sent_count("getMessage") < 4) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_EQ(sender_.sent_count("getMessage"), 4);
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  EXPECT_EQ(sender_.sent_count("getMessage"), 4);  // settled, no spinning
   EXPECT_EQ(process_streamer_->lane(0)->QueuedCount(), 0);
 }
 

@@ -3,6 +3,8 @@
 #include <app/AppContext.h>
 #include <common/Logger.h>
 #include <features/bot_command/CommandParser.h>
+#include <telegram/FloodRetry.h>
+#include <telegram/TdErrors.h>
 
 #include <memory>
 #include <optional>
@@ -64,10 +66,12 @@ std::optional<std::pair<std::int64_t, std::int64_t>> ReplyToTarget(
 BotCommandHandler::BotCommandHandler(
     const app::BotCommandConfig& config,
     media_thumbnail::MediaThumbnailHandler process,
-    media_thumbnail::SearchHandler& search)
+    media_thumbnail::SearchHandler& search,
+    telegram::FloodRetry* flood_retry)
     : config_(config),
       process_(std::move(process)),
-      search_(search) {
+      search_(search),
+      flood_retry_(flood_retry) {
   config_.process_command = NormalizeCommand(config_.process_command);
   config_.search_command = NormalizeCommand(config_.search_command);
 }
@@ -145,10 +149,6 @@ void BotCommandHandler::Handle(td_api::object_ptr<td_api::Update>& update,
     return;
   }
 
-  auto request = td_api::make_object<td_api::getMessage>();
-  request->chat_id_ = target->first;
-  request->message_id_ = target->second;
-
   // Async: send getMessage and return immediately — no worker thread waits
   // for the reply. The callback (Receive thread) only posts the pipeline
   // kick-off to the pool; the pipeline itself is async too, so one
@@ -156,11 +156,21 @@ void BotCommandHandler::Handle(td_api::object_ptr<td_api::Update>& update,
   // No timeout on the reply: a getMessage that never answers just means
   // this command is dropped (the bot can re-issue it); TDLib answers or
   // errors in practice.
-  const auto chat_id = target->first;
-  const auto message_id = target->second;
+  LookupTargetMessage(action, target->first, target->second, ctx, 1);
+}
+
+void BotCommandHandler::LookupTargetMessage(Action action,
+                                            std::int64_t chat_id,
+                                            std::int64_t message_id,
+                                            app::AppContext& ctx,
+                                            int attempt) {
+  auto request = td_api::make_object<td_api::getMessage>();
+  request->chat_id_ = chat_id;
+  request->message_id_ = message_id;
+
   ctx.telegram.Send(
       std::move(request),
-      [this, action, chat_id, message_id,
+      [this, action, chat_id, message_id, attempt,
        &ctx](td::ClientManager::Response&& response) {
         if (response.object == nullptr) {
           spdlog::error("bot_command: getMessage({}, {}) returned no object",
@@ -170,6 +180,26 @@ void BotCommandHandler::Handle(td_api::object_ptr<td_api::Update>& update,
         if (response.object->get_id() == td_api::error::ID) {
           const auto error =
               td_api::move_object_as<td_api::error>(response.object);
+          if (telegram::IsFloodWait(*error)) {
+            // Rate-limited: re-issue the SAME getMessage after retry-after
+            // + pad (it was refused, not applied). Bounded by the shared
+            // scheduler's attempt cap; beyond it the command is dropped —
+            // the bot can re-issue.
+            if (flood_retry_ != nullptr &&
+                flood_retry_->Schedule(
+                    *error, attempt, [this, action, chat_id, message_id,
+                                      attempt, &ctx] {
+                      LookupTargetMessage(action, chat_id, message_id, ctx,
+                                          attempt + 1);
+                    })) {
+              return;
+            }
+            spdlog::error(
+                "bot_command: getMessage({}, {}) still flood-limited after "
+                "{} attempts — command dropped", chat_id, message_id,
+                attempt);
+            return;
+          }
           spdlog::error("bot_command: getMessage({}, {}) failed: code {}: {}",
                         chat_id, message_id, error->code_, error->message_);
           return;

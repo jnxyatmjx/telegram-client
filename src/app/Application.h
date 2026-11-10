@@ -21,6 +21,7 @@
 #include <features/media_thumbnail/SearchHandler.h>
 #include <infra/Outbox.h>
 #include <telegram/FileDownloader.h>
+#include <telegram/FloodRetry.h>
 #include <telegram/MessageSender.h>
 #include <telegram/TelegramClient.h>
 #include <telegram/UpdateDispatcher.h>
@@ -82,6 +83,15 @@ class Application {
   // Declaration order == initialization order == dependency order.
   infra::Outbox outbox_;
   std::shared_ptr<WorkerPool> workers_;
+  // Shared TDLib FloodWait scheduler (chunk 3): one timer thread for the
+  // whole process. FileDownloader, MessageSender and BotCommandHandler
+  // re-issue their 429-refused requests through it (bounded attempts);
+  // HistoryBackfill / DialogScanner keep their own feature-level pauses.
+  // Declared before everything that uses it, so it is destroyed last;
+  // Shutdown() is called first in the destructor body — before
+  // telegram_.Stop() — so no pending closure fires against a closed
+  // TDLib session.
+  telegram::FloodRetry flood_retry_;
   telegram::TelegramClient telegram_;
   telegram::FileDownloader files_;
   transport::GrpcTransport transport_;

@@ -1,6 +1,8 @@
 #include "telegram/MessageSender.h"
 
 #include <common/Logger.h>
+#include <telegram/FloodRetry.h>
+#include <telegram/TdErrors.h>
 
 namespace tg::telegram {
 namespace {
@@ -54,42 +56,65 @@ std::vector<std::string> MessageSender::SplitForTelegram(
   return chunks;
 }
 
-MessageSender::MessageSender(ITdSender& sender) : sender_(sender) {}
+MessageSender::MessageSender(ITdSender& sender, FloodRetry* flood_retry)
+    : sender_(sender), flood_retry_(flood_retry) {}
 
 void MessageSender::SendMarkdown(std::int64_t chat_id,
                                  const std::string& text) const {
   for (const std::string& chunk : SplitForTelegram(text)) {
-    auto content = td_api::make_object<td_api::inputMessageText>();
-    auto formatted = td_api::make_object<td_api::formattedText>();
-    formatted->text_ = chunk;
-    content->text_ = std::move(formatted);
-    auto preview = td_api::make_object<td_api::linkPreviewOptions>();
-    preview->is_disabled_ = true;  // Python link_preview=False everywhere
-    content->link_preview_options_ = std::move(preview);
-    content->clear_draft_ = false;
-
-    auto request = td_api::make_object<td_api::sendMessage>();
-    request->chat_id_ = chat_id;
-    request->topic_id_ = nullptr;
-    request->reply_to_ = nullptr;
-    request->options_ = nullptr;
-    request->reply_markup_ = nullptr;
-    request->input_message_content_ = std::move(content);
-
-    const std::string head = chunk.substr(0, 200);
-    sender_.Send(std::move(request),
-                 [chat_id, head](td::ClientManager::Response&& response) {
-                   if (response.object == nullptr) return;
-                   if (response.object->get_id() == td_api::error::ID) {
-                     const auto& error = static_cast<const td_api::error&>(
-                         *response.object);
-                     spdlog::error(
-                         "send_text: sendMessage to {} failed: {}: {} "
-                         "(text head: {:.80})", chat_id, error.code_,
-                         error.message_, head);
-                   }
-                 });
+    SendChunk(chat_id, chunk, 1);
   }
+}
+
+void MessageSender::SendChunk(std::int64_t chat_id, const std::string& chunk,
+                              int attempt) const {
+  auto content = td_api::make_object<td_api::inputMessageText>();
+  auto formatted = td_api::make_object<td_api::formattedText>();
+  formatted->text_ = chunk;
+  content->text_ = std::move(formatted);
+  auto preview = td_api::make_object<td_api::linkPreviewOptions>();
+  preview->is_disabled_ = true;  // Python link_preview=False everywhere
+  content->link_preview_options_ = std::move(preview);
+  content->clear_draft_ = false;
+
+  auto request = td_api::make_object<td_api::sendMessage>();
+  request->chat_id_ = chat_id;
+  request->topic_id_ = nullptr;
+  request->reply_to_ = nullptr;
+  request->options_ = nullptr;
+  request->reply_markup_ = nullptr;
+  request->input_message_content_ = std::move(content);
+
+  sender_.Send(std::move(request),
+               [this, chat_id, text = chunk, attempt](
+                   td::ClientManager::Response&& response) {
+                 if (response.object == nullptr) return;
+                 if (response.object->get_id() == td_api::error::ID) {
+                   const auto& error = static_cast<const td_api::error&>(
+                       *response.object);
+                   if (IsFloodWait(error)) {
+                     // Rate-limited: re-send the SAME chunk after
+                     // retry-after + pad (it was never accepted), bounded
+                     // by the shared scheduler's attempt cap.
+                     if (flood_retry_ != nullptr &&
+                         flood_retry_->Schedule(
+                             error, attempt, [this, chat_id, text, attempt] {
+                               SendChunk(chat_id, text, attempt + 1);
+                             })) {
+                       return;
+                     }
+                     spdlog::error(
+                         "send_text: sendMessage to {} still flood-limited "
+                         "after {} attempts — chunk dropped (head: {:.80})",
+                         chat_id, attempt, text);
+                     return;
+                   }
+                   spdlog::error(
+                       "send_text: sendMessage to {} failed: {}: {} "
+                       "(text head: {:.80})", chat_id, error.code_,
+                       error.message_, text);
+                 }
+               });
 }
 
 }  // namespace tg::telegram

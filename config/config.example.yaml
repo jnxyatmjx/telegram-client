@@ -2,8 +2,8 @@
 #
 # Copy to config.yaml and fill in real values. Values of the form ${VAR} are
 # read from the environment — never hardcode or commit secrets.
-# NOTE (chunk 1): this file documents the target schema; the Config loader
-# implementation lands in a later chunk.
+# Every key below is parsed by src/app/Config.cpp (Config.h holds the
+# defaults); anything left out falls back to those defaults.
 
 telegram:
   api_id: 123456            # from https://my.telegram.org — supply via env
@@ -20,9 +20,19 @@ grpc:
   token: "${GRPC_TOKEN}"
   ca_cert: ""   # optional: PEM file with the CA that signed the server cert (private/self-signed CA); empty = system default roots
   # Bidi streams have no per-message deadline; ack timeout is used instead.
+  # ALREADY WIRED: this sets the Outbox ack deadline (PENDING -> DONE when the
+  # image_id ack arrives, else MarkRequeued). Chunk 3 did not change it.
   ack_timeout_ms: 30000
   reconnect_backoff_ms: 1000   # 1s -> 2s -> 4s ... capped at 30s
   connections: 1   # parallel gRPC connections (lanes); each lane has its own ProcessImages + SearchImages stream, requests round-robin across lanes
+  # --- HTTP/2 channel args (chunk 3): applied to every lane's channel, see
+  # src/transport/GrpcTransport.cpp MakeChannelArgs(); 0 = keep gRPC default ---
+  keepalive_ms: 60000                    # GRPC_ARG_KEEPALIVE_TIME_MS. If the server answers "too_many_pings", RAISE this — never lower it
+  keepalive_timeout_ms: 20000            # GRPC_ARG_KEEPALIVE_TIMEOUT_MS: ping unanswered this long = connection dead
+  keepalive_permit_without_calls: true   # keep the lane's TCP healthy even with no call in flight
+  max_message_bytes: 67108864            # 64 MiB max send AND receive message length — matches the Python client's max_send_message_length; full images must fit
+  http2_lookahead_bytes: 1048576         # GRPC_ARG_HTTP2_STREAM_LOOKAHEAD_BYTES (gRPC default 64 KiB): bytes to request ahead per stream
+  http2_write_buffer_bytes: 524288       # GRPC_ARG_HTTP2_WRITE_BUFFER_SIZE: per-call write buffer, smooths large sends
 
 features:
   media_thumbnail:
@@ -70,7 +80,7 @@ features:
     # the job for retry-after + flood_pad_seconds.
     enabled: true
     page_limit: 60             # Python get_messages(limit=60); TDLib caps 100
-    flood_pad_seconds: 1       # Telethon: sleep e.seconds + 1
+    flood_pad_seconds: 1       # Telethon: sleep e.seconds + 1. Also seeds the shared pipeline FloodRetry pad (src/telegram/FloodRetry.h: FileDownloader / MessageSender / BotCommandHandler retries wait retry_after + this pad)
   media_channels:
     # Whitelist chats whose media is forwarded automatically (Python
     # handmedias). OFF by default — the realtime ImageReply chain already

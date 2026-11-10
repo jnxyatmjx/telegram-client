@@ -27,6 +27,12 @@ grpc:
   ack_timeout_ms: 45000
   queue_capacity: 50
   connections: 3
+  keepalive_ms: 5000
+  keepalive_timeout_ms: 1500
+  keepalive_permit_without_calls: false
+  max_message_bytes: 8388608
+  http2_lookahead_bytes: 262144
+  http2_write_buffer_bytes: 65536
 
 features:
   media_thumbnail:
@@ -144,6 +150,14 @@ TEST_F(ConfigFileTest, FromFileMapsEverything) {
   EXPECT_EQ(config.grpc.ack_timeout_ms, 45000);
   EXPECT_EQ(config.grpc.queue_capacity, 50);
   EXPECT_EQ(config.grpc.connections, 3);
+
+  // Chunk 3: gRPC channel args (keepalive / 64 MiB cap / HTTP-2 window).
+  EXPECT_EQ(config.grpc.keepalive_ms, 5000);
+  EXPECT_EQ(config.grpc.keepalive_timeout_ms, 1500);
+  EXPECT_FALSE(config.grpc.keepalive_permit_without_calls);
+  EXPECT_EQ(config.grpc.max_message_bytes, 8388608);  // 8 MiB override
+  EXPECT_EQ(config.grpc.http2_lookahead_bytes, 262144);
+  EXPECT_EQ(config.grpc.http2_write_buffer_bytes, 65536);
   EXPECT_FALSE(config.media_thumbnail.enabled);
   EXPECT_EQ(config.media_thumbnail.keyme, "memo-seed-secret");
   EXPECT_EQ(config.bot_command.command_bot_user_id, 987654321);
@@ -249,4 +263,13 @@ TEST(ConfigDefaults, Chunk2Sections) {
   EXPECT_FALSE(config.media_channels.enabled);
   EXPECT_TRUE(config.media_channels.chats.empty());
   EXPECT_EQ(config.media_channels.rpc, "process");
+
+  // Chunk 3: gRPC channel args default to keepalive on, 64 MiB messages,
+  // larger HTTP/2 window + write buffer.
+  EXPECT_EQ(config.grpc.keepalive_ms, 60000);
+  EXPECT_EQ(config.grpc.keepalive_timeout_ms, 20000);
+  EXPECT_TRUE(config.grpc.keepalive_permit_without_calls);
+  EXPECT_EQ(config.grpc.max_message_bytes, 64LL * 1024 * 1024);
+  EXPECT_EQ(config.grpc.http2_lookahead_bytes, 1LL * 1024 * 1024);
+  EXPECT_EQ(config.grpc.http2_write_buffer_bytes, 512LL * 1024);
 }

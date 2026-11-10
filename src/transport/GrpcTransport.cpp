@@ -8,6 +8,47 @@
 
 namespace tg::transport {
 
+grpc::ChannelArguments MakeChannelArgs(const app::GrpcConfig& config) {
+  grpc::ChannelArguments args;
+  // One TCP connection per lane (see the lane rationale in the ctor below).
+  args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
+  // HTTP/2 keepalive: ping while the bidi streams sit idle so a dead peer /
+  // NAT-dropped connection is detected by the ping timeout (and the
+  // streamers reconnect) instead of surfacing at the next send. 0 = keep
+  // gRPC's default (pings effectively off).
+  if (config.keepalive_ms > 0) {
+    args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS,
+                static_cast<int>(config.keepalive_ms));
+  }
+  if (config.keepalive_timeout_ms > 0) {
+    args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS,
+                static_cast<int>(config.keepalive_timeout_ms));
+  }
+  args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS,
+              config.keepalive_permit_without_calls ? 1 : 0);
+  // Message length cap, both directions: chunk 1 sends the FULL image in
+  // one ImageRequest, and the Python client raises its sender to 64 MiB for
+  // exactly that. ImageReply is tiny, but the receive side is raised
+  // symmetrically so a larger server payload can never wedge the stream.
+  if (config.max_message_bytes > 0) {
+    args.SetInt(GRPC_ARG_MAX_SEND_MESSAGE_LENGTH,
+                static_cast<int>(config.max_message_bytes));
+    args.SetInt(GRPC_ARG_MAX_RECEIVE_MESSAGE_LENGTH,
+                static_cast<int>(config.max_message_bytes));
+  }
+  // HTTP/2 window read-ahead + per-stream write buffer: defaults are sized
+  // for small messages; multi-MB image sends benefit from more headroom.
+  if (config.http2_lookahead_bytes > 0) {
+    args.SetInt(GRPC_ARG_HTTP2_STREAM_LOOKAHEAD_BYTES,
+                static_cast<int>(config.http2_lookahead_bytes));
+  }
+  if (config.http2_write_buffer_bytes > 0) {
+    args.SetInt(GRPC_ARG_HTTP2_WRITE_BUFFER_SIZE,
+                static_cast<int>(config.http2_write_buffer_bytes));
+  }
+  return args;
+}
+
 GrpcTransport::GrpcTransport(const app::GrpcConfig& config)
     : config_(config) {
   if (config_.target.empty()) {
@@ -53,10 +94,8 @@ GrpcTransport::GrpcTransport(const app::GrpcConfig& config)
   if (lanes > kMaxLanes) lanes = kMaxLanes;
   channels_.reserve(lanes);
   for (std::size_t i = 0; i < lanes; ++i) {
-    grpc::ChannelArguments args;
-    args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
-    channels_.push_back(
-        grpc::CreateCustomChannel(config_.target, credentials, args));
+    channels_.push_back(grpc::CreateCustomChannel(
+        config_.target, credentials, MakeChannelArgs(config_)));
   }
   spdlog::info("grpc: {} channel(s) created for {} ({})", channels_.size(),
                config_.target, config_.tls ? "TLS" : "insecure");

@@ -99,6 +99,7 @@ add_library(tg_core STATIC
   src/telegram/AuthManager.cpp
   src/telegram/UpdateDispatcher.cpp
   src/telegram/FileDownloader.cpp
+  src/telegram/FloodRetry.cpp
   src/telegram/MessageSender.cpp
   src/telegram/TdErrors.cpp
   src/features/bot_command/BotCommandHandler.cpp

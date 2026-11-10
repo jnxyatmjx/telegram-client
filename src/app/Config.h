@@ -49,6 +49,34 @@ struct GrpcConfig {
   // its own ProcessImages + SearchImages stream, and requests are dealt
   // round-robin across lanes. 1 = previous single-connection behavior.
   int connections = 1;
+  //
+  // Channel args (Telethon migration chunk 3). Applied to every lane's
+  // Channel by GrpcTransport::MakeChannelArgs. A value of 0 means "leave
+  // gRPC's default" for the *_ms / *_bytes knobs below.
+  //
+  // HTTP/2 keepalive: ping the server every keepalive_ms; if no ping ack
+  // arrives within keepalive_timeout_ms the connection is considered dead
+  // and the streamers reconnect — a dead peer is detected while the bidi
+  // streams sit idle instead of on the next send. 60 s is deliberately
+  // conservative: a server with a stricter minimum ping interval answers
+  // with GOAWAY "too_many_pings", so raise this (not lower it) if that
+  // shows up in the logs.
+  std::int64_t keepalive_ms = 60'000;
+  std::int64_t keepalive_timeout_ms = 20'000;
+  // Allow keepalive pings while no call is outstanding (e.g. during a
+  // reconnect gap): keeps half-dead connections from looking healthy.
+  bool keepalive_permit_without_calls = true;
+  // Max gRPC message length, BOTH directions, bytes. The Python client sets
+  // max_send_message_length=64MiB for the same reason: chunk 1 sends the
+  // FULL image (photo largest tier) as ImageRequest.image_data, and full
+  // photos must fit in one message.
+  std::int64_t max_message_bytes = 64LL * 1024 * 1024;  // 64 MiB
+  // HTTP/2 flow-control read-ahead per stream (gRPC default 64 KiB): larger
+  // values help throughput on high-latency links carrying multi-MB images.
+  std::int64_t http2_lookahead_bytes = 1'048'576;  // 1 MiB
+  // Per-stream HTTP/2 write buffer bound (gRPC default 64 KiB): sized so a
+  // multi-MB image write is buffered without stalling the write loop.
+  std::int64_t http2_write_buffer_bytes = 524'288;  // 512 KiB
 };
 
 struct MediaThumbnailConfig {

@@ -1,6 +1,8 @@
 #include "telegram/FileDownloader.h"
 
 #include <common/Logger.h>
+#include <telegram/FloodRetry.h>
+#include <telegram/TdErrors.h>
 #include <telegram/TelegramClient.h>
 
 #include <stdexcept>
@@ -8,7 +10,8 @@
 
 namespace tg::telegram {
 
-FileDownloader::FileDownloader(ITdSender& sender) : sender_(sender) {}
+FileDownloader::FileDownloader(ITdSender& sender, FloodRetry* flood_retry)
+    : sender_(sender), flood_retry_(flood_retry) {}
 
 void FileDownloader::DownloadAsync(std::int32_t file_id,
                                    DownloadCallback on_done) {
@@ -20,11 +23,16 @@ void FileDownloader::DownloadAsync(std::int32_t file_id,
     already_pending = callbacks.size() > 1;
   }
   if (already_pending) {
-    // A downloadFile request for this file is already in flight; the
-    // callback rides along and fires when it completes. No second request.
+    // A downloadFile request for this file is already in flight (or its
+    // flood retry is scheduled — the callbacks stay registered through a
+    // FloodWait); the callback rides along and fires when it completes.
+    // No second request.
     return;
   }
+  SendDownloadFile(file_id);
+}
 
+void FileDownloader::SendDownloadFile(std::int32_t file_id) {
   auto request = td_api::make_object<td_api::downloadFile>();
   request->file_id_ = file_id;
   request->priority_ = 32;  // arbitrary medium priority
@@ -41,15 +49,70 @@ void FileDownloader::DownloadAsync(std::int32_t file_id,
     }
     if (response.object->get_id() == td_api::error::ID) {
       const auto error = td_api::move_object_as<td_api::error>(response.object);
+      if (IsFloodWait(*error)) {
+        HandleFloodWait(id, *error);
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        flood_attempts_.erase(id);
+      }
       FailOne(id, "downloadFile failed: code " + std::to_string(error->code_) +
                       ": " + error->message_);
       return;
     }
     if (response.object->get_id() == td_api::file::ID) {
       const auto file = td_api::move_object_as<td_api::file>(response.object);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        flood_attempts_.erase(id);
+      }
       MaybeComplete(id, *file);
     }
   });
+}
+
+void FileDownloader::HandleFloodWait(std::int32_t file_id,
+                                     const td_api::error& error) {
+  // Receive thread. The 429 means the download was refused, not applied:
+  // the callbacks stay registered and the same downloadFile is re-issued
+  // after retry-after + pad. attempt is tracked per file_id under mutex_.
+  if (flood_retry_ == nullptr) {
+    // Pre-chunk-3 behaviour (tests / unbuilt wiring): fail fast.
+    FailOne(file_id, "downloadFile failed: code " +
+                         std::to_string(error.code_) + ": " + error.message_);
+    return;
+  }
+  int attempt = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_.count(file_id) == 0) return;  // already failed/completed
+    attempt = ++flood_attempts_[file_id];
+  }
+  spdlog::warn("file_downloader: downloadFile {} FloodWait — retrying via "
+               "flood scheduler", file_id);
+  const bool scheduled = flood_retry_->Schedule(
+      error, attempt, [this, file_id] {
+        // Timer thread. FailAll may have cleared everything since; sending
+        // a download nobody waits for would be pointless.
+        bool still_wanted = false;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          still_wanted = pending_.count(file_id) > 0;
+        }
+        if (still_wanted) SendDownloadFile(file_id);
+      });
+  if (!scheduled) {
+    int attempts = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      attempts = flood_attempts_[file_id];
+      flood_attempts_.erase(file_id);
+    }
+    FailOne(file_id, "downloadFile still flood-limited after " +
+                         std::to_string(attempts) +
+                         " attempts — giving up");
+  }
 }
 
 std::future<std::string> FileDownloader::Download(
@@ -110,11 +173,18 @@ void FileDownloader::FailOne(std::int32_t file_id, const std::string& error) {
 }
 
 void FileDownloader::FailAll(const std::string& reason) {
+  // Shutdown path. flood_retry_ is NOT shut down here — it may be shared
+  // (Application passes one instance around), and Application already
+  // Shutdown()s it before tearing Telegram down. A retry that still fires
+  // after this point is a no-op: pending_ was just cleared, and the
+  // closure's still_wanted check refuses to send a download nobody
+  // waits for.
   std::map<std::int32_t, std::vector<DownloadCallback>> failed;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     failed = std::move(pending_);
     pending_.clear();
+    flood_attempts_.clear();
   }
   for (auto& [id, callbacks] : failed) {
     (void)id;

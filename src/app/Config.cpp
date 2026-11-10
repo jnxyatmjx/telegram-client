@@ -291,6 +291,18 @@ Config Config::FromFile(const std::string& path) {
     const auto connections = Int(*g, "connections", cfg.grpc.connections);
     cfg.grpc.connections =
         static_cast<int>(connections > 0 ? connections : cfg.grpc.connections);
+    cfg.grpc.keepalive_ms = Int(*g, "keepalive_ms", cfg.grpc.keepalive_ms);
+    cfg.grpc.keepalive_timeout_ms =
+        Int(*g, "keepalive_timeout_ms", cfg.grpc.keepalive_timeout_ms);
+    cfg.grpc.keepalive_permit_without_calls = Bool(
+        *g, "keepalive_permit_without_calls",
+        cfg.grpc.keepalive_permit_without_calls);
+    cfg.grpc.max_message_bytes =
+        Int(*g, "max_message_bytes", cfg.grpc.max_message_bytes);
+    cfg.grpc.http2_lookahead_bytes =
+        Int(*g, "http2_lookahead_bytes", cfg.grpc.http2_lookahead_bytes);
+    cfg.grpc.http2_write_buffer_bytes = Int(*g, "http2_write_buffer_bytes",
+                                            cfg.grpc.http2_write_buffer_bytes);
   }
 
   if (const YamlNode* f = root.Find("features")) {

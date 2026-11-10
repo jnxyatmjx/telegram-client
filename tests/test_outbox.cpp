@@ -145,12 +145,17 @@ TEST_F(OutboxTest, PurgeRemovesOnlyOldDoneRecords) {
 }
 
 TEST_F(OutboxTest, PersistsAcrossReopen) {
-  outbox_->Put(MakeRecord("c1:m1:uid"));
-  outbox_->MarkRequeued("c1:m1:uid", 12345, 5, "held");
+  // A REAL legacy id ("<chat>:<message_id>:<uid>" — the middle segment was
+  // always numeric): the reopen below runs MigrateLegacyImageIds, which
+  // rewrites the row to the wire format "456" and keeps it pending. A
+  // non-numeric middle would be dead-lettered instead (see
+  // OutboxLegacyMigration.UnparseableLegacyRowDeadLetters).
+  outbox_->Put(MakeRecord("-100123:456:uid"));
+  outbox_->MarkRequeued("-100123:456:uid", 12345, 5, "held");
   outbox_.reset();
 
   infra::Outbox reopened(path_);
-  const auto record = reopened.Get("c1:m1:uid");
+  const auto record = reopened.Get("456");
   ASSERT_TRUE(record.has_value());
   EXPECT_EQ(record->state, infra::OutboxState::kPending);
   EXPECT_EQ(record->attempts, 1);
@@ -171,4 +176,126 @@ TEST_F(OutboxTest, CountByState) {
 TEST_F(OutboxTest, OpensInvalidPathThrows) {
   EXPECT_THROW(infra::Outbox("/nonexistent-dir-xyz/outbox.sqlite"),
                std::runtime_error);
+}
+
+// --- legacy image_id migration (Telethon migration Chunk 2) ---------------------
+//
+// The Telethon client's outbox keyed rows "<chat>:<message_id>:<uid>"; the
+// C++ wire format is str(message_id). On open, rows carrying ':' are
+// rewritten to the message id, dropped on collision with an existing
+// current-format row, or dead-lettered when unparseable — idempotently.
+
+namespace {
+
+std::string MigrationDbPath() {
+  return "/tmp/tg_client_outbox_migration_" + std::to_string(getpid()) +
+         ".sqlite";
+}
+
+infra::OutboxRecord MakeRecordWith(const std::string& image_id,
+                                   const std::string& data) {
+  infra::OutboxRecord record = MakeRecord(image_id);
+  record.image_data = data;
+  return record;
+}
+
+}  // namespace
+
+TEST(OutboxLegacyMigration, RewritesLegacyIdsToMessageIds) {
+  const std::string path = MigrationDbPath();
+  std::remove(path.c_str());
+  {
+    infra::Outbox writer(path);  // writes rows as-is (migration not run yet)
+    writer.Put(MakeRecordWith("c1:120:uidA", "payload-a"));
+    writer.Put(MakeRecordWith("c1:150:uidB", "payload-b"));
+  }
+  // The upgrade: this open runs MigrateLegacyImageIds.
+  infra::Outbox migrated(path);
+  EXPECT_EQ(migrated.PendingCount(), 2);
+  const auto a = migrated.Get("120");
+  ASSERT_TRUE(a.has_value());
+  EXPECT_EQ(a->image_data, "payload-a");
+  const auto b = migrated.Get("150");
+  ASSERT_TRUE(b.has_value());
+  EXPECT_EQ(b->image_data, "payload-b");
+  EXPECT_EQ(migrated.Get("c1:120:uidA"), std::nullopt);
+  std::remove(path.c_str());
+}
+
+TEST(OutboxLegacyMigration, CollisionKeepsCurrentFormatRow) {
+  const std::string path = MigrationDbPath();
+  std::remove(path.c_str());
+  {
+    infra::Outbox writer(path);
+    writer.Put(MakeRecordWith("120", "current-row"));
+    writer.Put(MakeRecordWith("c1:120:uidX", "legacy-row"));
+  }
+  infra::Outbox migrated(path);
+  EXPECT_EQ(migrated.PendingCount(), 1);  // legacy row deleted, current kept
+  const auto kept = migrated.Get("120");
+  ASSERT_TRUE(kept.has_value());
+  EXPECT_EQ(kept->image_data, "current-row");
+  EXPECT_EQ(migrated.Get("c1:120:uidX"), std::nullopt);
+  std::remove(path.c_str());
+}
+
+TEST(OutboxLegacyMigration, ConvertedLegacyRowsDedupeAmongThemselves) {
+  const std::string path = MigrationDbPath();
+  std::remove(path.c_str());
+  {
+    infra::Outbox writer(path);
+    writer.Put(MakeRecordWith("c1:120:uidA", "first"));
+    writer.Put(MakeRecordWith("c2:120:uidB", "second"));  // same message id
+  }
+  infra::Outbox migrated(path);
+  EXPECT_EQ(migrated.PendingCount(), 1);
+  const auto kept = migrated.Get("120");
+  ASSERT_TRUE(kept.has_value());
+  EXPECT_EQ(kept->image_data, "first");
+  std::remove(path.c_str());
+}
+
+TEST(OutboxLegacyMigration, UnparseableLegacyRowDeadLetters) {
+  const std::string path = MigrationDbPath();
+  std::remove(path.c_str());
+  {
+    infra::Outbox writer(path);
+    writer.Put(MakeRecordWith("c1:abc:uid", "junk-middle"));
+    writer.Put(MakeRecordWith("no-colon-id", "not legacy"));
+    writer.Put(MakeRecordWith("c1:120", "two segments"));
+  }
+  infra::Outbox migrated(path);
+  // Non-digit middle and missing middle: dead-lettered for inspection.
+  const auto junk = migrated.Get("c1:abc:uid");
+  ASSERT_TRUE(junk.has_value());
+  EXPECT_EQ(junk->state, infra::OutboxState::kDeadLetter);
+  EXPECT_NE(junk->last_status.find("legacy image_id unparseable"),
+            std::string::npos);
+  const auto two = migrated.Get("c1:120");
+  ASSERT_TRUE(two.has_value());
+  EXPECT_EQ(two->state, infra::OutboxState::kDeadLetter);
+  // A row without any ':' is NOT legacy — untouched, still pending.
+  const auto clean = migrated.Get("no-colon-id");
+  ASSERT_TRUE(clean.has_value());
+  EXPECT_EQ(clean->state, infra::OutboxState::kPending);
+  std::remove(path.c_str());
+}
+
+TEST(OutboxLegacyMigration, MigrationIsIdempotentOnReopen) {
+  const std::string path = MigrationDbPath();
+  std::remove(path.c_str());
+  {
+    infra::Outbox writer(path);
+    writer.Put(MakeRecordWith("c1:120:uidA", "payload-a"));
+    writer.Put(MakeRecordWith("c1:abc:uid", "junk"));
+  }
+  infra::Outbox first(path);
+  ASSERT_EQ(first.PendingCount(), 1);          // converted
+  ASSERT_TRUE(first.Get("c1:abc:uid").has_value());  // dead-lettered row kept
+  {
+    infra::Outbox second(path);  // second open: nothing left to migrate
+    EXPECT_EQ(second.PendingCount(), 1);
+  }
+  EXPECT_TRUE(first.Get("120").has_value());
+  std::remove(path.c_str());
 }

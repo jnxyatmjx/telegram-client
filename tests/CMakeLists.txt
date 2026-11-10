@@ -18,7 +18,13 @@ set(TG_TEST_SOURCES
   test_tdlib_bootstrap.cpp
   test_auth_prompt.cpp
   test_update_logging.cpp
-  test_streamer_pool.cpp)
+  test_streamer_pool.cpp
+  test_message_sender.cpp
+  test_chat_state_backend.cpp
+  test_history_backfill.cpp
+  test_dialog_scan.cpp
+  test_control_commands.cpp
+  test_media_channels.cpp)
 
 foreach(src IN LISTS TG_TEST_SOURCES)
   get_filename_component(test_name "${src}" NAME_WE)

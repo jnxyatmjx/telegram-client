@@ -17,6 +17,24 @@
 //   PENDING  -- retryable failure (attempts exhausted) --> FAILED
 //   PENDING/FAILED -- permanent failure (INVALID_ARGUMENT, PERMISSION_DENIED)
 //                     --> DEAD_LETTER
+//
+// Legacy image_id migration (Telethon migration Chunk 2): rows written by
+// the pre-migration client carry "<chat_id>:<message_id>:<uid>" ids; the
+// wire format is now str(message_id) (Idempotency::MakeWireImageId — the
+// server dedupes on that exact string). At open, the constructor rewrites
+// every legacy row in one transaction:
+//   - parseable   -> UPDATE image_id to the bare message id;
+//   - new-id collision -> the legacy row is DELETED (the new-format row
+//     stands: replaying both would just dedupe to one server-side, and the
+//     new row is the one the current client owns);
+//   - unparseable -> DEAD_LETTER with a note (kept for inspection, never
+//     replayed).
+// This is idempotent: a second open finds no ':' rows and does nothing, so
+// no old row can wedge the retry loop or cause a duplicate send. NOTE: two
+// chats can legitimately carry the same numeric message id; in that
+// (rare) collision the second legacy row is dropped — the server's dedup
+// key space is the message id string itself, so only one of the two could
+// ever be acked.
 
 #include <sqlite3.h>
 
@@ -91,6 +109,9 @@ class Outbox {
 
  private:
   OutboxRecord RowToRecord(sqlite3_stmt* statement) const;
+  // One-time legacy "<chat>:<msg>:<uid>" rewrite; called from the ctor
+  // (mutex not yet contended).
+  void MigrateLegacyImageIds();
 
   mutable std::mutex mutex_;
   sqlite3* db_ = nullptr;

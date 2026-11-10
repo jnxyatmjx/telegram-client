@@ -209,10 +209,18 @@ TEST_F(ChatStateTest, ReplyCreatesUnknownChat) {
 TEST_F(ChatStateTest, InvalidIdsAreDropped) {
   store_->ApplyReply(0, 5);                    // 0 is not a bare id
   store_->ApplyReply(-100, 5);                 // negative
-  store_->ApplyReply(5'000'000'000LL, 5);      // > uint32
   store_->ApplyReply(1'234'567'890, 0);        // mid <= 0
   store_->ApplyReply(1'234'567'890, -3);
   EXPECT_EQ(store_->size(), 0u);
+}
+
+TEST_F(ChatStateTest, LargeBareIdAboveUint32IsAccepted) {
+  // Telegram user ids above 2^32 exist (e.g. a bot at 7974301646); the
+  // reply cid is int64, not uint32, so the watermark must still update.
+  store_->ApplyReply(7'974'301'646LL, 5);
+  const auto entry = store_->Get(7'974'301'646LL);
+  ASSERT_TRUE(entry.has_value());
+  EXPECT_EQ(entry->offset_id, 5);
 }
 
 // --- chat_url resolution -----------------------------------------------------

@@ -5,6 +5,7 @@
 
 #include <csignal>
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -65,12 +66,33 @@ Application::Application(Config config)
           std::chrono::milliseconds(1'000))),
       files_(telegram_),
       transport_(config_.grpc),
-      chat_state_(telegram_),
+      // chat_state.enabled=false keeps the store memory-only (Chunk 1
+      // behaviour); otherwise the Python `chathis` SQLite schema backs it.
+      chat_state_(telegram_,
+                  config_.chat_state.enabled
+                      ? features::chat_state::MakeSqliteChatStateBackend(
+                            config_.chat_state.db_path)
+                      : nullptr),
       process_handler_(MediaExtractor(config_.media_thumbnail), telegram_,
                        files_,
                        common::MemoCipher(config_.media_thumbnail.keyme)),
       search_handler_(MediaExtractor(config_.media_thumbnail), telegram_,
                       files_),
+      messenger_(telegram_),
+      backfill_(telegram_, process_handler_, chat_state_, messenger_,
+                features::history_backfill::HistoryBackfillConfig{
+                    config_.history_backfill.enabled,
+                    config_.history_backfill.page_limit,
+                    config_.history_backfill.flood_pad_seconds}),
+      dialog_scanner_(telegram_,
+                      features::commands::DialogScanner::Config{
+                          config_.commands.dialog_limit,
+                          config_.history_backfill.flood_pad_seconds}),
+      control_commands_handler_(config_.commands, config_.bot_command,
+                                messenger_, dialog_scanner_, backfill_),
+      media_channel_handler_(
+          std::make_shared<features::media_channels::MediaChannelHandler>(
+              config_.media_channels, process_handler_, search_handler_)),
       bot_command_handler_(config_.bot_command, process_handler_,
                            search_handler_),
       auto_search_handler_(std::make_shared<features::auto_search::AutoSearchHandler>(
@@ -114,17 +136,22 @@ Application::Application(Config config)
 
 Application::~Application() {
   // Async shutdown order (2026-11-09): stop the source of new work first.
+  // backfill_.Shutdown() / dialog_scanner_.Shutdown() refuse new TDLib
+  // sends, so pending callbacks during telegram_.Stop() no-op cleanly.
   // telegram_.Stop() completes every pending TDLib callback (getMessage,
   // downloadFile), which fires the download callbacks, which post their
   // finish stages to the pool — so the pool must still be running here,
   // and is drained after. FailAll is the safety net for any download
   // still pending after the TDLib callbacks completed.
+  backfill_.Shutdown();
+  dialog_scanner_.Shutdown();
   telegram_.Stop();
   files_.FailAll("shutting down");
   workers_->Stop(std::chrono::seconds(0));
   process_pool_.Stop();
   search_pool_.Stop();
   StopOutboxRetryThread();
+  StopStateFlushThread();
 }
 
 void Application::WireHandlers() {
@@ -132,6 +159,14 @@ void Application::WireHandlers() {
       &bot_command_handler_, [](telegram::IUpdateHandler*) {}));  // non-owning
   // Phase-2 trigger; disabled by default -> claims nothing.
   dispatcher_.Register(auto_search_handler_);
+  // Chunk 2: whitelist-channel auto pipeline (Python handmedias); disabled
+  // by default. With auto_search AND media_channels enabled for the same
+  // chat, auto_search (registered first) claims the update — first
+  // claimant wins (UpdateDispatcher semantics).
+  dispatcher_.Register(media_channel_handler_);
+  // Chunk 2: control-chat commands (/rsme //rsor //xm ...).
+  dispatcher_.Register(std::shared_ptr<telegram::IUpdateHandler>(
+      &control_commands_handler_, [](telegram::IUpdateHandler*) {}));  // non-owning
 }
 
 void Application::WireStreamerCallbacks() {
@@ -240,6 +275,40 @@ void Application::StopOutboxRetryThread() {
   }
 }
 
+void Application::StartStateFlushThread() {
+  if (!config_.chat_state.enabled) return;
+  flush_running_.store(true, std::memory_order_release);
+  flush_thread_ = std::thread([this] {
+    // Python schedule.every(30).schedule2db: flush entries whose watermark
+    // advanced within active_window_seconds.
+    const auto interval =
+        std::chrono::seconds(config_.chat_state.flush_interval_seconds);
+    while (flush_running_.load(std::memory_order_acquire)) {
+      chat_state_.FlushActive(
+          NowMs(), config_.chat_state.active_window_seconds);
+      const auto deadline = std::chrono::steady_clock::now() + interval;
+      while (flush_running_.load(std::memory_order_acquire) &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    }
+  });
+}
+
+void Application::StopStateFlushThread() {
+  if (!flush_running_.exchange(false, std::memory_order_acq_rel)) return;
+  if (flush_thread_.joinable()) {
+    flush_thread_.join();
+  }
+  if (config_.chat_state.enabled) {
+    // Final pass with an unbounded window: persist EVERY entry, not just
+    // the 45 s-active ones — a shutdown must not lose a watermark that
+    // advanced since its last periodic flush (Python lost exactly that on
+    // exit; we can afford the extra write).
+    chat_state_.FlushActive(NowMs(), std::numeric_limits<int>::max());
+  }
+}
+
 int Application::WaitForAuthOrFailure() {
   // Poll in short slices: a plain 300 s WaitForReady() would swallow
   // SIGINT/SIGTERM for the whole auth wait, because the signal handler
@@ -266,9 +335,13 @@ int Application::WaitForAuthOrFailure() {
 
 int Application::Run() {
   spdlog::info(
-      "application: starting — workers={}, outbox={}, grpc target={}, lanes={}",
-      config_.worker_count, config_.outbox.db_path, config_.grpc.target,
-      transport_.lane_count());
+      "application: starting — workers={}, outbox={}, chat_state={}, grpc "
+      "target={}, lanes={}",
+      config_.worker_count, config_.outbox.db_path,
+      config_.chat_state.enabled
+          ? config_.chat_state.db_path
+          : "<memory-only>",
+      config_.grpc.target, transport_.lane_count());
 
   telegram_.SetUpdateSink(
       [this](td_api::object_ptr<td_api::Update>&& update) {
@@ -284,13 +357,23 @@ int Application::Run() {
   const int auth_result = WaitForAuthOrFailure();
   if (auth_result == kAuthInterrupted) {
     // Shutdown requested during auth: skip straight to the ordered
-    // shutdown below. The retry thread was never started (its Stop is a
-    // no-op in that case); streamers and telegram were started above, so
-    // they still need their ordered Stop calls.
+    // shutdown below. The retry and flush threads were never started
+    // (their Stops are no-ops in that case); streamers and telegram were
+    // started above, so they still need their ordered Stop calls.
   } else if (auth_result != 0) {
     return auth_result;
   } else {
+    // Startup restore (Python load_chat_state): the persisted `chathis`
+    // table back into memory. Restored non-empty URLs (placeholder or real)
+    // count as resolved — no retry storm across restarts. A storage failure
+    // throws: startup-critical, same as opening the Outbox.
+    if (config_.chat_state.enabled) {
+      const std::size_t restored = chat_state_.Restore();
+      spdlog::info("application: chat state restored — {} chats from {}",
+                   restored, config_.chat_state.db_path);
+    }
     StartOutboxRetryThread();
+    StartStateFlushThread();
 
     // Signal wait: both stop paths are relaxed atomic stores (async-signal
     // safe), polled here.
@@ -300,16 +383,20 @@ int Application::Run() {
   }
 
   // v5 §3.6 ordered shutdown, async edition (2026-11-09): stop the
-  // source of new work first. telegram_.Stop() completes every pending
-  // TDLib callback, which fires the download callbacks, which post their
-  // finish stages to the pool — so the pool is drained AFTER telegram,
-  // and the streamers only after the pool (finish stages Enqueue to them).
+  // source of new work first. backfill/scanner Shutdown refuse new TDLib
+  // sends; telegram_.Stop() completes every pending TDLib callback, which
+  // fires the download callbacks, which post their finish stages to the
+  // pool — so the pool is drained AFTER telegram, and the streamers only
+  // after the pool (finish stages Enqueue to them).
+  backfill_.Shutdown();                         // 0. refuse new jobs/pages
+  dialog_scanner_.Shutdown();                   //    (pending callbacks no-op)
   telegram_.Stop();                             // 1. close TDLib session
   files_.FailAll("shutting down");              // 2. safety net for downloads
   workers_->Stop(kWorkerDrainTimeout);          // 3. drain in-flight work
   process_pool_.Stop();                     // 4. WritesDone/Finish/CQ join
   search_pool_.Stop();
   StopOutboxRetryThread();                      // 5. flush + join retry
+  StopStateFlushThread();                       // 6. final full flush + join
   spdlog::info("application: stopped cleanly (outbox pending: {})",
                outbox_.PendingCount());
   return 0;

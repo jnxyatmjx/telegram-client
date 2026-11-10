@@ -45,9 +45,57 @@ features:
     enabled: false
     chats: []                  # TDLib dialog chat_ids (the -100... form)
     dedup_ttl_seconds: 600     # (oid, id) recent-search dedup TTL
+  commands:
+    # Control-chat command surface (Telethon migration chunk 2):
+    #   /rsme  dialog listing (channels/groups then users, 45-line batches)
+    #   /rsor  失效/非法 dialog audit — reports only, NEVER auto-leaves
+    #   /xm /xy /ym /who <bare_chat_id>  history backfill from the watermark
+    enabled: true
+    # TDLib dialog id of the control conversation (0 = commands off).
+    control_chat_id: 0
+    # Trigger directions: outgoing messages (the account itself types the
+    # command, Python model) and/or the bot user below sending in this chat.
+    self_commands: true
+    rsme_command: "/rsme"
+    rsor_command: "/rsor"
+    backfill_commands: ["/xm", "/xy", "/ym", "/who"]
+    dialog_limit: 1202         # get_dialogs(limit=...) in /rsme
+    list_batch_lines: 45       # lines per /rsme reply message
+    rsor_report_limit: 50      # max findings per /rsor report
+  history_backfill:
+    # Engine behind /xm & co: searchChatMessages(photoAndVideo) pages
+    # backward from the newest message to the chat's watermark, then feeds
+    # each message through the realtime ProcessImages pipeline (oldest
+    # first). Watermark resumes from the persisted state; FloodWait pauses
+    # the job for retry-after + flood_pad_seconds.
+    enabled: true
+    page_limit: 60             # Python get_messages(limit=60); TDLib caps 100
+    flood_pad_seconds: 1       # Telethon: sleep e.seconds + 1
+  media_channels:
+    # Whitelist chats whose media is forwarded automatically (Python
+    # handmedias). OFF by default — the realtime ImageReply chain already
+    # drives the pipeline. Chats are BARE ids (same space as chathis.chat_id
+    # and the /rsme listing). rpc: "process" (Python main chain) or
+    # "search". If the same chat is also in auto_search.chats (and both
+    # enabled), auto_search claims the message first.
+    enabled: false
+    chats: []
+    rpc: "process"
 
 outbox:
   db_path: "/data/outbox.sqlite"   # SQLite, WAL mode; retry-only
+
+# State persistence (Telethon migration chunk 2, Python chathis):
+# every flush_interval_seconds, chats whose watermark advanced within the
+# last active_window_seconds are upserted into the local SQLite table
+# `chathis` (chat_id, offset_id, chat_url, init_date, init_time, updated_at;
+# GMT+8 fields, Python-compatible shape). Startup restores the table into
+# memory; D1 replaces the backend later behind the same interface.
+chat_state:
+  enabled: false
+  db_path: "/data/chathis.sqlite"
+  flush_interval_seconds: 30
+  active_window_seconds: 45
 
 log:
   level: "info"

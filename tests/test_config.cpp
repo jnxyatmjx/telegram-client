@@ -44,6 +44,36 @@ features:
       - -1001234567890
       - -987654321
     dedup_ttl_seconds: 300
+  commands:
+    enabled: true
+    control_chat_id: 777
+    self_commands: true
+    rsme_command: "/rsme"
+    rsor_command: "/rsor"
+    backfill_commands:
+      - "/xm"
+      - "/xy"
+      - "/ym"
+      - "/who"
+    dialog_limit: 1202
+    list_batch_lines: 45
+    rsor_report_limit: 50
+  history_backfill:
+    enabled: true
+    page_limit: 60
+    flood_pad_seconds: 1
+  media_channels:
+    enabled: true
+    chats:
+      - 1234567890
+      - 987654321
+    rpc: "search"
+
+chat_state:
+  enabled: true
+  db_path: /data/chathis.sqlite
+  flush_interval_seconds: 30
+  active_window_seconds: 45
 
 outbox:
   db_path: /tmp/outbox-test.sqlite
@@ -119,6 +149,37 @@ TEST_F(ConfigFileTest, FromFileMapsEverything) {
   EXPECT_EQ(config.bot_command.command_bot_user_id, 987654321);
   EXPECT_TRUE(config.auto_search.enabled);
   EXPECT_EQ(config.auto_search.chats.size(), 2u);
+
+  // Chunk 2: command surface.
+  EXPECT_TRUE(config.commands.enabled);
+  EXPECT_EQ(config.commands.control_chat_id, 777);
+  EXPECT_TRUE(config.commands.self_commands);
+  EXPECT_EQ(config.commands.rsme_command, "/rsme");
+  EXPECT_EQ(config.commands.rsor_command, "/rsor");
+  EXPECT_EQ(config.commands.backfill_commands.size(), 4u);
+  EXPECT_EQ(config.commands.backfill_commands[0], "/xm");
+  EXPECT_EQ(config.commands.backfill_commands[3], "/who");
+  EXPECT_EQ(config.commands.dialog_limit, 1202);
+  EXPECT_EQ(config.commands.list_batch_lines, 45);
+  EXPECT_EQ(config.commands.rsor_report_limit, 50);
+
+  // Chunk 2: history backfill.
+  EXPECT_TRUE(config.history_backfill.enabled);
+  EXPECT_EQ(config.history_backfill.page_limit, 60);
+  EXPECT_EQ(config.history_backfill.flood_pad_seconds, 1);
+
+  // Chunk 2: whitelisted media channels (bare chat ids).
+  EXPECT_TRUE(config.media_channels.enabled);
+  EXPECT_EQ(config.media_channels.chats.size(), 2u);
+  EXPECT_EQ(config.media_channels.chats[0], 1234567890);
+  EXPECT_EQ(config.media_channels.rpc, "search");
+
+  // Chunk 2: state persistence (Python chathis).
+  EXPECT_TRUE(config.chat_state.enabled);
+  EXPECT_EQ(config.chat_state.db_path, "/data/chathis.sqlite");
+  EXPECT_EQ(config.chat_state.flush_interval_seconds, 30);
+  EXPECT_EQ(config.chat_state.active_window_seconds, 45);
+
   EXPECT_EQ(config.outbox.db_path, "/tmp/outbox-test.sqlite");
   EXPECT_EQ(config.worker_count, 2);
   EXPECT_EQ(config.log_level, "debug");
@@ -148,4 +209,44 @@ TEST(ConfigDefaults, AutoSearchDisabledByDefault) {
   EXPECT_EQ(config.bot_command.process_command, "/process");
   EXPECT_EQ(config.bot_command.search_command, "/search");
   EXPECT_TRUE(config.grpc.tls);
+}
+
+TEST(ConfigDefaults, Chunk2Sections) {
+  const std::string path = "/tmp/tg_client_config_empty2_" +
+                           std::to_string(getpid()) + ".yaml";
+  { std::ofstream out(path); out << ""; }
+  const app::Config config = app::Config::FromFile(path);
+  std::remove(path.c_str());
+
+  // State persistence: OFF by default (opt-in like Python's chathis path).
+  EXPECT_FALSE(config.chat_state.enabled);
+  EXPECT_EQ(config.chat_state.db_path, "/data/chathis.sqlite");
+  EXPECT_EQ(config.chat_state.flush_interval_seconds, 30);
+  EXPECT_EQ(config.chat_state.active_window_seconds, 45);
+
+  // Command surface: on, self-commands trigger (the Python model), no
+  // control chat configured yet.
+  EXPECT_TRUE(config.commands.enabled);
+  EXPECT_EQ(config.commands.control_chat_id, 0);
+  EXPECT_TRUE(config.commands.self_commands);
+  EXPECT_EQ(config.commands.rsme_command, "/rsme");
+  EXPECT_EQ(config.commands.rsor_command, "/rsor");
+  ASSERT_EQ(config.commands.backfill_commands.size(), 4u);
+  EXPECT_EQ(config.commands.backfill_commands[0], "/xm");
+  EXPECT_EQ(config.commands.backfill_commands[1], "/xy");
+  EXPECT_EQ(config.commands.backfill_commands[2], "/ym");
+  EXPECT_EQ(config.commands.backfill_commands[3], "/who");
+  EXPECT_EQ(config.commands.dialog_limit, 1202);
+  EXPECT_EQ(config.commands.list_batch_lines, 45);
+  EXPECT_EQ(config.commands.rsor_report_limit, 50);
+
+  // History backfill: on, TDLib-capped page size.
+  EXPECT_TRUE(config.history_backfill.enabled);
+  EXPECT_EQ(config.history_backfill.page_limit, 60);
+  EXPECT_EQ(config.history_backfill.flood_pad_seconds, 1);
+
+  // Whitelisted media channels: opt-in, ProcessImages pipeline.
+  EXPECT_FALSE(config.media_channels.enabled);
+  EXPECT_TRUE(config.media_channels.chats.empty());
+  EXPECT_EQ(config.media_channels.rpc, "process");
 }

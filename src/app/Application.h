@@ -11,11 +11,17 @@
 #include <features/auto_search/AutoSearchHandler.h>
 #include <features/bot_command/BotCommandHandler.h>
 #include <features/chat_state/ChatStateStore.h>
+#include <features/chat_state/SqliteChatStateBackend.h>
+#include <features/commands/ControlCommandsHandler.h>
+#include <features/commands/DialogScanner.h>
+#include <features/history_backfill/HistoryBackfill.h>
+#include <features/media_channels/MediaChannelHandler.h>
 #include <features/media_thumbnail/MediaExtractor.h>
 #include <features/media_thumbnail/MediaThumbnailHandler.h>
 #include <features/media_thumbnail/SearchHandler.h>
 #include <infra/Outbox.h>
 #include <telegram/FileDownloader.h>
+#include <telegram/MessageSender.h>
 #include <telegram/TelegramClient.h>
 #include <telegram/UpdateDispatcher.h>
 #include <transport/GrpcTransport.h>
@@ -62,6 +68,11 @@ class Application {
   void WireStreamerCallbacks();
   void StartOutboxRetryThread();
   void StopOutboxRetryThread();
+  // Chat-state flush loop (Chunk 2): FlushActive every
+  // chat_state.flush_interval_seconds; joined + one final full flush on
+  // stop. No-op unless chat_state.enabled.
+  void StartStateFlushThread();
+  void StopStateFlushThread();
   // One pass: re-enqueue due Outbox records (retry thread + reconnect hook).
   void SweepOutbox();
   int WaitForAuthOrFailure();
@@ -80,13 +91,26 @@ class Application {
   std::vector<std::unique_ptr<transport::SearchImagesClient>> search_clients_;
   transport::StreamerPool<ImageRequest, ImageReply> process_pool_;
   transport::StreamerPool<SearchReq, SearchRsp> search_pool_;
-  // Per-chat watermark/link state driven by ImageReply.result (Chunk 1:
-  // in-memory). Declared after telegram_: its TDLib resolution callbacks
-  // complete during telegram_.Stop() in the destructor body, before members
-  // are destroyed.
+  // Per-chat watermark/link state driven by ImageReply.result. With
+  // chat_state.enabled it persists to the local SQLite `chathis` table
+  // (30 s flush of active chats) and restores on startup; otherwise it is
+  // memory-only (Chunk 1 behaviour). Declared after telegram_: its TDLib
+  // resolution callbacks complete during telegram_.Stop() in the destructor
+  // body, before members are destroyed.
   features::chat_state::ChatStateStore chat_state_;
   features::media_thumbnail::MediaThumbnailHandler process_handler_;
   features::media_thumbnail::SearchHandler search_handler_;
+  // Chunk 2: unified sendMessage (markdown, 4096-char split), history
+  // backfill engine, dialog enumeration and the control-chat command
+  // surface (/rsme //rsor //xm ...). Declaration order: messenger_ feeds
+  // backfill_ and control_commands_handler_; backfill_ and dialog_scanner_
+  // are referenced by control_commands_handler_.
+  telegram::MessageSender messenger_;
+  features::history_backfill::HistoryBackfill backfill_;
+  features::commands::DialogScanner dialog_scanner_;
+  features::commands::ControlCommandsHandler control_commands_handler_;
+  std::shared_ptr<features::media_channels::MediaChannelHandler>
+      media_channel_handler_;
   features::bot_command::BotCommandHandler bot_command_handler_;
   std::shared_ptr<features::auto_search::AutoSearchHandler> auto_search_handler_;
   telegram::UpdateDispatcher dispatcher_;
@@ -95,6 +119,8 @@ class Application {
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> retry_running_{false};
   std::thread retry_thread_;
+  std::atomic<bool> flush_running_{false};
+  std::thread flush_thread_;
 };
 
 }  // namespace tg::app

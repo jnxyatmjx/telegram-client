@@ -235,6 +235,15 @@ bool Bool(const YamlNode& section, const std::string& key, bool fallback) {
   return v ? *v : fallback;
 }
 
+std::vector<std::string> StrList(const YamlNode& node) {
+  std::vector<std::string> out;
+  out.reserve(node.list.size());
+  for (const auto& item : node.list) {
+    if (auto v = item.AsString()) out.push_back(*v);
+  }
+  return out;
+}
+
 }  // namespace
 
 Config Config::FromFile(const std::string& path) {
@@ -306,6 +315,43 @@ Config Config::FromFile(const std::string& path) {
       cfg.auto_search.dedup_ttl_seconds =
           Int(*a, "dedup_ttl_seconds", cfg.auto_search.dedup_ttl_seconds);
     }
+    if (const YamlNode* c = f->Find("commands")) {
+      cfg.commands.enabled = Bool(*c, "enabled", cfg.commands.enabled);
+      cfg.commands.control_chat_id =
+          Int(*c, "control_chat_id", cfg.commands.control_chat_id);
+      cfg.commands.self_commands =
+          Bool(*c, "self_commands", cfg.commands.self_commands);
+      cfg.commands.rsme_command =
+          Str(*c, "rsme_command", cfg.commands.rsme_command);
+      cfg.commands.rsor_command =
+          Str(*c, "rsor_command", cfg.commands.rsor_command);
+      if (const YamlNode* cmds = c->Find("backfill_commands")) {
+        const auto commands = StrList(*cmds);
+        if (!commands.empty()) cfg.commands.backfill_commands = commands;
+      }
+      cfg.commands.dialog_limit =
+          static_cast<int>(Int(*c, "dialog_limit", cfg.commands.dialog_limit));
+      cfg.commands.list_batch_lines = static_cast<int>(
+          Int(*c, "list_batch_lines", cfg.commands.list_batch_lines));
+      cfg.commands.rsor_report_limit = static_cast<int>(
+          Int(*c, "rsor_report_limit", cfg.commands.rsor_report_limit));
+    }
+    if (const YamlNode* h = f->Find("history_backfill")) {
+      cfg.history_backfill.enabled =
+          Bool(*h, "enabled", cfg.history_backfill.enabled);
+      cfg.history_backfill.page_limit =
+          static_cast<int>(Int(*h, "page_limit", cfg.history_backfill.page_limit));
+      cfg.history_backfill.flood_pad_seconds = static_cast<int>(
+          Int(*h, "flood_pad_seconds", cfg.history_backfill.flood_pad_seconds));
+    }
+    if (const YamlNode* mc = f->Find("media_channels")) {
+      cfg.media_channels.enabled =
+          Bool(*mc, "enabled", cfg.media_channels.enabled);
+      if (const YamlNode* chats = mc->Find("chats")) {
+        cfg.media_channels.chats = chats->AsInt64List();
+      }
+      cfg.media_channels.rpc = Str(*mc, "rpc", cfg.media_channels.rpc);
+    }
   }
 
   if (const YamlNode* o = root.Find("outbox")) {
@@ -316,6 +362,15 @@ Config Config::FromFile(const std::string& path) {
     cfg.outbox.max_attempts = static_cast<int>(attempts);
     cfg.outbox.purge_done_after_seconds =
         Int(*o, "purge_done_after_seconds", cfg.outbox.purge_done_after_seconds);
+  }
+
+  if (const YamlNode* c = root.Find("chat_state")) {
+    cfg.chat_state.enabled = Bool(*c, "enabled", cfg.chat_state.enabled);
+    cfg.chat_state.db_path = Str(*c, "db_path", cfg.chat_state.db_path);
+    cfg.chat_state.flush_interval_seconds = static_cast<int>(
+        Int(*c, "flush_interval_seconds", cfg.chat_state.flush_interval_seconds));
+    cfg.chat_state.active_window_seconds = static_cast<int>(
+        Int(*c, "active_window_seconds", cfg.chat_state.active_window_seconds));
   }
 
   cfg.worker_count = static_cast<int>(Int(root, "workers", cfg.worker_count));

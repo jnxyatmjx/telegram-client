@@ -1,5 +1,6 @@
 #include "features/chat_state/ChatStateStore.h"
 
+#include <common/Gmt8.h>
 #include <common/Idempotency.h>
 #include <common/Logger.h>
 
@@ -269,12 +270,15 @@ std::optional<ParsedReply> ParseReplyResult(const std::string& json) {
 
 // --- ChatStateStore ---------------------------------------------------------
 
-ChatStateStore::ChatStateStore(telegram::ITdSender& sender) : sender_(sender) {}
+ChatStateStore::ChatStateStore(
+    telegram::ITdSender& sender,
+    std::shared_ptr<ChatStateBackend> backend)
+    : sender_(sender), backend_(std::move(backend)) {}
 
 void ChatStateStore::ApplyReply(std::int64_t bare_cid, std::int64_t mid) {
-  // Bare chat ids are uint32; anything else means the server contract broke.
-  if (bare_cid <= 0 ||
-      static_cast<std::uint64_t>(bare_cid) > tg::common::kUint32Max) {
+  // Bare chat ids are int64 (Telegram user ids above 2^32 exist, e.g.
+  // 7974301646); only a non-positive cid means the server contract broke.
+  if (bare_cid <= 0) {
     spdlog::error("chat_state: reply cid {} is not a valid bare chat id — dropped",
                   bare_cid);
     return;
@@ -453,6 +457,101 @@ void ChatStateStore::SetUrl(std::int64_t bare_cid, std::string url) {
 
 void ChatStateStore::SetPlaceholder(std::int64_t bare_cid) {
   SetUrl(bare_cid, PlaceholderUrl(bare_cid));
+}
+
+// --- Persistence (Telethon migration Chunk 2) -------------------------------
+
+std::size_t ChatStateStore::Restore() {
+  if (backend_ == nullptr) return 0;
+  // Storage failure propagates: restore is startup-critical (the caller
+  // treats it like an Outbox-open failure and exits).
+  const std::vector<ChatStateRow> rows = backend_->LoadAll();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (ChatStateRow row : rows) {
+      if (row.chat_id <= 0 ||
+          static_cast<std::uint64_t>(row.chat_id) > tg::common::kUint32Max) {
+        spdlog::warn("chat_state: restore skips invalid chat_id {}",
+                     row.chat_id);
+        continue;
+      }
+      if (row.offset_id < 0) row.offset_id = 0;
+      // Python writes init_date via strftime('%Y%m%d'), i.e. pure digits —
+      // accept the integer form too (D1 may type it as a number).
+      std::int64_t init_date = 0;
+      bool date_digits_ok = !row.init_date.empty();
+      for (const char c : row.init_date) {
+        if (c < '0' || c > '9') {
+          date_digits_ok = false;
+          break;
+        }
+        init_date = init_date * 10 + (c - '0');
+      }
+      const auto last_seen =
+          date_digits_ok
+              ? tg::common::ParseGmt8(init_date, row.init_time)
+              : std::nullopt;
+      State& state = chats_[row.chat_id];
+      state.entry.offset_id = row.offset_id;
+      state.entry.chat_url = std::move(row.chat_url);
+      // Python load_chat_state parses init_date+init_time back into t_t
+      // (app_client.py:797-798); same round-trip here, into last_seen_ms.
+      if (last_seen.has_value()) {
+        state.entry.last_seen_ms = *last_seen;
+      } else {
+        spdlog::warn("chat_state: restore chat {} has unparseable "
+                     "init_date='{}' init_time='{}' — last_seen now",
+                     row.chat_id, row.init_date, row.init_time);
+        state.entry.last_seen_ms = NowMs();
+      }
+      // A persisted URL — real or placeholder — is DONE resolving (the
+      // placeholder exists precisely to avoid retry storms; honour it across
+      // restarts). Only an empty URL resolves on demand at the first reply.
+      state.resolving = false;
+      state.resolved = !state.entry.chat_url.empty();
+    }
+  }
+  const std::size_t restored = size();
+  spdlog::info("chat_state: restored {} chats from state backend", restored);
+  return restored;
+}
+
+std::size_t ChatStateStore::FlushActive(std::int64_t now_ms,
+                                        int active_window_seconds) {
+  if (backend_ == nullptr) return 0;
+  if (active_window_seconds <= 0) active_window_seconds = 45;
+  std::vector<ChatStateRow> rows;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::int64_t window_ms =
+        static_cast<std::int64_t>(active_window_seconds) * 1000;
+    for (const auto& [bare_cid, state] : chats_) {
+      // Python schedule2db: `if now_gmt8 - v_.t_t > timedelta(seconds=45):
+      // continue` (app_client.py:1216-1218) — only recently-active chats.
+      if (now_ms - state.entry.last_seen_ms > window_ms) continue;
+      ChatStateRow row;
+      row.chat_id = bare_cid;
+      row.offset_id = state.entry.offset_id;
+      row.chat_url = state.entry.chat_url;
+      // init_date/init_time come from t_t (the watermark advance), NOT from
+      // the flush time; updated_at from now (app_client.py:1223-1225).
+      row.init_date = tg::common::Gmt8Date(state.entry.last_seen_ms);
+      row.init_time = tg::common::Gmt8Clock(state.entry.last_seen_ms);
+      row.updated_at = tg::common::Gmt8DateTime(now_ms);
+      rows.push_back(std::move(row));
+    }
+  }
+  if (rows.empty()) return 0;
+  // Backend I/O happens outside the mutex — a slow disk must never stall
+  // ApplyReply on the gRPC CQ thread.
+  try {
+    backend_->Upsert(rows);
+  } catch (const std::exception& e) {
+    spdlog::error("chat_state: flush failed ({} rows kept in memory): {}",
+                  rows.size(), e.what());
+    return 0;
+  }
+  return rows.size();
 }
 
 }  // namespace tg::features::chat_state

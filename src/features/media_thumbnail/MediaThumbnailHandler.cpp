@@ -37,11 +37,15 @@ void MediaThumbnailHandler::SendProcessImages(
     return;
   }
   // Fail BEFORE downloading when the request could never be built anyway:
-  // owner_id needs a bare chat id in uint32 range (v5 §1.3 hard rule), and
-  // the memo needs a configured KEYME (the server expects ciphertext).
-  if (!common::ToBareChatId(media->chat_id)) {
-    spdlog::error("process: chat_id {} does not fit uint32 bare id — NOT "
-                  "sending (no truncation)", media->chat_id);
+  // owner_id needs a bare chat id (int64 — ImageRequest.owner_id is int64
+  // in the proto; Telegram user ids above 2^32 exist, e.g. 7974301646, so
+  // this must NOT be the uint32-capped ToBareChatId, which is only for
+  // SearchReq.oid), and the memo needs a configured KEYME (the server
+  // expects ciphertext).
+  if (!common::ToBareChatId64(media->chat_id)) {
+    spdlog::error("process: chat_id {} is not a valid bare id — NOT "
+                  "sending",
+                  media->chat_id);
     return;
   }
   if (!memo_cipher_.IsConfigured()) {
@@ -92,12 +96,13 @@ void MediaThumbnailHandler::FinishProcess(ExtractedMedia media,
   }
 
   // Protocol alignment (Telethon migration Chunk 1):
-  //   owner_id: bare MTProto chat id, uint32 range-checked (the server and
-  //     the reply {"cid"} both live in the bare-id world).
-  const auto bare = common::ToBareChatId(media.chat_id);
+  //   owner_id: bare MTProto chat id as int64 (ImageRequest.owner_id is
+  //     int64 in the proto; the uint32 cap applies only to SearchReq.oid).
+  const auto bare = common::ToBareChatId64(media.chat_id);
   if (!bare) {
-    spdlog::error("process: chat_id {} does not fit uint32 bare id — NOT "
-                  "sending (no truncation)", media.chat_id);
+    spdlog::error("process: chat_id {} is not a valid bare id — NOT "
+                  "sending",
+                  media.chat_id);
     return;
   }
   //   image_id: str(message_id) — message-level dedup, Python protocol.
@@ -112,14 +117,14 @@ void MediaThumbnailHandler::FinishProcess(ExtractedMedia media,
 
   spdlog::info("process: msg {} {}x{} {} bytes sha256={} owner={} (bare) "
                "memo_len={}", image_id, media.width, media.height,
-               bytes->size(), infra::Sha256::Hex(*bytes), bare->oid,
+               bytes->size(), infra::Sha256::Hex(*bytes), *bare,
                memo->size());
 
   ImageRequest request;
   request.set_image_id(image_id);
   request.set_image_data(std::move(*bytes));  // move, no extra copy (v5 §2.3)
   request.set_memo(std::move(*memo));
-  request.set_owner_id(static_cast<std::int64_t>(bare->oid));
+  request.set_owner_id(*bare);
 
   // Outbox first (v5 §2.2 step [4]): if the enqueue fails the record stays
   // PENDING and the retry thread replays it by image_id (now the message id

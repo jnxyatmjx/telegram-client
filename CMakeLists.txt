@@ -99,9 +99,17 @@ add_library(tg_core STATIC
   src/telegram/AuthManager.cpp
   src/telegram/UpdateDispatcher.cpp
   src/telegram/FileDownloader.cpp
+  src/telegram/MessageSender.cpp
+  src/telegram/TdErrors.cpp
   src/features/bot_command/BotCommandHandler.cpp
   src/features/bot_command/CommandParser.cpp
   src/features/auto_search/AutoSearchHandler.cpp
+  src/features/chat_state/ChatStateStore.cpp
+  src/features/chat_state/SqliteChatStateBackend.cpp
+  src/features/commands/ControlCommandsHandler.cpp
+  src/features/commands/DialogScanner.cpp
+  src/features/history_backfill/HistoryBackfill.cpp
+  src/features/media_channels/MediaChannelHandler.cpp
   src/features/media_thumbnail/MediaThumbnailHandler.cpp
   src/features/media_thumbnail/MediaExtractor.cpp
   src/features/media_thumbnail/SearchHandler.cpp
@@ -111,9 +119,10 @@ add_library(tg_core STATIC
   src/infra/Outbox.cpp
   src/infra/Sha256.cpp
   src/infra/FileStore.cpp
+  src/common/Gmt8.cpp
   src/common/Idempotency.cpp
   src/common/MemoCipher.cpp
-  src/features/chat_state/ChatStateStore.cpp)
+  src/common/ResumeTimer.cpp)
 
 target_include_directories(tg_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(tg_core

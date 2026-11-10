@@ -115,6 +115,100 @@ Outbox::Outbox(const std::string& db_path) {
     sqlite3_free(error);
     throw std::runtime_error("outbox: schema failed: " + message);
   }
+  MigrateLegacyImageIds();
+}
+
+void Outbox::MigrateLegacyImageIds() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // Collect legacy rows (old format contains ':' — the wire format
+  // str(message_id) never does).
+  Statement select(db_,
+      "SELECT image_id FROM outbox WHERE instr(image_id, ':') > 0");
+  std::vector<std::string> legacy;
+  while (select.Step(db_)) {
+    legacy.push_back(ColumnText(select.get(), 0));
+  }
+  if (legacy.empty()) return;
+
+  char* error = nullptr;
+  if (sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, &error) !=
+      SQLITE_OK) {
+    const std::string message = error != nullptr ? error : "unknown";
+    sqlite3_free(error);
+    throw std::runtime_error("outbox: legacy migration begin failed: " +
+                             message);
+  }
+  try {
+    int converted = 0;
+    int dropped = 0;
+    int dead_lettered = 0;
+    for (const std::string& old_id : legacy) {
+      // "<chat>:<message_id>:<uid>": message_id = between the FIRST and the
+      // LAST ':' (unique ids are alphanumeric, but be liberal).
+      const std::size_t first = old_id.find(':');
+      const std::size_t last = old_id.rfind(':');
+      const std::string middle =
+          (first != std::string::npos && last != std::string::npos &&
+           last > first)
+              ? old_id.substr(first + 1, last - first - 1)
+              : std::string{};
+      bool numeric = !middle.empty();
+      for (const char c : middle) {
+        if (c < '0' || c > '9') {
+          numeric = false;
+          break;
+        }
+      }
+      if (numeric) {
+        Statement exists(db_, "SELECT 1 FROM outbox WHERE image_id = ?1");
+        BindText(exists.get(), 1, middle);
+        if (exists.Step(db_)) {
+          // A current-format row already exists — it wins; drop the legacy
+          // row (both dedupe to the same server key anyway).
+          Statement del(db_, "DELETE FROM outbox WHERE image_id = ?1");
+          BindText(del.get(), 1, old_id);
+          del.Step(db_);
+          ++dropped;
+        } else {
+          Statement upd(db_,
+              "UPDATE outbox SET image_id = ?1, updated_at = ?2 "
+              "WHERE image_id = ?3");
+          BindText(upd.get(), 1, middle);
+          BindInt(upd.get(), 2, NowMs());
+          BindText(upd.get(), 3, old_id);
+          upd.Step(db_);
+          ++converted;
+        }
+      } else {
+        // Unparseable: never replay it, never wedge the retry loop —
+        // dead-letter for inspection.
+        Statement dead(db_,
+            "UPDATE outbox SET state = ?1, last_status = ?2, updated_at = ?3 "
+            "WHERE image_id = ?4");
+        BindInt(dead.get(), 1,
+                static_cast<std::int64_t>(OutboxState::kDeadLetter));
+        BindText(dead.get(), 2,
+                 "legacy image_id unparseable — dead-lettered by migration");
+        BindInt(dead.get(), 3, NowMs());
+        BindText(dead.get(), 4, old_id);
+        dead.Step(db_);
+        ++dead_lettered;
+      }
+    }
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &error) != SQLITE_OK) {
+      const std::string message = error != nullptr ? error : "unknown";
+      sqlite3_free(error);
+      error = nullptr;
+      throw std::runtime_error("outbox: legacy migration commit failed: " +
+                               message);
+    }
+    spdlog::info("outbox: legacy image_id migration — {} rewritten, {} "
+                 "dropped (new-format row kept), {} dead-lettered",
+                 converted, dropped, dead_lettered);
+  } catch (...) {
+    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    throw;
+  }
 }
 
 Outbox::~Outbox() {

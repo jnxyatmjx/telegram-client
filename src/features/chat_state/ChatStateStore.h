@@ -22,19 +22,29 @@
 // no retry storm. While a resolution is in flight, further replies for the
 // same chat do NOT start a second one.
 //
-// In-memory only in Chunk 1: state dies with the process. Persistence (30 s
-// flush, startup restore) is Chunk 2 — keep the interface ready for it.
+// Persistence (Telethon migration Chunk 2, Python schedule2db 1209-1241 /
+// load_chat_state 790-800): every 30 s a flush pass writes the entries whose
+// watermark advanced within the last 45 s to the backend (local SQLite with
+// the Python `chathis` schema; D1 comes later behind the same interface).
+// On startup Restore() loads the table back. A restored chat_url — including
+// a placeholder — counts as resolved: the no-retry-storm lesson holds across
+// restarts. The flush timer thread lives in Application (like the Outbox
+// retry thread); the store only provides FlushActive().
 //
 // Threading: ApplyReply runs on the gRPC CQ thread, resolution callbacks on
-// the TDLib Receive thread; all state is behind one mutex. Callbacks only
-// touch memory — no blocking anywhere.
+// the TDLib Receive thread, FlushActive/Restore on the Application flush
+// thread; all state is behind one mutex. The backend call in FlushActive
+// happens OUTSIDE the mutex — SQLite I/O must not stall ApplyReply.
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
+#include <features/chat_state/ChatStateBackend.h>
 #include <telegram/TelegramClient.h>
 
 namespace tg::features::chat_state {
@@ -60,7 +70,10 @@ struct ChatEntry {
 
 class ChatStateStore {
  public:
-  explicit ChatStateStore(telegram::ITdSender& sender);
+  // `backend` may be null: the store then runs memory-only (Chunk 1
+  // behaviour; chat_state.enabled=false in config).
+  explicit ChatStateStore(telegram::ITdSender& sender,
+                          std::shared_ptr<ChatStateBackend> backend = nullptr);
 
   ChatStateStore(const ChatStateStore&) = delete;
   ChatStateStore& operator=(const ChatStateStore&) = delete;
@@ -73,6 +86,25 @@ class ChatStateStore {
 
   std::optional<ChatEntry> Get(std::int64_t bare_cid) const;
   std::size_t size() const;
+
+  // Startup restore (Python load_chat_state): loads every persisted row into
+  // memory, parsing init_date/init_time back into last_seen. Must run AFTER
+  // authorization (before the flush thread starts). Rows whose chat_url is
+  // non-empty — placeholder or real — come back as resolved=true and are
+  // never re-resolved; empty URLs resolve on demand at the first reply.
+  // Returns the number of entries restored. Throws std::runtime_error on a
+  // storage failure (startup-critical, same as opening the Outbox).
+  std::size_t Restore();
+
+  // One flush pass (Python schedule2db body): rows for every entry whose
+  // watermark advanced within active_window_seconds of now, with the GMT+8
+  // init_date/init_time (from the watermark advance) and updated_at (from
+  // `now_ms`). No-op without a backend. Returns the number of rows written;
+  // a backend failure is logged and returns 0 (the in-memory state stays
+  // authoritative; the next pass retries).
+  std::size_t FlushActive(std::int64_t now_ms, int active_window_seconds);
+
+  bool persistent() const { return backend_ != nullptr; }
 
  private:
   struct State {
@@ -99,6 +131,8 @@ class ChatStateStore {
   void SetPlaceholder(std::int64_t bare_cid);
 
   telegram::ITdSender& sender_;
+  // Null = memory-only (chat_state.enabled=false).
+  std::shared_ptr<ChatStateBackend> backend_;
   mutable std::mutex mutex_;
   std::unordered_map<std::int64_t, State> chats_;
 };

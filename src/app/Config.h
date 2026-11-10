@@ -84,6 +84,54 @@ struct OutboxConfig {
   int64_t purge_done_after_seconds = 24 * 3600;
 };
 
+// State persistence (Telethon migration Chunk 2; Python chathis /
+// schedule2db 1209-1241). Local SQLite backend with the Python `chathis`
+// schema; D1 comes later behind the same ChatStateBackend interface.
+struct ChatStateConfig {
+  // False = memory-only (Chunk 1 behaviour, nothing restored at startup).
+  bool enabled = false;
+  std::string db_path = "/data/chathis.sqlite";
+  int flush_interval_seconds = 30;   // Python schedule.every(30)
+  int active_window_seconds = 45;    // flush only chats active within 45 s
+};
+
+// Control-chat command surface (/rsme //rsor //xm ...; Python handlersm /
+// handrestore / handlerfetchhistory).
+struct CommandsConfig {
+  bool enabled = true;
+  // TDLib dialog id of the control conversation (where commands are typed).
+  // 0 = the whole command surface is off.
+  std::int64_t control_chat_id = 0;
+  // Trigger directions: outgoing messages in the control chat (the Python
+  // model) and/or messages from bot_command.command_bot_user_id there (the
+  // existing bot model).
+  bool self_commands = true;
+  std::string rsme_command = "/rsme";
+  std::string rsor_command = "/rsor";
+  // Numeric-arg commands that trigger history backfill (bare-id argument).
+  std::vector<std::string> backfill_commands = {"/xm", "/xy", "/ym", "/who"};
+  int dialog_limit = 1202;         // Python get_dialogs(limit=1202)
+  int list_batch_lines = 45;       // handlersm 45-line reply batches
+  int rsor_report_limit = 50;      // handrestore 50-finding truncation
+};
+
+// History backfill engine (Python handlerfetchhistory 918-963).
+struct HistoryBackfillConfig {
+  bool enabled = true;
+  int page_limit = 60;        // Python get_messages(limit=60); TDLib caps 100
+  int flood_pad_seconds = 1;  // Telethon: sleep e.seconds + 1
+};
+
+// Whitelist chats whose media is forwarded automatically (Python handmedias
+// 1255-1269). Off by default: the realtime ImageReply chain already drives
+// the pipeline; this is an opt-in extra (e.g. chats the server never
+// acknowledges).
+struct MediaChannelsConfig {
+  bool enabled = false;
+  std::vector<std::int64_t> chats;  // BARE ids (chathis.chat_id space)
+  std::string rpc = "process";      // "process" | "search"
+};
+
 struct Config {
   TelegramConfig telegram;
   GrpcConfig grpc;
@@ -91,6 +139,10 @@ struct Config {
   BotCommandConfig bot_command;
   AutoSearchConfig auto_search;
   OutboxConfig outbox;
+  ChatStateConfig chat_state;
+  CommandsConfig commands;
+  HistoryBackfillConfig history_backfill;
+  MediaChannelsConfig media_channels;
   int worker_count = 4;
   std::string log_level = "info";
 

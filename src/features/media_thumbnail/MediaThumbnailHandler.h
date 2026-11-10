@@ -24,8 +24,10 @@
 //                                         server dedupes per message.
 //   memo     = AES-GCM(caption)         — MemoCipher ciphertext, never the
 //                                         plaintext caption.
-//   owner_id = bare MTProto chat id     — uint32 via ToBareChatId (range
-//                                         checked; out of range = NOT sent).
+//   owner_id = bare MTProto chat id     — int64 via ToBareChatId64 (no
+//                                         uint32 cap: Telegram user ids
+//                                         above 2^32 exist; the uint32 cap
+//                                         applies only to SearchReq.oid).
 // A request that cannot be built (no bare id / memo cipher unconfigured /
 // encryption failed) is refused loudly and nothing is sent.
 

@@ -4,14 +4,26 @@
 // ID conversion + idempotency key helpers (architecture v5 §1.2, §1.3).
 //
 // The server (Telethon/MTProto) speaks *bare* IDs; TDLib speaks Bot API
-// dialog IDs. Conversions here are the single place where that happens, and
-// every conversion range-checks: out of uint32 range -> nullopt, log an
-// error at the call site and DO NOT send. Never silently truncate to the low
-// 32 bits (different chats would collide on the same oid).
+// dialog IDs. Conversions here are the single place where that happens.
+//
+// Two bare-id widths exist, and callers must pick the right one:
+//   - SearchReq.oid / SearchReq.id are uint32 in the proto, so the search
+//     path uses ToBareChatId / ToBareMessageId and range-checks to
+//     0..UINT32_MAX (out of range -> nullopt, log an error at the call site
+//     and DO NOT send; never silently truncate to the low 32 bits, or
+//     different chats would collide on the same oid).
+//   - ImageRequest.owner_id is int64 in the proto and Python sends it as an
+//     arbitrary-precision int, so the ProcessImages path uses
+//     ToBareChatId64 (no uint32 cap). Telegram has started allocating user
+//     ids above 2^32 (e.g. a bot at 7974301646), and capping owner_id at
+//     uint32 would refuse to send those chats entirely. The same applies to
+//     the ImageReply {"cid"} the server echoes back (ChatStateStore keys
+//     bare ids as int64) and to DialogIdCandidates (the reverse direction).
 
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace tg::common {
 
@@ -37,6 +49,14 @@ inline constexpr std::uint64_t kUint32Max = 4'294'967'295ULL;
 // 0..UINT32_MAX yields nullopt (loud fail upstream).
 std::optional<BareChatId> ToBareChatId(std::int64_t chat_id);
 
+// TDLib Bot API dialog id -> MTProto bare id as int64, for
+// ImageRequest.owner_id (int64 in the proto) and anywhere else the bare id
+// is not a proto uint32 field. Same unmarking as ToBareChatId, but no
+// uint32 cap: Telegram user ids above 2^32 exist (e.g. 7974301646) and must
+// still send. 0 is not a dialog id; a supergroup/channel whose bare value
+// is 0 yields nullopt.
+std::optional<std::int64_t> ToBareChatId64(std::int64_t chat_id);
+
 // TDLib message_id is int53 but really is the per-chat MTProto sequence
 // number, a positive 32-bit value. Out of range -> nullopt.
 std::optional<std::uint32_t> ToBareMessageId(std::int64_t message_id);
@@ -61,6 +81,16 @@ std::string MakeImageId(std::int64_t chat_id, std::int64_t message_id,
 inline std::string MakeWireImageId(std::int64_t message_id) {
   return std::to_string(message_id);
 }
+
+// The reverse direction of ToBareChatId for bare ids arriving OUTSIDE
+// TDLib (Telethon migration Chunk 2): /xm <id> arguments and the
+// ImageReply {"cid"} are bare MTProto ids, but td_api getChat/getMessage
+// need the marked dialog-id form. A bare id alone does not say which peer
+// type it is (Telethon answered this from its session cache), so callers
+// probe getChat over these candidates in order: supergroup/channel first
+// (the media-chat case), then basic group, then user. Bare ids are int64
+// (user ids above 2^32 exist); only non-positive ids have no candidates.
+std::vector<std::int64_t> DialogIdCandidates(std::int64_t bare_chat_id);
 
 }  // namespace tg::common
 

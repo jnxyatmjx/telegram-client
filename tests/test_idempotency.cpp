@@ -66,6 +66,59 @@ TEST(BareId, Int64MinDoesNotOverflow) {
   EXPECT_FALSE(id.has_value());  // magnitude >> uint32 max
 }
 
+// ToBareChatId64: same unmarking as ToBareChatId, but the bare id is
+// int64 — Telegram user ids above 2^32 exist and must still send as
+// ImageRequest.owner_id (int64 in the proto).
+TEST(BareId64, UserIdAboveUint32) {
+  // Real case: a bot at 7974301646 (live test 2026-11-10) was refused by
+  // the uint32-capped conversion; owner_id is int64 and must accept it.
+  const auto id = common::ToBareChatId64(7'974'301'646LL);
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(*id, 7'974'301'646LL);
+}
+
+TEST(BareId64, SupergroupBareAboveUint32) {
+  // chat_id = -(1e12 + 5'000'000'000) -> bare 5'000'000'000.
+  const auto id = common::ToBareChatId64(-1'005'000'000'000LL);
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(*id, 5'000'000'000LL);
+}
+
+TEST(BareId64, BasicGroupDialogId) {
+  const auto id = common::ToBareChatId64(-123456);
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(*id, 123456);
+}
+
+TEST(BareId64, ZeroIsNotADialog) {
+  EXPECT_FALSE(common::ToBareChatId64(0).has_value());
+}
+
+TEST(BareId64, SupergroupMarkAloneHasBareZero) {
+  EXPECT_FALSE(common::ToBareChatId64(-1'000'000'000'000LL).has_value());
+}
+
+TEST(BareId64, Int64MinDoesNotOverflow) {
+  // chat_id == INT64_MIN -> bare = 2^63 - 1e12 = 9223371036854775808,
+  // which still fits in int64 (INT64_MAX is 9223372036854775807), so it
+  // round-trips without overflow.
+  const auto id =
+      common::ToBareChatId64(std::numeric_limits<std::int64_t>::min());
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(*id, 9'223'371'036'854'775'808LL);
+}
+
+TEST(DialogCandidates, BareIdAboveUint32StillHasCandidates) {
+  const auto candidates = common::DialogIdCandidates(7'974'301'646LL);
+  ASSERT_EQ(candidates.size(), 3u);
+  EXPECT_EQ(candidates[2], 7'974'301'646LL);  // user form is the bare id
+}
+
+TEST(DialogCandidates, NonPositiveHasNone) {
+  EXPECT_TRUE(common::DialogIdCandidates(0).empty());
+  EXPECT_TRUE(common::DialogIdCandidates(-5).empty());
+}
+
 TEST(BareMessageId, AcceptsPositiveUint32Range) {
   EXPECT_EQ(common::ToBareMessageId(12345), std::optional<std::uint32_t>(12345));
   EXPECT_EQ(common::ToBareMessageId(4'294'967'295LL),

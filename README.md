@@ -5,18 +5,25 @@ async gRPC media transport (`ImageProcessor::ProcessImages` /
 `SearchImages`, bidirectional streaming, `grpc::CompletionQueue`).
 Architecture: `~/workspace/tdlib-grpc-architecture.md` (v5).
 
-## Status — chunks 1–3 complete (2026-11-08)
+## Status — chunks 1–3 complete (2026-11-08); Telethon migration chunk 2 complete (2026-11-10)
 
 构建任务已全部完成：TDLib 已编好（2026-11-08），tg-client 真实实现已完成，
-`ctest` 9/9 通过（见 Test 一节），二进制 `tg-client 0.1.0` 可正常运行
-`--help` / `--version`。唯一还没做的是真机联调，需要用户提供服务器地址、
-api_id/api_hash、触发 bot 的 user_id 和命令名（见 Open items）。
+二进制 `tg-client 0.1.0` 可正常运行 `--help` / `--version`。唯一还没做的是
+真机联调，需要用户提供服务器地址、api_id/api_hash、触发 bot 的 user_id 和
+命令名（见 Open items）。
 
 - TDLib 已编译：`build/third_party/td/libtdcore.a`（132MB）、`libtdclient.a`，
   此后绝不再重编（见 Build 一节铁律）。
-- 真实实现：44 个源文件，约 4430 行（登录、接收、派发、下载、两个触发器、
-  全异步 gRPC 流、SQLite Outbox、bare-ID 换算）。
-- 测试：9 个 GTest 二进制，含假服务器端到端测试，全部通过。
+- 真实实现：登录、接收、派发、下载、两个触发器、全异步 gRPC 流、
+  SQLite Outbox、bare-ID 换算。
+- 测试：21 个 GTest 二进制，含假服务器端到端测试，全部通过
+  （见 Test 一节）。
+- **Telethon 迁移**：chunk 1（线上协议对齐：memo AES-256-GCM、
+  `image_id = str(message_id)`、bare owner_id、`ImageReply.result`
+  JSON、整图发送）已合入（commit a939e0b）；chunk 2（状态持久化、
+  控制命令面 `/rsme` `/rsor` `/xm` 族、历史回填引擎、媒体频道白名单、
+  Outbox 旧 id 迁移）已实现并通过全部测试；chunk 3（gRPC channel args
+  健壮性 + 文档收尾）未开始。
 
 ## Dependencies (apt, Ubuntu 24.04 / Debian 11 — no vcpkg, no source builds)
 
@@ -794,15 +801,27 @@ of libraries.
   in `Application`, not here.
 - `infra/Outbox` — SQLite persistence in WAL mode: `Put`, `Get`,
   `MarkDone`, `MarkDeadLetter`, `DueForRetry`. One connection behind
-  one mutex, shared by workers and the retry thread.
+  one mutex, shared by workers and the retry thread. On open it runs
+  the legacy-id migration (chunk 2): rows whose image_id contains `:`
+  (the Telethon client's `<chat>:<message_id>:<uid>` keys) are rewritten
+  to the wire format `str(message_id)`; a collision with an existing
+  current-format row drops the legacy row (both dedupe to the same
+  server key); a non-numeric middle segment is dead-lettered for
+  inspection — never replayed, never wedging the retry loop. Idempotent
+  on every reopen.
 - `infra/Sha256`, `infra/FileStore` — SHA-256 hex (log only) and
   `ReadFileBytes` with a max-bytes cap.
 - `common/Idempotency` — `MakeWireImageId` (`str(message_id)`, the wire
   image_id since chunk 1), `MakeImageId`
   (`<chat_id>:<message_id>:<file_unique_id>` — internal SearchReq
-  correlation only) and the bare-ID conversions `ToBareChatId` /
-  `ToBareMessageId` with range checks that fail loudly instead of
-  truncating.
+  correlation only), `DialogIdCandidates` (bare → TDLib probe candidates
+  supergroup → basic group → user) and the bare-ID conversions. Two
+  widths, since chunk 2: `ToBareChatId` / `ToBareMessageId` for the
+  proto-uint32 search fields (uint32 range checks that fail loudly
+  instead of truncating) and `ToBareChatId64` for `ImageRequest.owner_id`
+  (proto int64, NO uint32 cap — Telegram now allocates user ids above
+  2^32, e.g. 7974301646; capping owner_id would refuse those chats
+  entirely).
 - `common/MemoCipher` — AES-256-GCM memo encryption, byte-compatible
   with the Python server (`base64(nonce[12] ‖ ct ‖ tag[16])`, key =
   SHA256(KEYME), 12 random nonce bytes per message). `Clean` applies
@@ -810,14 +829,91 @@ of libraries.
   whitespace, `[]*_ -`). `EncryptWithNonce` exists for the fixed-nonce
   cross-language test vectors only. Uses OpenSSL `EVP` (linked as
   `OpenSSL::Crypto`).
-- `features/chat_state/ChatStateStore` — In-memory per-bare-chat-id
-  state fed by `ImageReply.result` (`{"cid","mid"}` JSON, parsed by
+- `features/chat_state/ChatStateStore` — Per-bare-chat-id state fed by
+  `ImageReply.result` (`{"cid","mid"}` JSON, parsed by
   `ParseReplyResult`): watermark `offset_id` that only increases, a
   `chat_url` resolved on demand over TDLib (getChat candidates
   supergroup → basic group → user, then getSupergroup usernames /
   getBasicGroup upgrade; failures land on the `>>>>Nrror><id>`
-  placeholder and are never retried), and `last_seen`. Memory-only in
-  chunk 1; persistence is chunk 2.
+  placeholder and are never retried), and `last_seen`. Since chunk 2
+  the store flushes through a `ChatStateBackend` (below): every
+  `chat_state.flush_interval_seconds` the Application flush thread
+  writes entries active within `active_window_seconds`, and startup
+  restores the table before the flush thread starts.
+- `features/chat_state/ChatStateBackend` + `SqliteChatStateBackend` —
+  The storage seam behind `ChatStateStore` (chunk 2). The interface
+  (`Upsert` / `LoadAll`) exists so the planned Cloudflare D1 backend —
+  the Python client's backend, sharing the watermark table — can be
+  swapped in without touching the store or the wiring. The default
+  implementation is local SQLite with the exact Python `chathis` schema
+  (column names, order, `ON CONFLICT(chat_id)` upsert —
+  app_client.py schedule2db), a separate database file from the Outbox.
+  Timestamps are GMT+8 civil strings in the Python formats
+  (`common/Gmt8`), so D1 rows written by either deployment parse back
+  in both. Full D1 design: `docs/state-persistence-and-d1.md`.
+- `features/commands/ControlCommandsHandler` — The control-chat command
+  surface (chunk 2; Python `handlersm` / `handlerfetchhistory` /
+  `handrestore`). `/rsme` lists dialogs (channels/groups then users,
+  `list_batch_lines` per reply message); the listing hands out BARE
+  chat ids as `/xm`-family arguments. `/rsor` audits stale/illegal
+  dialogs (scam/fake/left/banned/deactivated/migrated/private reports
+  from `getSupergroupFullInfo`) — reports only, NEVER auto-leaves
+  (Python's auto-LeaveChannelRequest is deliberately not migrated;
+  destructive, Hong to confirm). `/xm` `/xy` `/ym` `/who <bare_chat_id>`
+  start a history backfill. Triggers follow the Python model: an
+  OUTGOING message in the control chat (`self_commands`) and/or the
+  configured bot sending there; incoming media from self is ignored.
+- `features/commands/DialogScanner` — Dialog enumeration for the
+  command surface (chunk 2). This TDLib build has no legacy
+  `getDialogs(offset, …)`: `loadChats` is called repeatedly until the
+  documented 404 "all chats loaded" signal, then `getChats` returns the
+  ordered list; each dialog is then resolved sequentially (getChat →
+  getUser / getBasicGroup / getSupergroup, migrated groups re-entered
+  at their supergroup — Python `resolve_active_chat_entity`), one
+  outstanding request at a time; FloodWaits pause via `ResumeTimer`.
+- `features/history_backfill/HistoryBackfill` — The engine behind
+  `/xm` & co (chunk 2; Python `handlerfetchhistory`). Phase A pages
+  `searchChatMessages` (photoAndVideo filter) BACKWARD from the newest
+  message down to the chat's persisted watermark (8 bytes per id —
+  only the gap is collected, message objects are re-fetched per id in
+  phase B to keep memory flat). Phase B replays the gap ASCENDING
+  through the realtime pipeline (`getMessage` →
+  `MediaThumbnailHandler::SendProcessImages`), so `image_id =
+  str(message_id)` dedupes server-side and the watermark re-read per
+  batch skips what the server already confirmed (resume-friendliness).
+  FloodWait (429 + retry-after, `telegram/TdErrors`) pauses the job for
+  `retry_after + flood_pad_seconds` via `common/ResumeTimer`. Unknown
+  peers are dropped with a notice BEFORE any search (Python checks
+  `get_entity` first); a duplicate Start for a running chat is refused
+  with a notice; each dispatch re-reads the CURRENT watermark so a
+  restart never re-downloads covered messages.
+- `features/media_channels/MediaChannelHandler` — Whitelist chats whose
+  media goes through the pipeline automatically (chunk 2; Python
+  `handmedias` main chain). OFF by default — the realtime ImageReply
+  chain already drives the pipeline. Chats are BARE ids (same space as
+  `chathis.chat_id`); `rpc` selects ProcessImages (default) or
+  SearchImages. First-claimant-wins with auto_search when both match a
+  chat: registration order decides.
+- `telegram/MessageSender` — The single sendMessage path (chunk 2;
+  Python `SendText`). Splits at the 4096-character hard limit
+  (line boundaries preferred — Telethon's 45-line batches can exceed
+  the limit and TDLib has no auto-split), disables link previews on
+  every chunk, sends markdown fire-and-forget (a failed reply is a
+  lost reply; the command can be re-issued — matching Python).
+- `telegram/TdErrors` — TDLib 429 classification for the rate-limited
+  calls added in chunk 2: TDLib embeds retry-after in the error MESSAGE
+  text (`"Too Many Requests: retry after <seconds>"` — no structured
+  field in this TDLib version); `RetryAfterSeconds` parses it,
+  `IsFloodWait` matches code 429.
+- `common/Gmt8` — Fixed-offset GMT+8 civil time (chunk 2), the analogue
+  of Python's `gmt8_now()` + strftime: `Gmt8Date` (`YYYYMMDD`),
+  `Gmt8Clock` (`HH:MM:SS`), `Gmt8DateTime` (`YYYY-MM-DD HH:MM:SS`) —
+  the exact `chathis` timestamp formats (SURVEY §8.5-4).
+- `common/ResumeTimer` — One-slot delay scheduler (chunk 2) for
+  FloodWait backoff: Telethon does `await asyncio.sleep(e.seconds + 1)`;
+  the C++ side has no event loop and no thread may block on I/O, so the
+  pause is a deadline and this thread fires when it passes. Used by
+  `HistoryBackfill` and `DialogScanner`.
 - `common/Logger` — spdlog setup (level from config).
 
 ## gRPC code generation
@@ -920,6 +1016,31 @@ single connection, or when you want one dead connection to cost only
 spread, and exactly what breaks and recovers when a connection dies —
 is documented under Architecture → "Parallel gRPC connections (lanes)".
 
+### Feature toggles (Telethon migration chunk 2)
+
+Four new config blocks (all documented inline in
+`config/config.example.yaml`; defaults keep today's behaviour — nothing
+auto-forwards, no commands answered until `features.commands.control_chat_id`
+is set):
+
+- `features.commands` — the control-chat command surface. Set
+  `control_chat_id` (TDLib dialog id of the control conversation; 0 =
+  commands off) and optionally `self_commands: true` so the account itself
+  typing `/rsme` / `/rsor` / `/xm <bare_chat_id>` triggers them (the Python
+  model). `dialog_limit`, `list_batch_lines`, `rsor_report_limit` tune the
+  listing/audit sizes.
+- `features.history_backfill` — the `/xm` engine. `page_limit: 60` (TDLib
+  caps 100), `flood_pad_seconds: 1` (Telethon sleeps `e.seconds + 1`).
+- `features.media_channels` — whitelist auto-forward (Python `handmedias`),
+  OFF by default; `chats` are BARE ids, `rpc` picks `process` (Python main
+  chain) or `search`.
+- `chat_state` — watermark persistence: `enabled: false` until you provide
+  a `db_path` (default `/data/chathis.sqlite`); flushes every
+  `flush_interval_seconds` (30 s), entries active within
+  `active_window_seconds` (45 s), schema and GMT+8 fields byte-compatible
+  with the Python `chathis` table. The D1 backend arrives later behind the
+  same interface (`docs/state-persistence-and-d1.md`).
+
 ## Run
 
 ```bash
@@ -959,7 +1080,7 @@ program's own log lines.
 ctest --test-dir build/tests --output-on-failure
 ```
 
-15 test binaries, all green (2026-11-10, ~5.3 s total):
+21 test binaries, all green (2026-11-10, Telethon migration chunk 2):
 
 | test | covers |
 |---|---|
@@ -968,7 +1089,7 @@ ctest --test-dir build/tests --output-on-failure
 | test_memo_cipher | chunk 1: Python-compatible caption cleaning (case by case), cross-language AES-GCM vectors in BOTH directions (Python ciphertext decrypted here; fixed-nonce C++ ciphertext byte-equal to Python's), round-trips incl. every base64 padding length, tamper/wrong-key rejection, a DISABLED live token dump for re-running the C++→Python check |
 | test_chat_state | chunk 1: `{"cid","mid"}` parsing, watermark only increases, supergroup/basic/user URL forms, migrated group follows its supergroup, placeholder on failure with NO retry storm, single in-flight resolution |
 | test_media_extractor | photo largest-tier (full image), tier tie-break, file-less tier skip, video/animation thumbnail-only, document `image/*`/`video/*`/reject |
-| test_outbox | PENDING -> DONE / retry / dead-letter / replay |
+| test_outbox | PENDING -> DONE / retry / dead-letter / replay; legacy-id migration on reopen: numeric-middle `<chat>:<msg>:<uid>` rewritten to `str(message_id)` and kept pending, collision keeps the current-format row, converted rows dedupe among themselves, unparseable rows dead-letter, migration idempotent on every reopen |
 | test_bot_command | only the configured bot's command accepted, arg parsing; wire request checks: `image_id = str(message_id)`, `memo` = KEYME-encrypted cleaned caption (decrypt-verified), `owner_id` = bare id; `SecondCommandCompletesWhileFirstDownloadPending` proves async message processing (B completes while A's download is still pending) |
 | test_auto_search | allowlisted chat triggers Search only (disabled by default) |
 | test_handler_registry | dispatcher registration / dispatch |
@@ -978,6 +1099,12 @@ ctest --test-dir build/tests --output-on-failure
 | test_auth_prompt | terminal prompts for the login code and 2FA password (env override, empty input fails fast) |
 | test_update_logging | `telegram.log_updates` logs every update with type + content, silent when off |
 | test_streamer_pool | 3-lane pool against a fake server: one stream per lane, 9 requests dealt 3 per lane, every reply round-trips |
+| test_message_sender | chunk 2: 4096-char split (line boundaries kept intact, hard-split oversized lines, empty text), multi-message sends, errors logged not thrown |
+| test_chat_state_backend | chunk 2: `common/Gmt8` formats (fixed offset, UTC-midnight date roll, parse round-trip/garbage), SQLite backend upsert/load/reopen, flush→restore round trip (url + watermark), 45 s active window skips quiet chats, flushed fields match the Python `chathis` shape |
+| test_history_backfill | chunk 2: gap replay through the realtime pipeline (oldest first, `str(message_id)`), watermark terminates collection, per-batch watermark re-read skips covered messages, FloodWait pauses and the resume timer continues, unknown peer dropped with a notice BEFORE any search, duplicate Start refused while a job is active, invalid bare ids refused, disabled engine refuses everything |
+| test_dialog_scan | chunk 2: `loadChats`/`getChats` enumeration for all chat kinds, supergroup full-info audit findings, migrated groups listed as their supergroup, FloodWait retries the same step, enumeration failure aborts, unnamed/broken chats skipped, second scan refused while running; view-model wording/links match Python |
+| test_control_commands | chunk 2: command classification, `/rsme` batching (users first, one line per dialog, empty input), `/rsor` clean + findings reports (capped), trigger directions (self-commands / bot), backfill start through the pipeline + refusals |
+| test_media_channels | chunk 2: disabled by default never claims, only whitelisted chats and only media claimed, `rpc: process` runs the realtime pipeline, `rpc: search` queues a search request |
 
 Note: the socket-based tests (test_async_streamer, test_e2e_fake_server,
 test_streamer_pool)
@@ -998,6 +1125,12 @@ Per IMPLEMENTATION_TASK.md / v5 §7 — a live run is NOT possible yet:
 3. Bot user_id (`command_bot_user_id`) and the real command names
    (`/process`, `/search` are placeholders).
 4. Auto-search chat allowlist (phase 2; disabled by default).
+5. Cloudflare D1 credentials (Hong, via Secure Vault): `CLOUDFLARE_ACCOUNT_ID`,
+   `CLOUDFLARE_API_TOKEN`, `D1_DATABASE_ID` — for the chat-state backend swap
+   (SQLite default works today; design in `docs/state-persistence-and-d1.md`).
+6. Restricted private channels: Python auto-left them during `/rsme`
+   (LeaveChannelRequest — destructive); the C++ port only marks them ⚠️.
+   Confirm whether to migrate the auto-leave or keep report-only.
 
 ## Layout (v5 §3.7)
 
@@ -1007,19 +1140,29 @@ proto/image_stream.proto            (verbatim, do not edit)
 src/main.cpp
 src/app/            Application, Config, AppContext
 src/telegram/       TelegramClient, AuthManager, UpdateDispatcher,
-                    UpdateHandler, FileDownloader
+                    UpdateHandler, FileDownloader, MessageSender (chunk 2),
+                    TdErrors (chunk 2: 429/retry-after parsing)
 src/features/       bot_command/ (BotCommandHandler, CommandParser)
                     auto_search/ (AutoSearchHandler, disabled by default)
                     chat_state/ (ChatStateStore: {"cid","mid"} watermarks,
-                    chat-URL resolution — chunk 1, in-memory)
+                    chat-URL resolution; ChatStateBackend +
+                    SqliteChatStateBackend — chunk 2 persistence)
+                    commands/ (ControlCommandsHandler, DialogScanner —
+                    chunk 2: /rsme, /rsor, /xm family)
+                    history_backfill/ (HistoryBackfill — chunk 2 engine
+                    behind /xm & co)
+                    media_channels/ (MediaChannelHandler — chunk 2
+                    whitelist auto-forward, disabled by default)
                     media_thumbnail/ (MediaThumbnailHandler, MediaExtractor, SearchHandler)
 src/transport/      GrpcTransport, AsyncStreamer (template),
                     StreamerPool (template), ProcessImagesClient,
                     SearchImagesClient
-src/infra/          Outbox (SQLite), Sha256, FileStore
+src/infra/          Outbox (SQLite + legacy-id migration, chunk 2),
+                    Sha256, FileStore
 src/common/         Logger (spdlog), Idempotency (bare-ID conversion,
                     MakeImageId/MakeWireImageId), MemoCipher (AES-256-GCM
-                    memo, chunk 1)
+                    memo, chunk 1), Gmt8 (chunk 2), ResumeTimer (chunk 2)
+docs/               state-persistence-and-d1.md (chunk 2)
 tests/              GTest unit tests
 config/             config.example.yaml
 third_party/td/     TDLib shallow clone (commit 4c6377a; built 2026-11-08,

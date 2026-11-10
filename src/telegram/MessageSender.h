@@ -1,0 +1,54 @@
+#ifndef TG_TELEGRAM_MESSAGESENDER_H_
+#define TG_TELEGRAM_MESSAGESENDER_H_
+
+// MessageSender — the single sendMessage path (Telethon migration Chunk 2,
+// SURVEY §7.2-6 "SendText"). Python replies with event.reply(...,
+// link_preview=False, parse_mode="markdown") in /rsme 45-line batches;
+// TDLib has no auto-split, and Telethon's 45-line batches can exceed the
+// 4096-character hard limit (SURVEY §8.5-2) — so this wrapper splits at
+// 4096 chars (line boundaries preferred) and disables link previews on
+// every chunk.
+//
+// Markdown dialect: TDLib parses its own Markdown flavour, not Telethon's;
+// the generated content (inline code in backticks, [text](url) links) is
+// compatible — free-form user markdown may render differently (SURVEY
+// §8.5-1).
+//
+// Fire-and-forget: sends are async, errors are logged with the chat id and
+// the first 200 chars of the chunk. No retry — a failed reply is a lost
+// reply (the command can be re-issued), matching the Python client.
+
+#include <telegram/TelegramClient.h>
+
+#include <cstddef>
+#include <string>
+#include <vector>
+
+namespace tg::telegram {
+
+class MessageSender {
+ public:
+  // Telegram's hard per-message limit in characters.
+  static constexpr std::size_t kMaxMessageChars = 4096;
+
+  explicit MessageSender(ITdSender& sender);
+
+  // Splits `text` into chunks of at most max_chars characters: whole lines
+  // are kept together while they fit; a single line longer than the limit
+  // is hard-split at the limit. Empty text produces one empty chunk (an
+  // intentional empty reply still sends).
+  static std::vector<std::string> SplitForTelegram(
+      const std::string& text,
+      std::size_t max_chars = kMaxMessageChars);
+
+  // Sends `text` as markdown with link previews disabled, in as many
+  // messages as the 4096-char split needs. Safe from any thread.
+  void SendMarkdown(std::int64_t chat_id, const std::string& text) const;
+
+ private:
+  ITdSender& sender_;
+};
+
+}  // namespace tg::telegram
+
+#endif  // TG_TELEGRAM_MESSAGESENDER_H_

@@ -11,6 +11,15 @@ telegram:
   phone: "${TG_PHONE}"      # user account (not a bot token)
   database_directory: "/data/tdlib/db"    # chmod 700; TDLib database is encrypted
   files_directory: "/data/tdlib/files"
+  # NOTE (memory-only downloads): TDLib's downloadFile is the ONLY way to
+  # fetch image bytes — a Telegram message carries only file metadata
+  # (file_id, size), not bytes — and it always writes the downloaded file
+  # here. The client itself never writes a file; it only reads the bytes
+  # back into memory (gRPC + Outbox BLOB). To keep downloads off persistent
+  # disk, point this at a tmpfs mount (e.g. /dev/shm/tdlib-files): TDLib
+  # then writes to RAM and the files vanish on reboot. There is no code
+  # change that removes the download step — without it there are no bytes
+  # to send or store.
   encryption_key: "${TG_TDLIB_ENCRYPTION_KEY}"
   log_updates: false   # true: log every incoming Telegram update (type + full content) at info level — very verbose
 

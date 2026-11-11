@@ -32,8 +32,21 @@
 // the same file ride along (they only append callbacks), so a rate-limited
 // burst cannot spin: nothing is re-sent before retry-after passes.
 //
+// Cache cleanup (deleteFile, Hong requirement 2026-11-11): every
+// DownloadAsync call counts as one consumer (use_count_, shared file_ids —
+// a forwarded photo, or the same message processed twice — must not have
+// one consumer delete the file out from under another). A consumer calls
+// Release(file_id) ONCE, after it has stored the bytes (Outbox BLOB for
+// ProcessImages / enqueued SearchReq for SearchImages) — never while it
+// may still read the file. When the count reaches 0 the local cached file
+// in telegram.files_directory is removed from TDLib's cache with
+// td_api::deleteFile (fire-and-forget, best-effort: an error is logged,
+// never fatal). A FAILED download deletes nothing (the file may not exist
+// or be partial — TDLib cache is left as-is); FailAll (shutdown) deletes
+// nothing either.
+//
 // Receive thread rules: OnUpdateFile only completes callbacks (cheap); the
-// map is guarded by one mutex (v5 §3.3). Callbacks are always invoked
+// maps are guarded by one mutex (v5 §3.3). Callbacks are always invoked
 // WITHOUT holding the mutex.
 
 #include <td/telegram/td_api.h>
@@ -68,7 +81,16 @@ class FileDownloader {
   explicit FileDownloader(ITdSender& sender, FloodRetry* flood_retry = nullptr);
 
   // Async: registers on_done and returns immediately. No thread blocks.
+  // Counts one consumer for the file: the caller must Release(file_id)
+  // after it has consumed the bytes (see the cache-cleanup note above).
   void DownloadAsync(std::int32_t file_id, DownloadCallback on_done);
+
+  // Drops one consumer's claim on the file (any thread; same mutex_ as the
+  // download bookkeeping). At count 0 the cached local file is deleted from
+  // TDLib's cache via td_api::deleteFile — fire-and-forget, best-effort:
+  // the response is ignored (errors logged, never fatal). Unknown file_id /
+  // already-zero count: no-op (defensive).
+  void Release(std::int32_t file_id);
 
   // Future-based wrapper (tests / simple callers): resolves with the local
   // file path once downloaded; rejects (std::runtime_error) on request
@@ -105,6 +127,14 @@ class FileDownloader {
   // MaybeComplete/FailOne), which is what keeps concurrent callers from
   // double-sending while a flood retry is scheduled.
   std::map<std::int32_t, int> flood_attempts_;
+  // Consumers that still need the local file (deleteFile refcount): one
+  // increment per DownloadAsync call, one decrement per Release. At 0 the
+  // cached file is deleted. Incremented on EVERY DownloadAsync call —
+  // including during the download itself — so a consumer cannot release a
+  // file another consumer has not received yet. Cleared by FailAll (no
+  // deletes during shutdown); decremented by FailOne (a failed download
+  // has no consumers left, and nothing is deleted for it).
+  std::map<std::int32_t, int> use_count_;
 };
 
 }  // namespace tg::telegram

@@ -89,9 +89,16 @@ void MediaThumbnailHandler::FinishProcess(ExtractedMedia media,
                                           std::string local_path,
                                           app::AppContext& ctx) const {
   // [3] read bytes, hash (log only), build the request.
+  // Every path below either stores the bytes in the Outbox BLOB or fails
+  // before storing them; either way this consumer is done with the local
+  // file and drops its claim (files_.Release). Release AFTER the Put —
+  // deleting the cached file before the BLOB store would break a consumer
+  // that has not read it yet (shared file_id) or leave nothing for a
+  // never-stored retry.
   auto bytes = infra::ReadFileBytes(local_path, ctx.config.media_thumbnail.max_thumb_bytes);
   if (!bytes) {
     spdlog::error("process: cannot read downloaded media: {}", local_path);
+    files_.Release(media.file_id);
     return;
   }
 
@@ -103,6 +110,7 @@ void MediaThumbnailHandler::FinishProcess(ExtractedMedia media,
     spdlog::error("process: chat_id {} is not a valid bare id — NOT "
                   "sending",
                   media.chat_id);
+    files_.Release(media.file_id);
     return;
   }
   //   image_id: str(message_id) — message-level dedup, Python protocol.
@@ -112,6 +120,7 @@ void MediaThumbnailHandler::FinishProcess(ExtractedMedia media,
   if (!memo) {
     spdlog::error("process: memo encryption failed for message {} — NOT "
                   "sending (never send plaintext)", media.message_id);
+    files_.Release(media.file_id);
     return;
   }
 
@@ -153,6 +162,12 @@ void MediaThumbnailHandler::FinishProcess(ExtractedMedia media,
   record.state = infra::OutboxState::kPending;
   record.next_retry_at_ms = now_ms + ctx.config.grpc.ack_timeout_ms;
   ctx.outbox.Put(record);
+
+  // Bytes are safe in the Outbox BLOB — this consumer is done with the
+  // local file. Release only NOW (deleteFile cache cleanup fires at the
+  // last consumer): retry uses the BLOB, not the file, so this also holds
+  // when the Enqueue below fails and the record stays PENDING.
+  files_.Release(media.file_id);
 
   if (!ctx.process_images.Enqueue(std::move(request), kEnqueueTimeout)) {
     // Not fatal: PENDING record is picked up by the Outbox retry thread.

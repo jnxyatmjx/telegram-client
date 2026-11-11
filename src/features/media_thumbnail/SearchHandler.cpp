@@ -99,17 +99,26 @@ void SearchHandler::OnDownloaded(
 
 void SearchHandler::FinishSearch(ExtractedMedia media, std::string local_path,
                                  app::AppContext& ctx) const {
+  // Every path below either moves the bytes into the (enqueued or dropped)
+  // SearchReq or fails before building it; either way this consumer is done
+  // with the local file and drops its claim (files_.Release -> deleteFile
+  // cache cleanup at the last consumer). SearchReq is NOT in the Outbox, so
+  // there is nothing after FinishSearch that would read the file again.
   auto bytes =
       infra::ReadFileBytes(local_path, ctx.config.media_thumbnail.max_thumb_bytes);
   if (!bytes) {
     spdlog::error("search: cannot read downloaded thumbnail: {}", local_path);
+    files_.Release(media.file_id);
     return;
   }
 
   // Bare IDs again (same conversion as the kick-off stage; both are pure).
   const auto oid = common::ToBareChatId(media.chat_id);
   const auto bare_message_id = common::ToBareMessageId(media.message_id);
-  if (!oid || !bare_message_id) return;  // already checked; cannot happen
+  if (!oid || !bare_message_id) {
+    files_.Release(media.file_id);
+    return;  // already checked; cannot happen
+  }
 
   const std::string image_id =
       common::MakeImageId(media.chat_id, media.message_id, media.file_unique_id);
@@ -125,7 +134,14 @@ void SearchHandler::FinishSearch(ExtractedMedia media, std::string local_path,
   correlation_.Register(oid->oid, *bare_message_id,
                         {media.chat_id, media.message_id, image_id});
 
-  if (!ctx.search_images.Enqueue(std::move(request), kEnqueueTimeout)) {
+  // The bytes are now owned by the request — whether it is enqueued or
+  // dropped (a dropped SearchReq is recovered by re-triggering, not by
+  // re-reading the file), this consumer is done with the local file.
+  const bool enqueued =
+      ctx.search_images.Enqueue(std::move(request), kEnqueueTimeout);
+  files_.Release(media.file_id);
+
+  if (!enqueued) {
     // SearchReq is not in the Outbox: re-triggering the search is the
     // recovery path (v5 §2.4).
     spdlog::warn("search: {} write queue full; SearchReq dropped (not replayed)",

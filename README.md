@@ -16,7 +16,7 @@ Architecture: `~/workspace/tdlib-grpc-architecture.md` (v5).
   此后绝不再重编（见 Build 一节铁律）。
 - 真实实现：登录、接收、派发、下载、两个触发器、全异步 gRPC 流、
   SQLite Outbox、bare-ID 换算。
-- 测试：23 个 GTest 二进制，含假服务器端到端测试，全部通过
+- 测试：24 个 GTest 二进制，含假服务器端到端测试，全部通过
   （见 Test 一节）。
 - **Telethon 迁移**：chunk 1（线上协议对齐：memo AES-256-GCM、
   `image_id = str(message_id)`、bare owner_id、`ImageReply.result`
@@ -474,6 +474,16 @@ tg-client (1 process)
   `BotCommandTest.SecondCommandCompletesWhileFirstDownloadPending`
   (message A's download takes 2 s, B's is instant; B's request reaches
   the streamer queue while A is still downloading).
+- **Downloaded files are deleted from TDLib's cache (deleteFile,
+  2026-11-11).** Every `FileDownloader::DownloadAsync` call counts one
+  consumer (shared file_ids share one download); the consumer calls
+  `Release` only AFTER the bytes are stored (Outbox BLOB for ProcessImages,
+  enqueued `SearchReq` for SearchImages), and at zero claims a
+  fire-and-forget `td_api::deleteFile` removes the cached file from
+  `telegram.files_directory` — best-effort, errors logged not fatal.
+  No delete on download failure (file may not exist / be partial) and no
+  delete during shutdown (`FailAll` clears the claims). Regression tests:
+  `tests/test_delete_file.cpp`.
 - **Async gRPC state machine (one per stream).**
   `CREATE` (PrepareAsync + StartCall) → `CONNECTING`/`RUNNING`
   (issue a Read immediately; Write when the queue is non-empty and no
@@ -754,6 +764,15 @@ of libraries.
   while a retry is pending, later downloads of the same file ride along —
   there is never a second request before retry-after passes; without a
   scheduler the old fail-fast behaviour stays).
+  **Cache cleanup (deleteFile, 2026-11-11):** every `DownloadAsync` call
+  counts one consumer; `Release(file_id)` drops the claim, and at zero the
+  cached local file is removed from TDLib's cache with a fire-and-forget
+  `td_api::deleteFile` (best-effort — an error is logged, never fatal) so
+  downloads do not accumulate in `telegram.files_directory`. Handlers call
+  `Release` only after the bytes are stored (Outbox BLOB for ProcessImages /
+  enqueued `SearchReq` for SearchImages); shared file_ids (forwarded photo,
+  same message twice) delete exactly once, at the last `Release`. A failed
+  download deletes nothing; shutdown (`FailAll`) deletes nothing.
   `Download(file_id)` (future) is a thin wrapper for
   tests; its timeout is enforced by the caller via `wait_for`.
 - `features/bot_command/BotCommandHandler` + `CommandParser` — Mode (a)
@@ -783,12 +802,18 @@ of libraries.
   Fails fast before downloading when the chat id does not fit the bare
   uint32 range or `KEYME` is unconfigured; an encryption failure sends
   nothing. Enqueue failure leaves the record PENDING for the retry
-  thread.
+  thread. After the Outbox `Put` (bytes safe in the BLOB) — and on every
+  early-return path — the handler drops its claim on the local file
+  (`FileDownloader::Release` → `deleteFile` at the last consumer); the
+  retry replays from the BLOB, never from the file.
 - `features/media_thumbnail/SearchHandler` — The `/search` chain. Same
   extraction/download path, but builds a `SearchReq` with the bare-ID
   conversion and range checks, registers `(oid, id)` in the correlation
   table, and enqueues to the SearchImages stream. Never writes to the
-  Outbox.
+  Outbox. After the enqueue attempt (a dropped `SearchReq` is recovered
+  by re-triggering, not by re-reading the file) — and on every
+  early-return path — the handler drops its claim on the local file
+  (`FileDownloader::Release` → `deleteFile` at the last consumer).
 - `transport/GrpcTransport` — A pool of `grpc.connections` Channels
   (one per lane, one TCP/HTTP2 connection each, all to the same target;
   1 by default). TLS or insecure from config. Every channel is built with
@@ -1255,7 +1280,7 @@ program's own log lines.
 ctest --test-dir build/tests --output-on-failure
 ```
 
-23 test binaries, all green (2026-11-10, Telethon migration chunk 3):
+24 test binaries, all green (2026-11-11, deleteFile cache cleanup):
 
 | test | covers |
 |---|---|
@@ -1282,6 +1307,7 @@ ctest --test-dir build/tests --output-on-failure
 | test_media_channels | chunk 2: disabled by default never claims, only whitelisted chats and only media claimed, `rpc: process` runs the realtime pipeline, `rpc: search` queues a search request |
 | test_flood_retry | chunk 3: `TdErrors` 429/retry-after parsing (code match, wire-text parse, unparseable → `RetryAfterOr` fallback); `FloodRetry` (fires after retry-after + pad, fallback delay when the text carries no number, attempt cap drops, Shutdown drops pending, Schedule after Shutdown refused, multiple pending all run); FileDownloader flood path (same-file retry lands once, cap gives up and fails the future, ride-along callbacks fail with the give-up, null scheduler keeps the old fail-fast, no double send while a retry is pending) |
 | test_grpc_channel_args | chunk 3: `MakeChannelArgs` — keepalive trio, 64 MiB send/receive caps, HTTP/2 lookahead + write buffer, per-lane subchannel-pool flag; `0` keeps the gRPC default for that arg; config values reach the raw `grpc_channel_args` (read back via `c_channel_args()` — gRPC 1.51 has no getter API) |
+| test_delete_file | deleteFile cache cleanup: one consumer downloads → `Release` sends `deleteFile` exactly once with the right file_id (and only after the bytes are delivered); shared file_id with the download in flight → both callbacks from ONE request, first `Release` deletes nothing, second deletes exactly once; failed download deletes nothing and the downloader stays usable; `Release` of an unknown file_id / double `Release` is a no-op; a `deleteFile` error response is swallowed (best-effort) |
 
 Note: the socket-based tests (test_async_streamer, test_e2e_fake_server,
 test_streamer_pool)

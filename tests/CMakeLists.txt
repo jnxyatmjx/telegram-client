@@ -26,7 +26,8 @@ set(TG_TEST_SOURCES
   test_control_commands.cpp
   test_media_channels.cpp
   test_flood_retry.cpp
-  test_grpc_channel_args.cpp)
+  test_grpc_channel_args.cpp
+  test_delete_file.cpp)
 
 foreach(src IN LISTS TG_TEST_SOURCES)
   get_filename_component(test_name "${src}" NAME_WE)

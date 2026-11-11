@@ -21,6 +21,10 @@ void FileDownloader::DownloadAsync(std::int32_t file_id,
     auto& callbacks = pending_[file_id];
     callbacks.push_back(std::move(on_done));
     already_pending = callbacks.size() > 1;
+    // One consumer claim per call: the caller must Release(file_id) after
+    // it has stored the bytes, and the cached file is deleted when the
+    // last claim is dropped (deleteFile cache cleanup).
+    ++use_count_[file_id];
   }
   if (already_pending) {
     // A downloadFile request for this file is already in flight (or its
@@ -30,6 +34,41 @@ void FileDownloader::DownloadAsync(std::int32_t file_id,
     return;
   }
   SendDownloadFile(file_id);
+}
+
+void FileDownloader::Release(std::int32_t file_id) {
+  bool delete_now = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = use_count_.find(file_id);
+    // Defensive: no entry / already at zero — nothing to release.
+    if (it == use_count_.end() || it->second <= 0) return;
+    if (--it->second == 0) {
+      use_count_.erase(it);
+      delete_now = true;
+    }
+  }
+  if (!delete_now) return;
+  // Last consumer is done with the bytes: remove the cached local file
+  // (telegram.files_directory) from TDLib's cache so completed downloads
+  // do not accumulate on disk. Fire-and-forget, best-effort: an error is
+  // logged and never retried, and it must never be fatal.
+  spdlog::info("file_downloader: last consumer done — deleteFile {}",
+               file_id);
+  auto request = td_api::make_object<td_api::deleteFile>();
+  request->file_id_ = file_id;
+  sender_.Send(
+      std::move(request),
+      [file_id](td::ClientManager::Response&& response) {
+        if (response.object == nullptr) return;  // shutdown filler
+        if (response.object->get_id() == td_api::error::ID) {
+          const auto error =
+              td_api::move_object_as<td_api::error>(response.object);
+          spdlog::warn("file_downloader: deleteFile {} failed (ignored): "
+                       "code {}: {}", file_id, error->code_,
+                       error->message_);
+        }
+      });
 }
 
 void FileDownloader::SendDownloadFile(std::int32_t file_id) {
@@ -166,6 +205,15 @@ void FileDownloader::FailOne(std::int32_t file_id, const std::string& error) {
     if (it == pending_.end()) return;
     callbacks = std::move(it->second);
     pending_.erase(it);
+    // The callbacks fire with an error, so no consumer will use the file:
+    // drop one claim per fired callback. Decrement — do NOT erase the
+    // whole entry — because an earlier successful download of the same
+    // file_id may still have live consumers holding claims (they Release
+    // later). NO deleteFile on failure: the file may not exist or be
+    // partial; TDLib's cache is left as-is (pre-existing behaviour).
+    int& count = use_count_[file_id];
+    count -= static_cast<int>(callbacks.size());
+    if (count <= 0) use_count_.erase(file_id);
   }
   for (auto& callback : callbacks) {
     callback(DownloadResult{"", error});
@@ -185,6 +233,10 @@ void FileDownloader::FailAll(const std::string& reason) {
     failed = std::move(pending_);
     pending_.clear();
     flood_attempts_.clear();
+    // Shutdown: the process is exiting, so no consumer will consume and no
+    // deleteFile is sent (clearing the claims prevents a straggler Release
+    // from deleting during teardown).
+    use_count_.clear();
   }
   for (auto& [id, callbacks] : failed) {
     (void)id;

@@ -407,11 +407,11 @@ TEST(ControlCommandStatics, RenderRsmeBatchesUsersFirstThenChats) {
   // 4 lines / 2 per batch = 2 messages, USERS first.
   ASSERT_EQ(batches.size(), 2u);
   EXPECT_EQ(batches[0],
-            "1. [Alice](https://t.me/alice_h)\t`/ym 200 Alice`\t\n\n"
-            "2. **🎯Bob🎯**\t`/who 300`\t\n\n");
+            "1\\. [Alice](https://t.me/alice_h)\t`/ym 200 Alice`\t\n\n"
+            "2\\. **🎯Bob🎯**\t`/who 300`\t\n\n");
   EXPECT_EQ(batches[1],
-            "1. [👉👉👈](https://t.me/deals)\t`/xm 100 Deals&Steals`\t\n\n"
-            "2. **⚠️Priv Channel⚠️**\t`/who 400 Priv Channel`\t\n\n");
+            "1\\. [👉👉👈](https://t.me/deals)\t`/xm 100 Deals&Steals`\t\n\n"
+            "2\\. **⚠️Priv Channel⚠️**\t`/who 400 Priv Channel`\t\n\n");
 }
 
 TEST(ControlCommandStatics, RenderRsmeBatchesEscapesMarkdownV2Specials) {
@@ -428,10 +428,10 @@ TEST(ControlCommandStatics, RenderRsmeBatchesEscapesMarkdownV2Specials) {
   // Users and chats batch separately (users first), so two batches.
   ASSERT_EQ(batches.size(), 2u);
   EXPECT_EQ(batches[0],
-            "1. [Cool\\_Channel\\*Star](https://t.me/cool)\t`/ym 200 "
+            "1\\. [Cool\\_Channel\\*Star](https://t.me/cool)\t`/ym 200 "
             "Cool_Channel*Star`\t\n\n");
   EXPECT_EQ(batches[1],
-            "1. **⚠️Best\\*Deals⚠️**\t`/who 400 Best*Deals`\t\n\n");
+            "1\\. **⚠️Best\\*Deals⚠️**\t`/who 400 Best*Deals`\t\n\n");
 }
 
 TEST(ControlCommandStatics, RenderRsmeBatchesOneLinePerMessage) {
@@ -442,9 +442,9 @@ TEST(ControlCommandStatics, RenderRsmeBatchesOneLinePerMessage) {
       commands::ControlCommandsHandler::RenderRsmeBatches(views, 1);
   ASSERT_EQ(batches.size(), 2u);
   EXPECT_EQ(batches[0],
-            "1. [Alice](https://t.me/alice_h)\t`/ym 200 Alice`\t\n\n");
+            "1\\. [Alice](https://t.me/alice_h)\t`/ym 200 Alice`\t\n\n");
   EXPECT_EQ(batches[1],
-            "1. [👉👉👈](https://t.me/deals)\t`/xm 100 Deals`\t\n\n");
+            "1\\. [👉👉👈](https://t.me/deals)\t`/xm 100 Deals`\t\n\n");
 }
 
 TEST(ControlCommandStatics, RenderRsmeBatchesEmptyInput) {

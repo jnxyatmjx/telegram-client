@@ -167,14 +167,18 @@ std::vector<std::string> ControlCommandsHandler::RenderRsmeBatches(
         // handlersm 881/883: [{first_name}](https://t.me/{username}) + /ym.
         // The display name is user-controlled: escape it for the link text
         // (MarkdownV2) and for the code span (backtick only).
-        user_lines.push_back(std::to_string(j) + ". [" +
+        // MarkdownV2: the '.' after the list number is a reserved
+        // character and must be escaped (otherwise the whole chunk fails
+        // to parse). The URL's '.' is fine — the link parser reads it
+        // literally.
+        user_lines.push_back(std::to_string(j) + "\\. [" +
                              EscapeMarkdownV2(view.first_name) +
                              "](https://t.me/" + view.username + ")\t`/ym " +
                              std::to_string(view.bare_id) + " " +
                              EscapeCodeSpan(view.first_name) + "`\t\n\n");
       } else {
         // handlersm 885: **🎯name🎯** + /who.
-        user_lines.push_back(std::to_string(j) + ". **🎯" +
+        user_lines.push_back(std::to_string(j) + "\\. **🎯" +
                              EscapeMarkdownV2(view.title) +
                              "🎯**\t`/who " + std::to_string(view.bare_id) +
                              "`\t\n\n");
@@ -185,7 +189,7 @@ std::vector<std::string> ControlCommandsHandler::RenderRsmeBatches(
     if (!view.username.empty()) {
       // handlersm 862: [👉👉👈](https://t.me/{username}) + /xm with the
       // sanitized title.
-      chat_lines.push_back(std::to_string(i) + ". [👉👉👈](https://t.me/" +
+      chat_lines.push_back(std::to_string(i) + "\\. [👉👉👈](https://t.me/" +
                            view.username + ")\t`/xm " +
                            std::to_string(view.bare_id) + " " +
                            SanitizeTitle(view.title) + "`\t\n\n");
@@ -194,7 +198,7 @@ std::vector<std::string> ControlCommandsHandler::RenderRsmeBatches(
       // (restricted-channel auto-leave NOT migrated: destructive).
       // Title is user-controlled: escape it for the bold text and for the
       // code span (backtick only).
-      chat_lines.push_back(std::to_string(i) + ". **⚠️" +
+      chat_lines.push_back(std::to_string(i) + "\\. **⚠️" +
                            EscapeMarkdownV2(view.title) +
                            "⚠️**\t`/who " + std::to_string(view.bare_id) +
                            " " + EscapeCodeSpan(view.title) + "`\t\n\n");

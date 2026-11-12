@@ -64,6 +64,48 @@ class FakeImageProcessor final : public ImageProcessor::Service {
   }
 };
 
+// Fake server for the half-close regression test (second live crash
+// 2026-11-12 12:11:41): on the FIRST stream it reads one request and then
+// returns immediately without replying, so the client's Read fails while
+// the client still has a Write in flight (burst). On later streams it
+// echoes normally, so the reconnected stream can round-trip.
+class HalfCloseImageProcessor final : public ImageProcessor::Service {
+ public:
+  ::grpc::Status ProcessImages(
+      ::grpc::ServerContext* /*context*/,
+      ::grpc::ServerReaderWriter<::ImageReply, ::ImageRequest>* stream)
+      override {
+    ::ImageRequest req;
+    if (!stream->Read(&req)) {
+      return ::grpc::Status::OK;
+    }
+    if (close_first_.exchange(false)) {
+      // First stream: close without replying. The client's Read fails;
+      // a burst Write is (very likely) still outstanding, so this is the
+      // "read fails first while a Write is in flight" interleaving.
+      return ::grpc::Status::OK;
+    }
+    // Later streams: echo.
+    do {
+      ::ImageReply reply;
+      reply.set_image_id(req.image_id());
+      reply.set_result("ok:" + req.image_id());
+      if (!stream->Write(reply)) break;
+    } while (stream->Read(&req));
+    return ::grpc::Status::OK;
+  }
+
+  ::grpc::Status SearchImages(
+      ::grpc::ServerContext* /*context*/,
+      ::grpc::ServerReaderWriter<::SearchRsp, ::SearchReq>* /*stream*/)
+      override {
+    return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "not used");
+  }
+
+ private:
+  std::atomic<bool> close_first_{true};
+};
+
 ImageRequest MakeRequest(const std::string& image_id) {
   ImageRequest req;
   req.set_image_id(image_id);
@@ -84,6 +126,21 @@ class StreamerTest : public ::testing::Test {
     builder.AddListeningPort("unix://" + socket_path_,
                              ::grpc::InsecureServerCredentials());
     builder.RegisterService(&service_);
+    server_ = builder.BuildAndStart();
+    ASSERT_NE(server_, nullptr);
+  }
+
+  // Same socket, but the half-close service (first stream closes after one
+  // request without replying; later streams echo).
+  void StartHalfCloseServer() {
+    socket_path_ = "/tmp/tg-streamer-test-" +
+                   std::to_string(static_cast<long long>(::getpid())) +
+                   ".sock";
+    std::remove(socket_path_.c_str());
+    ::grpc::ServerBuilder builder;
+    builder.AddListeningPort("unix://" + socket_path_,
+                             ::grpc::InsecureServerCredentials());
+    builder.RegisterService(&half_close_service_);
     server_ = builder.BuildAndStart();
     ASSERT_NE(server_, nullptr);
   }
@@ -162,6 +219,7 @@ class StreamerTest : public ::testing::Test {
   }
 
   FakeImageProcessor service_;
+  HalfCloseImageProcessor half_close_service_;
   std::unique_ptr<::grpc::Server> server_;
   std::string socket_path_;
   std::shared_ptr<::grpc::Channel> channel_;
@@ -303,6 +361,46 @@ TEST_F(StreamerTest, ReconnectAfterServerKillWithPendingWrites) {
   server_ = builder.BuildAndStart();
   ASSERT_NE(server_, nullptr);
 
+  ASSERT_TRUE(WaitForReconnected(1, std::chrono::seconds(10)));
+  ASSERT_TRUE(WaitForRunning(*streamer, std::chrono::seconds(10)));
+  const std::size_t before = replies_.size();
+  ASSERT_TRUE(streamer->Enqueue(MakeRequest("c1:m2:after"),
+                                std::chrono::milliseconds(1000)));
+  ASSERT_TRUE(WaitForReplies(before + 1, std::chrono::seconds(10)));
+  EXPECT_EQ(replies_.back().image_id(), "c1:m2:after");
+  EXPECT_EQ(replies_.back().result(), "ok:c1:m2:after");
+
+  streamer->Stop();
+  StopServer();
+}
+
+TEST_F(StreamerTest, ReconnectAfterServerHalfCloseWithWriteInFlight) {
+  // Regression test for the second live crash 2026-11-12 12:11:41: the
+  // server half-closes (Read fails) while the client still has a Write in
+  // flight, and the old code issued WritesDone immediately — colliding
+  // with the outstanding Write on the shared write-side CallOpSet, which
+  // aborts the process on the same call_op_set.h:972 assertion. The fix
+  // defers WritesDone until the in-flight Write lands. This test drives
+  // that interleaving (burst writes + server closes after one request)
+  // and requires a clean reconnect afterwards (no abort, no hang, work
+  // flows again).
+  StartHalfCloseServer();
+  auto streamer = MakeStreamer();
+  streamer->Start();
+  ASSERT_TRUE(WaitForRunning(*streamer, std::chrono::seconds(10)));
+
+  // Burst: the first request is read by the server (which then closes the
+  // stream without replying); the remaining writes keep a Write in flight
+  // when the client's Read fails.
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_TRUE(streamer->Enqueue(
+        MakeRequest("c1:burst-" + std::to_string(i)),
+        std::chrono::milliseconds(1000)));
+  }
+
+  // The stream must break (server closed it) and the streamer must
+  // reconnect on its own (backoff is 50–200 ms in this test) and work
+  // must flow again on the new stream.
   ASSERT_TRUE(WaitForReconnected(1, std::chrono::seconds(10)));
   ASSERT_TRUE(WaitForRunning(*streamer, std::chrono::seconds(10)));
   const std::size_t before = replies_.size();

@@ -21,6 +21,10 @@
 // calling Finish() while WritesDone is pending is a gRPC API misuse that
 // aborts the process (call_op_set.h assertion, live 2026-11-12), so
 // FailStream defers Finish in that case and OnWritesDone() issues it.
+// WritesDone() must likewise wait for an outstanding Write to complete:
+// Write and WritesDone share one write-side CallOpSet and only one write
+// may be outstanding, so OnReadDone defers WritesDone while a Write is in
+// flight and OnWriteDone issues it (second live crash 2026-11-12 12:11:41).
 // Stop() respects this too: it lets the CQ thread drain the stream (cancel
 // -> WritesDone -> Finish -> OnFinish) and joins it BEFORE shutting the CQ
 // down. Shutting the CQ down first would strand the stream with an
@@ -237,6 +241,7 @@ class AsyncStreamer {
     finish_requested_ = false;
     finish_called_ = false;
     writes_done_called_ = false;
+    writes_done_pending_ = false;
     finish_status_ = grpc::Status();
 
     context_ = options_.make_context ? options_.make_context()
@@ -295,6 +300,13 @@ class AsyncStreamer {
   void OnWriteDone(bool ok) {
     write_in_progress_ = false;
     pending_write_.reset();
+    if (writes_done_pending_) {
+      // A WritesDone was deferred by OnReadDone because this Write was in
+      // flight. The Write has now landed, so it is safe to issue it.
+      // TryWritesDone is a no-op if Finish was already requested.
+      writes_done_pending_ = false;
+      TryWritesDone();
+    }
     if (!ok) {
       FailStream(grpc::Status(grpc::StatusCode::UNAVAILABLE,
                               options_.name + ": Write failed"));
@@ -314,6 +326,15 @@ class AsyncStreamer {
     // requests are dropped by FailStream — their Outbox records replay after
     // the reconnect (v5 §2.5).
     read_closed_ = true;
+    if (write_in_progress_) {
+      // A Write is still outstanding. WritesDone() shares the write-side
+      // CallOpSet with Write(), and gRPC allows only one write outstanding
+      // at a time — issuing WritesDone now would be the same API misuse
+      // that aborts the process (call_op_set.h:972, second live crash
+      // 2026-11-12 12:11:41). Defer it until OnWriteDone lands.
+      writes_done_pending_ = true;
+      return;
+    }
     TryWritesDone();
   }
 
@@ -449,6 +470,7 @@ class AsyncStreamer {
   bool finish_requested_ = false;
   bool finish_called_ = false;
   bool writes_done_called_ = false;
+  bool writes_done_pending_ = false;
   bool reconnected_ = false;
   std::int64_t connect_attempts_ = 0;
   grpc::Status finish_status_;

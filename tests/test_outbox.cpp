@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdio>
 #include <string>
 
@@ -83,6 +84,7 @@ TEST_F(OutboxTest, UnknownIdTransitionsFail) {
   EXPECT_FALSE(outbox_->MarkFailed("nope", "x", 1000));
   EXPECT_FALSE(outbox_->MarkDeadLetter("nope", "x"));
   EXPECT_FALSE(outbox_->MarkRequeued("nope", 1000, 3, "x"));
+  EXPECT_FALSE(outbox_->MarkSent("nope", 9999999999999LL));
 }
 
 TEST_F(OutboxTest, RequeuedBumpsAttemptsAndDefers) {
@@ -119,6 +121,161 @@ TEST_F(OutboxTest, FailedIsRetriedLater) {
   EXPECT_EQ(record->state, infra::OutboxState::kFailed);
   EXPECT_EQ(record->last_status, "enqueue failed");
   // FAILED records come back once next_retry_at passes.
+  EXPECT_EQ(outbox_->DueForRetry(9999999999999LL, 10).size(), 1u);
+}
+
+// --- kSent (retry design §3.1): write-ok takes the record out of the
+// --- timer-driven retry set until the safety deadline / the reply.
+
+TEST_F(OutboxTest, MarkSentRemovesFromRetrySetUntilDeadline) {
+  outbox_->Put(MakeRecord("c1:m1:uid"));
+  const std::int64_t now = infra::OutboxRecord{}.created_at_ms + 1;
+  ASSERT_TRUE(outbox_->MarkSent("c1:m1:uid", now + 600'000));
+  const auto record = outbox_->Get("c1:m1:uid");
+  ASSERT_TRUE(record.has_value());
+  EXPECT_EQ(record->state, infra::OutboxState::kSent);
+  EXPECT_EQ(record->next_retry_at_ms, now + 600'000);
+  // The whole point: a SENT record is invisible to the normal sweep —
+  // even after the deadline passes (only the safety sweep may requeue it).
+  EXPECT_TRUE(outbox_->DueForRetry(now, 10).empty());
+  EXPECT_TRUE(outbox_->DueForRetry(now + 599'999, 10).empty());
+  EXPECT_TRUE(outbox_->DueForRetry(now + 600'001, 10).empty());
+  // ... while the safety sweep sees exactly it, at and after the deadline.
+  EXPECT_EQ(outbox_->SentPastDeadline(now + 600'001, 10).size(), 1u);
+  EXPECT_EQ(outbox_->CountByState(infra::OutboxState::kSent), 1);
+  EXPECT_EQ(outbox_->PendingCount(), 0);
+}
+
+TEST_F(OutboxTest, MarkSentIsIdempotentAndSkipsDoneAndDead) {
+  outbox_->Put(MakeRecord("c1:m1:uid"));
+  ASSERT_TRUE(outbox_->MarkSent("c1:m1:uid", 1));
+  // Duplicate write-ok (re-sent copy on another lane): harmless no-op that
+  // keeps the FIRST deadline (the record is already SENT).
+  EXPECT_FALSE(outbox_->MarkSent("c1:m1:uid", 2));
+  EXPECT_EQ(outbox_->Get("c1:m1:uid")->next_retry_at_ms, 1);
+  // DONE (reply raced the write-ok): no transition.
+  outbox_->Put(MakeRecord("c1:m2:uid"));
+  EXPECT_TRUE(outbox_->MarkDone("c1:m2:uid", "ok"));
+  EXPECT_FALSE(outbox_->MarkSent("c1:m2:uid", 3));
+  EXPECT_EQ(outbox_->Get("c1:m2:uid")->state, infra::OutboxState::kDone);
+  // DEAD_LETTER (permanent failure swept it): no transition.
+  outbox_->Put(MakeRecord("c1:m3:uid"));
+  EXPECT_TRUE(outbox_->MarkDeadLetter("c1:m3:uid", "INVALID_ARGUMENT"));
+  EXPECT_FALSE(outbox_->MarkSent("c1:m3:uid", 4));
+  EXPECT_EQ(outbox_->Get("c1:m3:uid")->state, infra::OutboxState::kDeadLetter);
+}
+
+TEST_F(OutboxTest, SentPastDeadlineReturnsOnlyPastDeadlineSentRows) {
+  outbox_->Put(MakeRecord("sent:due"));
+  outbox_->Put(MakeRecord("sent:future"));
+  outbox_->Put(MakeRecord("plain:pending"));
+  const std::int64_t now = infra::OutboxRecord{}.created_at_ms + 1;
+  EXPECT_TRUE(outbox_->MarkSent("sent:due", now - 1));
+  EXPECT_TRUE(outbox_->MarkSent("sent:future", now + 600'000));
+  const auto stale = outbox_->SentPastDeadline(now, 10);
+  ASSERT_EQ(stale.size(), 1u);
+  EXPECT_EQ(stale[0].image_id, "sent:due");
+  // Deadline in the future -> nothing (the write just landed).
+  EXPECT_TRUE(outbox_->SentPastDeadline(now - 2, 10).empty());
+  // Ordering: oldest deadline first.
+  outbox_->Put(MakeRecord("sent:older"));
+  EXPECT_TRUE(outbox_->MarkSent("sent:older", now - 2));
+  const auto two = outbox_->SentPastDeadline(now, 10);
+  ASSERT_EQ(two.size(), 2u);
+  EXPECT_EQ(two[0].image_id, "sent:older");
+  EXPECT_EQ(two[1].image_id, "sent:due");
+}
+
+TEST_F(OutboxTest, MarkDoneOnSentCompletesAndIsIdempotent) {
+  // Reply raced/landed for a written request: SENT -> DONE, and the
+  // duplicate reply stays a no-op.
+  outbox_->Put(MakeRecord("c1:m1:uid"));
+  ASSERT_TRUE(outbox_->MarkSent("c1:m1:uid", 9999999999999LL));
+  EXPECT_TRUE(outbox_->MarkDone("c1:m1:uid", "processed ok"));
+  EXPECT_EQ(outbox_->Get("c1:m1:uid")->state, infra::OutboxState::kDone);
+  EXPECT_FALSE(outbox_->MarkDone("c1:m1:uid", "processed ok"));
+  EXPECT_EQ(outbox_->Get("c1:m1:uid")->last_status, "processed ok");
+}
+
+TEST_F(OutboxTest, ReopenTransitionsSentToPendingWithFutureDeadline) {
+  // Restart recovery (retry design §3.1): the previous process died with
+  // written-but-unreplied requests. The reopen re-arms them PENDING after
+  // a grace period — replay is at-least-once, server dedup is the backstop.
+  // Wire-format id (no colons): a legacy-format SENT row would instead be
+  // dead-lettered by MigrateLegacyImageIds, which runs first by design
+  // (unparseable ids are never replayed).
+  const std::int64_t grace = 5'000;
+  outbox_->Put(MakeRecord("456"));
+  ASSERT_TRUE(outbox_->MarkSent("456", 9999999999999LL));
+  outbox_.reset();
+
+  const std::int64_t before = std::chrono::duration_cast<
+      std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  infra::Outbox reopened(path_, grace);
+  const auto record = reopened.Get("456");
+  ASSERT_TRUE(record.has_value());
+  EXPECT_EQ(record->state, infra::OutboxState::kPending);
+  // Future deadline (before + grace), and no longer the old sent_until.
+  EXPECT_GT(record->next_retry_at_ms, before);
+  EXPECT_LT(record->next_retry_at_ms, 9999999999999LL);
+  EXPECT_TRUE(reopened.DueForRetry(before, 10).empty());
+  EXPECT_EQ(reopened.DueForRetry(before + grace + 1'000, 10).size(), 1u);
+  // Idempotent: a second open finds no SENT rows and changes nothing.
+  infra::Outbox second(path_, grace);
+  EXPECT_EQ(second.Get("456")->state, infra::OutboxState::kPending);
+  EXPECT_EQ(second.CountByState(infra::OutboxState::kSent), 0);
+}
+
+TEST_F(OutboxTest, SafetyNetRequeueFromSentGoesPendingThenDeadLetters) {
+  // Safety net (SweepOutbox): MarkRequeued from SENT must flip the record
+  // to PENDING (so the next sweep actually re-sends it), and exhaustion
+  // must dead-letter it (attempts now count un-acked re-sends only).
+  outbox_->Put(MakeRecord("c1:m1:uid"));
+  ASSERT_TRUE(outbox_->MarkSent("c1:m1:uid", 9999999999999LL));
+  EXPECT_TRUE(outbox_->MarkRequeued("c1:m1:uid", 0, 3, "ack timeout"));
+  auto record = outbox_->Get("c1:m1:uid");
+  EXPECT_EQ(record->state, infra::OutboxState::kPending);
+  EXPECT_EQ(record->attempts, 1);
+  EXPECT_EQ(record->last_status, "ack timeout");
+  EXPECT_EQ(outbox_->DueForRetry(9999999999999LL, 10).size(), 1u);
+
+  // Re-sent, still no reply, safety net again -> dead-letter at max.
+  ASSERT_TRUE(outbox_->MarkSent("c1:m1:uid", 9999999999999LL));
+  EXPECT_TRUE(outbox_->MarkRequeued("c1:m1:uid", 0, 3, "ack timeout"));
+  ASSERT_TRUE(outbox_->MarkSent("c1:m1:uid", 9999999999999LL));
+  EXPECT_TRUE(outbox_->MarkRequeued("c1:m1:uid", 0, 3, "ack timeout"));
+  record = outbox_->Get("c1:m1:uid");
+  EXPECT_EQ(record->state, infra::OutboxState::kDeadLetter);
+  EXPECT_TRUE(outbox_->SentPastDeadline(9999999999999LL, 10).empty());
+}
+
+TEST_F(OutboxTest, WriteLostOnlyFailsPendingRecords) {
+  // A write-lost carrying a SENT record's id is a lost DUPLICATE copy (the
+  // real request is already on the wire) — it must not re-arm the record.
+  // DONE / DEAD_LETTER must not be resurrected by a late write-lost either
+  // (FailStream fires OnStreamFailed before ClearQueue).
+  outbox_->Put(MakeRecord("c1:m1:uid"));
+  ASSERT_TRUE(outbox_->MarkSent("c1:m1:uid", 9999999999999LL));
+  EXPECT_FALSE(outbox_->MarkFailed("c1:m1:uid", "write lost", 0));
+  EXPECT_EQ(outbox_->Get("c1:m1:uid")->state, infra::OutboxState::kSent);
+
+  outbox_->Put(MakeRecord("c1:m2:uid"));
+  ASSERT_TRUE(outbox_->MarkDone("c1:m2:uid", "ok"));
+  EXPECT_FALSE(outbox_->MarkFailed("c1:m2:uid", "write lost", 0));
+  EXPECT_EQ(outbox_->Get("c1:m2:uid")->state, infra::OutboxState::kDone);
+
+  outbox_->Put(MakeRecord("c1:m3:uid"));
+  ASSERT_TRUE(outbox_->MarkDeadLetter("c1:m3:uid", "INVALID_ARGUMENT"));
+  EXPECT_FALSE(outbox_->MarkFailed("c1:m3:uid", "write lost", 0));
+  EXPECT_EQ(outbox_->Get("c1:m3:uid")->state, infra::OutboxState::kDeadLetter);
+
+  // PENDING (the real write-lost / queue-full case): FAILED due-now.
+  outbox_->Put(MakeRecord("c1:m4:uid"));
+  EXPECT_TRUE(outbox_->MarkFailed("c1:m4:uid", "write lost", 0));
+  const auto record = outbox_->Get("c1:m4:uid");
+  EXPECT_EQ(record->state, infra::OutboxState::kFailed);
+  EXPECT_EQ(record->last_status, "write lost");
   EXPECT_EQ(outbox_->DueForRetry(9999999999999LL, 10).size(), 1u);
 }
 

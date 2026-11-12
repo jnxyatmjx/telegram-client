@@ -96,7 +96,7 @@ std::string ColumnBlob(sqlite3_stmt* statement, int index) {
 
 }  // namespace
 
-Outbox::Outbox(const std::string& db_path) {
+Outbox::Outbox(const std::string& db_path, std::int64_t reopen_grace_ms) {
   const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
   if (sqlite3_open_v2(db_path.c_str(), &db_, flags, nullptr) != SQLITE_OK) {
     const std::string message = db_ != nullptr ? sqlite3_errmsg(db_) : "unknown";
@@ -116,6 +116,33 @@ Outbox::Outbox(const std::string& db_path) {
     throw std::runtime_error("outbox: schema failed: " + message);
   }
   MigrateLegacyImageIds();
+  RecoverSentRecords(reopen_grace_ms);
+}
+
+void Outbox::RecoverSentRecords(std::int64_t grace_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // Restart recovery (retry design §3.1): the previous process may have
+  // died with requests written-but-unreplied (SENT). Their replies may or
+  // may not have been processed by the server, so the replay is
+  // at-least-once — server-side dedup on (cid, image_id) is the backstop.
+  // Re-arm each as PENDING after a grace period: short enough that the
+  // first sweep (10 s period) replays them promptly, long enough not to
+  // race writes that were still landing. Idempotent: a reopen after a
+  // clean shutdown finds no SENT rows and does nothing.
+  Statement statement(db_,
+      "UPDATE outbox SET state = ?1, next_retry_at = ?2, updated_at = ?2 "
+      "WHERE state = ?3");
+  const std::int64_t now = NowMs();
+  BindInt(statement.get(), 1, static_cast<std::int64_t>(OutboxState::kPending));
+  BindInt(statement.get(), 2, now + grace_ms);
+  BindInt(statement.get(), 3, static_cast<std::int64_t>(OutboxState::kSent));
+  statement.Step(db_);
+  const int recovered = sqlite3_changes(db_);
+  if (recovered > 0) {
+    spdlog::info("outbox: reopened with {} sent-but-unreplied record(s) — "
+                 "requeued after {} ms grace",
+                 recovered, grace_ms);
+  }
 }
 
 void Outbox::MigrateLegacyImageIds() {
@@ -285,49 +312,85 @@ bool Outbox::MarkDone(const std::string& image_id, const std::string& result) {
   std::lock_guard<std::mutex> lock(mutex_);
   // Only a record still awaiting its reply transitions to DONE. A record
   // already DONE stays DONE: a duplicate ImageReply for the same image_id
-  // (the server replied twice, or the request was re-sent before the
-  // ack timeout and both replies arrived) must NOT report a second DONE
-  // — the first reply already logged it. The caller distinguishes "already
-  // done" from "unknown" with Get().
+  // (the server replied twice, or the request was re-sent and both replies
+  // arrived) must NOT report a second DONE — the first reply already
+  // logged it. SENT is included: the reply may land while the write-ok is
+  // still in flight on another lane's thread (replies ride the same lane
+  // their request was dealt to, but duplicates can be outstanding).
+  // The caller distinguishes "already done" from "unknown" with Get().
   Statement statement(db_,
       "UPDATE outbox SET state = ?1, last_status = ?2, updated_at = ?3 "
-      "WHERE image_id = ?4 AND state IN (?5, ?6)");
+      "WHERE image_id = ?4 AND state IN (?5, ?6, ?7)");
   BindInt(statement.get(), 1, static_cast<std::int64_t>(OutboxState::kDone));
   BindText(statement.get(), 2, result);
   BindInt(statement.get(), 3, NowMs());
   BindText(statement.get(), 4, image_id);
   BindInt(statement.get(), 5, static_cast<std::int64_t>(OutboxState::kPending));
   BindInt(statement.get(), 6, static_cast<std::int64_t>(OutboxState::kFailed));
+  BindInt(statement.get(), 7, static_cast<std::int64_t>(OutboxState::kSent));
+  return RunTransition(db_, statement);
+}
+
+bool Outbox::MarkSent(const std::string& image_id, std::int64_t sent_until_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // Write-ok (retry design §3.1): the request provably left the client, so
+  // the record leaves the timer-driven retry set until sent_until_ms (the
+  // safety deadline). Only PENDING/FAILED transition: false is the
+  // harmless no-op for already-SENT (duplicate write-ok of a re-sent
+  // copy), DONE (the reply raced the write-ok), DEAD_LETTER (permanent
+  // failure swept it) and unknown ids.
+  Statement statement(db_,
+      "UPDATE outbox SET state = ?1, next_retry_at = ?2, updated_at = ?2 "
+      "WHERE image_id = ?3 AND state IN (?4, ?5)");
+  BindInt(statement.get(), 1, static_cast<std::int64_t>(OutboxState::kSent));
+  BindInt(statement.get(), 2, sent_until_ms);
+  BindText(statement.get(), 3, image_id);
+  BindInt(statement.get(), 4, static_cast<std::int64_t>(OutboxState::kPending));
+  BindInt(statement.get(), 5, static_cast<std::int64_t>(OutboxState::kFailed));
   return RunTransition(db_, statement);
 }
 
 bool Outbox::MarkRequeued(const std::string& image_id, std::int64_t retry_delay_ms,
                           int max_attempts, const std::string& note) {
   std::lock_guard<std::mutex> lock(mutex_);
+  // Transitions from ANY source state (retry design §3.1: the safety net
+  // requeues SENT records). Not exhausted -> PENDING explicitly, so a
+  // requeued SENT record actually re-enters the retry set (the SQLite CASE
+  // below reads the OLD attempts value: attempts+1 < max must yield
+  // PENDING, not "keep SENT").
   Statement statement(db_,
       "UPDATE outbox "
       "SET attempts = attempts + 1, "
-      "    state = CASE WHEN attempts + 1 >= ?1 THEN ?2 ELSE state END, "
-      "    next_retry_at = ?3, last_status = ?4, updated_at = ?3 "
-      "WHERE image_id = ?5");
+      "    state = CASE WHEN attempts + 1 >= ?1 THEN ?2 ELSE ?3 END, "
+      "    next_retry_at = ?4, last_status = ?5, updated_at = ?4 "
+      "WHERE image_id = ?6");
   BindInt(statement.get(), 1, max_attempts);
   BindInt(statement.get(), 2, static_cast<std::int64_t>(OutboxState::kDeadLetter));
-  BindInt(statement.get(), 3, NowMs() + retry_delay_ms);
-  BindText(statement.get(), 4, note);
-  BindText(statement.get(), 5, image_id);
+  BindInt(statement.get(), 3, static_cast<std::int64_t>(OutboxState::kPending));
+  BindInt(statement.get(), 4, NowMs() + retry_delay_ms);
+  BindText(statement.get(), 5, note);
+  BindText(statement.get(), 6, image_id);
   return RunTransition(db_, statement);
 }
 
 bool Outbox::MarkFailed(const std::string& image_id, const std::string& error,
                         std::int64_t retry_delay_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
+  // Only a record still awaiting its write outcome can be failed. A SENT
+  // record's request was already written — a write-lost carrying its id is
+  // a lost DUPLICATE copy, not the sent one, and must not re-arm it. DONE /
+  // DEAD_LETTER must not be resurrected by a late write-lost firing after
+  // the permanent-error sweep (FailStream runs OnStreamFailed before
+  // ClearQueue, so that ordering is real). The guard makes the no-op
+  // atomic — no Get-then-update race.
   Statement statement(db_,
       "UPDATE outbox SET state = ?1, last_status = ?2, "
-      "next_retry_at = ?3, updated_at = ?3 WHERE image_id = ?4");
+      "next_retry_at = ?3, updated_at = ?3 WHERE image_id = ?4 AND state = ?5");
   BindInt(statement.get(), 1, static_cast<std::int64_t>(OutboxState::kFailed));
   BindText(statement.get(), 2, error);
   BindInt(statement.get(), 3, NowMs() + retry_delay_ms);
   BindText(statement.get(), 4, image_id);
+  BindInt(statement.get(), 5, static_cast<std::int64_t>(OutboxState::kPending));
   return RunTransition(db_, statement);
 }
 
@@ -361,6 +424,25 @@ std::vector<OutboxRecord> Outbox::DueForRetry(std::int64_t now_ms,
     due.push_back(RowToRecord(statement.get()));
   }
   return due;
+}
+
+std::vector<OutboxRecord> Outbox::SentPastDeadline(std::int64_t now_ms,
+                                                   std::size_t limit) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  Statement statement(db_,
+      "SELECT image_id, image_data, memo, owner_id, state, attempts, "
+      "next_retry_at, last_status, created_at, updated_at "
+      "FROM outbox WHERE state = ?1 AND next_retry_at <= ?2 "
+      "ORDER BY next_retry_at ASC LIMIT ?3");
+  BindInt(statement.get(), 1, static_cast<std::int64_t>(OutboxState::kSent));
+  BindInt(statement.get(), 2, now_ms);
+  BindInt(statement.get(), 3, static_cast<std::int64_t>(limit));
+
+  std::vector<OutboxRecord> stale;
+  while (statement.Step(db_)) {
+    stale.push_back(RowToRecord(statement.get()));
+  }
+  return stale;
 }
 
 std::int64_t Outbox::CountByState(OutboxState state) const {

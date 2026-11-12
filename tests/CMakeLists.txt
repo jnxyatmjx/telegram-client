@@ -27,7 +27,8 @@ set(TG_TEST_SOURCES
   test_media_channels.cpp
   test_flood_retry.cpp
   test_grpc_channel_args.cpp
-  test_delete_file.cpp)
+  test_delete_file.cpp
+  test_flow_control.cpp)
 
 foreach(src IN LISTS TG_TEST_SOURCES)
   get_filename_component(test_name "${src}" NAME_WE)
@@ -41,6 +42,8 @@ endforeach()
 set_property(TEST test_async_streamer PROPERTY TIMEOUT 120)
 # The e2e test opens real sockets (fake server + two streams).
 set_property(TEST test_e2e_fake_server PROPERTY TIMEOUT 120)
+# The flow-control test opens a real socket (gated fake echo server).
+set_property(TEST test_flow_control PROPERTY TIMEOUT 120)
 # The bootstrap test creates a real TDLib client and waits for its first
 # authorization-state update (no network, no real credentials).
 set_property(TEST test_tdlib_bootstrap PROPERTY TIMEOUT 60)

@@ -75,6 +75,13 @@ class AsyncStreamer {
                                           grpc::CompletionQueue* cq)>;
   using ReplyHandler = std::function<void(const Reply& reply)>;
   using StatusHandler = std::function<void(const grpc::Status& status)>;
+  // Write-outcome callbacks (retry design §3.1): fire on the CQ thread with
+  // the request whose fate was just decided. on_written = the write tag
+  // landed ok (the message is in the transport; NOT a server ack);
+  // on_write_lost = the write failed or the request was dropped from a
+  // breaking stream's queue (it provably never reached the server).
+  // Optional: unset (SearchImages) means no observer, zero behavior change.
+  using WrittenHandler = std::function<void(const Request& request)>;
 
   struct Options {
     std::string name;  // "ProcessImages" / "SearchImages"
@@ -105,6 +112,18 @@ class AsyncStreamer {
   // INVALID_ARGUMENT / PERMISSION_DENIED to Outbox dead-letter).
   void SetOnStreamFailed(StatusHandler handler) {
     on_stream_failed_ = std::move(handler);
+  }
+  // Write-outcome observers (ProcessImages only; SearchImages never sets
+  // them). Ordering is safe for Outbox use: the callback runs on the CQ
+  // thread, after the write outcome is known, before any reply for that
+  // message can be delivered on this stream — so MarkSent precedes MarkDone
+  // for a given id. on_write_lost fires BEFORE FailStream's
+  // on_stream_failed_ / ClearQueue callbacks.
+  void SetOnWritten(WrittenHandler handler) {
+    on_written_ = std::move(handler);
+  }
+  void SetOnWriteLost(WrittenHandler handler) {
+    on_write_lost_ = std::move(handler);
   }
 
   void Start() {
@@ -299,6 +318,10 @@ class AsyncStreamer {
 
   void OnWriteDone(bool ok) {
     write_in_progress_ = false;
+    // Capture the request BEFORE resetting pending_write_ (the write-outcome
+    // callbacks report WHICH request resolved; moving is safe — the buffer
+    // only had to outlive the op, and this tag just landed).
+    Request written = std::move(*pending_write_);
     pending_write_.reset();
     if (writes_done_pending_) {
       // A WritesDone was deferred by OnReadDone because this Write was in
@@ -308,10 +331,16 @@ class AsyncStreamer {
       TryWritesDone();
     }
     if (!ok) {
+      // The request never reached the server: tell the Outbox before
+      // FailStream (whose ClearQueue reports the remaining queued ones), so
+      // its record re-arms as FAILED due-now instead of waiting out the
+      // safety deadline (retry design §3.3, fixes G2/G3).
+      if (on_write_lost_) on_write_lost_(written);
       FailStream(grpc::Status(grpc::StatusCode::UNAVAILABLE,
                               options_.name + ": Write failed"));
       return;
     }
+    if (on_written_) on_written_(written);
     PumpWrite();
   }
 
@@ -424,9 +453,21 @@ class AsyncStreamer {
   }
 
   void ClearQueue() {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    std::queue<Request> empty;
-    queue_.swap(empty);
+    // Swap the queue out under the lock, then report each dropped request
+    // OUTSIDE it: the callback touches the Outbox (SQLite), and holding
+    // queue_mutex_ across user code would expose the streamer to re-entrancy
+    // (e.g. a callback that enqueues). The requests die with the local deque
+    // after the callback.
+    std::queue<Request> dropped;
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      queue_.swap(dropped);
+    }
+    if (!on_write_lost_) return;
+    while (!dropped.empty()) {
+      on_write_lost_(dropped.front());
+      dropped.pop();
+    }
   }
 
   void BackoffAndReconnect() {
@@ -490,6 +531,8 @@ class AsyncStreamer {
   ReplyHandler reply_handler_;
   std::function<void()> on_reconnected_;
   StatusHandler on_stream_failed_;
+  WrittenHandler on_written_;
+  WrittenHandler on_write_lost_;
 };
 
 }  // namespace tg::transport

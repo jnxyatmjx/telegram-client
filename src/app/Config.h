@@ -39,7 +39,12 @@ struct GrpcConfig {
   // Optional PEM file with the CA(s) that signed the server certificate
   // (private/self-signed CA). Empty = system default roots.
   std::string ca_cert_path;
-  std::int64_t ack_timeout_ms = 30'000;          // app-level ack timeout
+  // App-level ack timeout. SUPERSEDED for the ProcessImages send path by
+  // outbox.send_grace_ms / outbox.sent_timeout_ms (retry design §3.1:
+  // the timeout is demoted to a safety net driven by write outcomes) —
+  // no code reads it anymore. Kept parsed so existing config files load
+  // unchanged; do not reuse it for new send-path decisions.
+  std::int64_t ack_timeout_ms = 30'000;
   std::int64_t reconnect_backoff_ms = 1'000;     // 1s -> 2s -> ... capped
   std::int64_t max_reconnect_backoff_ms = 30'000;
   std::int64_t enqueue_timeout_ms = 5'000;       // streamer write-queue wait
@@ -110,6 +115,22 @@ struct OutboxConfig {
   std::int64_t retry_backoff_ms = 5'000;     // per-record backoff base
   int max_attempts = 5;                      // then dead-letter
   int64_t purge_done_after_seconds = 24 * 3600;
+  // Grace between Put (PENDING) and the write outcome becoming known
+  // (retry design §3.1): write-ok -> SENT with the sent_timeout deadline,
+  // write-lost -> FAILED due-now. Also the deadline carried by records
+  // recovered at startup (SENT -> PENDING) and the delay before a
+  // window-blocked record is first retried. Supersedes
+  // grpc.ack_timeout_ms for the send path.
+  std::int64_t send_grace_ms = 5'000;
+  // Safety net (retry design §3.1): a request written but unreplied for
+  // this long is requeued (attempts++; dead-letter at max_attempts). Must
+  // exceed the worst legitimate in-flight latency — roughly the
+  // flow-control window times the per-image processing time (§4 Q2).
+  std::int64_t sent_timeout_ms = 600'000;
+  // Flow-control window (retry design §2(c)): max sent-but-unreplied
+  // ProcessImages requests (copies in lane write queues included).
+  // SearchImages bypasses it. 0 = unlimited.
+  int max_in_flight = 60;
 };
 
 // State persistence (Telethon migration Chunk 2; Python chathis /

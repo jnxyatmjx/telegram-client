@@ -28,9 +28,10 @@ grpc:
   tls: true
   token: "${GRPC_TOKEN}"
   ca_cert: ""   # optional: PEM file with the CA that signed the server cert (private/self-signed CA); empty = system default roots
-  # Bidi streams have no per-message deadline; ack timeout is used instead.
-  # ALREADY WIRED: this sets the Outbox ack deadline (PENDING -> DONE when the
-  # image_id ack arrives, else MarkRequeued). Chunk 3 did not change it.
+  # Bidi streams have no per-message deadline; ack timeout used to set the
+  # Outbox ack deadline. SUPERSEDED for the ProcessImages send path by
+  # outbox.send_grace_ms / outbox.sent_timeout_ms (retry design §3.1) —
+  # kept parsed for backward compatibility only, no code reads it.
   ack_timeout_ms: 30000
   reconnect_backoff_ms: 1000   # 1s -> 2s -> 4s ... capped at 30s
   connections: 1   # parallel gRPC connections (lanes); each lane has its own ProcessImages + SearchImages stream, requests round-robin across lanes
@@ -103,6 +104,17 @@ features:
 
 outbox:
   db_path: "/data/outbox.sqlite"   # SQLite, WAL mode; retry-only
+  # Send grace (retry design §3.1): deadline carried from Put until the
+  # write outcome is known — write-ok flips the record to SENT with the
+  # sent_timeout_ms deadline, a lost write re-arms it FAILED due-now.
+  send_grace_ms: 5000
+  # Safety net: a request written but unreplied for this long is requeued
+  # (attempts++; dead-letter at outbox.max_attempts). Must exceed the worst
+  # legitimate in-flight latency ≈ max_in_flight × per-image time.
+  sent_timeout_ms: 600000
+  # Flow-control window (retry design §2(c)): max sent-but-unreplied
+  # ProcessImages requests. SearchImages bypasses it. 0 = unlimited.
+  max_in_flight: 60
 
 # State persistence (Telethon migration chunk 2, Python chathis):
 # every flush_interval_seconds, chats whose watermark advanced within the

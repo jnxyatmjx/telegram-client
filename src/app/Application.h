@@ -101,6 +101,12 @@ class Application {
   std::vector<std::unique_ptr<transport::SearchImagesClient>> search_clients_;
   transport::StreamerPool<ImageRequest, ImageReply> process_pool_;
   transport::StreamerPool<SearchReq, SearchRsp> search_pool_;
+  // Flow-control window for the process path (retry design §2(c)): caps
+  // sent-but-unreplied ProcessImages requests at outbox.max_in_flight.
+  // Declared before ctx_, which hands a pointer to the handlers; released
+  // on reply-DONE / write-lost / safety-net requeue / permanent-failure
+  // dead-letter of a SENT record.
+  FlowControl flow_control_;
   // Per-chat watermark/link state driven by ImageReply.result. With
   // chat_state.enabled it persists to the local SQLite `chathis` table
   // (30 s flush of active chats) and restores on startup; otherwise it is

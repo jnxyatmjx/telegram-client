@@ -374,6 +374,11 @@ Config Config::FromFile(const std::string& path) {
     cfg.outbox.max_attempts = static_cast<int>(attempts);
     cfg.outbox.purge_done_after_seconds =
         Int(*o, "purge_done_after_seconds", cfg.outbox.purge_done_after_seconds);
+    cfg.outbox.send_grace_ms = Int(*o, "send_grace_ms", cfg.outbox.send_grace_ms);
+    cfg.outbox.sent_timeout_ms =
+        Int(*o, "sent_timeout_ms", cfg.outbox.sent_timeout_ms);
+    cfg.outbox.max_in_flight =
+        static_cast<int>(Int(*o, "max_in_flight", cfg.outbox.max_in_flight));
   }
 
   if (const YamlNode* c = root.Find("chat_state")) {

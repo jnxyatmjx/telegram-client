@@ -36,6 +36,7 @@ class StreamerPool {
   using Streamer = AsyncStreamer<Request, Reply>;
   using ReplyHandler = typename Streamer::ReplyHandler;
   using StatusHandler = typename Streamer::StatusHandler;
+  using WrittenHandler = typename Streamer::WrittenHandler;
 
   StreamerPool() = default;
   explicit StreamerPool(std::vector<typename Streamer::Options> options_list) {
@@ -57,6 +58,8 @@ class StreamerPool {
     if (reply_handler_) lane->SetReplyHandler(reply_handler_);
     if (on_reconnected_) lane->SetOnReconnected(on_reconnected_);
     if (on_stream_failed_) lane->SetOnStreamFailed(on_stream_failed_);
+    if (on_written_) lane->SetOnWritten(on_written_);
+    if (on_write_lost_) lane->SetOnWriteLost(on_write_lost_);
     lanes_.push_back(std::move(lane));
   }
 
@@ -110,6 +113,17 @@ class StreamerPool {
     on_stream_failed_ = handler;
     for (auto& lane : lanes_) lane->SetOnStreamFailed(handler);
   }
+  // Write-outcome observers, forwarded to every lane. Only the ProcessImages
+  // pool has them wired (Application); SearchImages has no Outbox and never
+  // sets them — unset callbacks are a no-op in the streamer.
+  void SetOnWritten(WrittenHandler handler) {
+    on_written_ = handler;
+    for (auto& lane : lanes_) lane->SetOnWritten(handler);
+  }
+  void SetOnWriteLost(WrittenHandler handler) {
+    on_write_lost_ = handler;
+    for (auto& lane : lanes_) lane->SetOnWriteLost(handler);
+  }
 
  private:
   std::vector<std::unique_ptr<Streamer>> lanes_;
@@ -118,6 +132,8 @@ class StreamerPool {
   ReplyHandler reply_handler_;
   std::function<void()> on_reconnected_;
   StatusHandler on_stream_failed_;
+  WrittenHandler on_written_;
+  WrittenHandler on_write_lost_;
 };
 
 }  // namespace tg::transport

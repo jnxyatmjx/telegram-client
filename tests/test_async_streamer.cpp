@@ -20,6 +20,7 @@
 #include <grpcpp/server_builder.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -409,6 +410,109 @@ TEST_F(StreamerTest, ReconnectAfterServerHalfCloseWithWriteInFlight) {
   ASSERT_TRUE(WaitForReplies(before + 1, std::chrono::seconds(10)));
   EXPECT_EQ(replies_.back().image_id(), "c1:m2:after");
   EXPECT_EQ(replies_.back().result(), "ok:c1:m2:after");
+
+  streamer->Stop();
+  StopServer();
+}
+
+TEST_F(StreamerTest, WrittenCallbackFiresForEachWriteOk) {
+  // Write-outcome observer (retry design §3.2): every request whose write
+  // tag lands ok fires on_written with THAT request — this is the event
+  // Application maps to Outbox::MarkSent.
+  StartServer();
+  auto streamer = MakeStreamer();
+  std::mutex written_mutex;
+  std::condition_variable written_cv;
+  std::vector<std::string> written;
+  streamer->SetOnWritten([&](const ImageRequest& request) {
+    std::lock_guard<std::mutex> lock(written_mutex);
+    written.push_back(request.image_id());
+    written_cv.notify_all();
+  });
+  streamer->Start();
+  ASSERT_TRUE(WaitForRunning(*streamer, std::chrono::seconds(10)));
+
+  ASSERT_TRUE(streamer->Enqueue(MakeRequest("c1:written-a"),
+                                std::chrono::milliseconds(1000)));
+  ASSERT_TRUE(streamer->Enqueue(MakeRequest("c1:written-b"),
+                                std::chrono::milliseconds(1000)));
+  {
+    std::unique_lock<std::mutex> lock(written_mutex);
+    ASSERT_TRUE(written_cv.wait_for(lock, std::chrono::seconds(10),
+                                    [&] { return written.size() >= 2u; }));
+  }
+  EXPECT_EQ(written[0], "c1:written-a");
+  EXPECT_EQ(written[1], "c1:written-b");
+  // The normal round-trip is unaffected by the observer.
+  ASSERT_TRUE(WaitForReplies(2, std::chrono::seconds(10)));
+
+  streamer->Stop();
+  StopServer();
+}
+
+TEST_F(StreamerTest, WriteLostFiresForEachDroppedRequest) {
+  // Dropped requests fire on_write_lost (retry design §3.2): the server
+  // closes the stream right after reading the FIRST request, while a burst
+  // is queued. Every request must resolve exactly one way — writes that
+  // landed fire on_written, everything still queued at the break fires
+  // on_write_lost (the in-flight write either way) — and the streamer must
+  // reconnect cleanly with an empty queue.
+  StartHalfCloseServer();
+  auto streamer = MakeStreamer();
+  std::mutex outcome_mutex;
+  std::condition_variable outcome_cv;
+  std::vector<std::string> written;
+  std::vector<std::string> lost;
+  streamer->SetOnWritten([&](const ImageRequest& request) {
+    std::lock_guard<std::mutex> lock(outcome_mutex);
+    written.push_back(request.image_id());
+    outcome_cv.notify_all();
+  });
+  streamer->SetOnWriteLost([&](const ImageRequest& request) {
+    std::lock_guard<std::mutex> lock(outcome_mutex);
+    lost.push_back(request.image_id());
+    outcome_cv.notify_all();
+  });
+  streamer->Start();
+  ASSERT_TRUE(WaitForRunning(*streamer, std::chrono::seconds(10)));
+
+  const int kRequests = 100;
+  for (int i = 0; i < kRequests; ++i) {
+    ASSERT_TRUE(streamer->Enqueue(
+        MakeRequest("c1:burst-" + std::to_string(i)),
+        std::chrono::milliseconds(1000)));
+  }
+  {
+    std::unique_lock<std::mutex> lock(outcome_mutex);
+    ASSERT_TRUE(outcome_cv.wait_for(
+        lock, std::chrono::seconds(10),
+        [&] { return written.size() + lost.size() >= kRequests; }));
+  }
+  // The first request was read by the server (so it was written ok), and
+  // the queue behind it was dropped.
+  EXPECT_GT(written.size(), 0u);
+  EXPECT_GT(lost.size(), 0u);
+  // Each request fired exactly one callback, nothing twice, nothing missed.
+  std::vector<std::string> all = written;
+  all.insert(all.end(), lost.begin(), lost.end());
+  std::sort(all.begin(), all.end());
+  EXPECT_EQ(all.end(), std::unique(all.begin(), all.end()));
+  std::vector<std::string> expected;
+  for (int i = 0; i < kRequests; ++i) {
+    expected.push_back("c1:burst-" + std::to_string(i));
+  }
+  std::sort(expected.begin(), expected.end());
+  EXPECT_EQ(all, expected);
+
+  // The stream broke and came back cleanly (no abort, no hang), with
+  // nothing replayed behind the break — work that was lost stays in the
+  // Outbox (Application's concern), not in the streamer.
+  ASSERT_TRUE(WaitForReconnected(1, std::chrono::seconds(10)));
+  ASSERT_TRUE(WaitForRunning(*streamer, std::chrono::seconds(10)));
+  ASSERT_TRUE(streamer->Enqueue(MakeRequest("c1:m2:after"),
+                                std::chrono::milliseconds(1000)));
+  ASSERT_TRUE(WaitForReplies(1, std::chrono::seconds(10)));
+  EXPECT_EQ(replies_.back().image_id(), "c1:m2:after");
 
   streamer->Stop();
   StopServer();

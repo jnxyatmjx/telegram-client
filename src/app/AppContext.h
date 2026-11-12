@@ -14,6 +14,7 @@
 // must never block). That is why the pool is in the context.
 
 #include <app/Config.h>
+#include <app/FlowControl.h>
 #include <app/WorkerPool.h>
 #include <infra/Outbox.h>
 #include <telegram/FileDownloader.h>
@@ -35,6 +36,10 @@ struct AppContext {
   transport::StreamerPool<SearchReq, SearchRsp>& search_images;
   infra::Outbox& outbox;
   const Config& config;
+  // Flow-control window for the process path (retry design §2(c)):
+  // FinishProcess gates its Enqueue on it. Nullable: a context built
+  // without one (tests) means the window is bypassed.
+  FlowControl* flow_control = nullptr;
 };
 
 }  // namespace tg::app

@@ -135,32 +135,36 @@ void MediaThumbnailHandler::FinishProcess(ExtractedMedia media,
   request.set_memo(std::move(*memo));
   request.set_owner_id(*bare);
 
-  // Outbox first (v5 §2.2 step [4]): if the enqueue fails the record stays
-  // PENDING and the retry thread replays it by image_id (now the message id
-  // string — message-level dedup, same replay semantics).
+  // Outbox first (v5 §2.2 step [4]): if the enqueue fails the record is
+  // re-armed FAILED due-now and the retry thread replays it by image_id.
   //
-  // next_retry_at is the ack deadline, NOT "due now": the request is about
-  // to be sent, so the retry sweep must not re-send it while the server
-  // still has time to reply. A record left at next_retry_at = 0 is
-  // immediately "due", so a server that takes longer than the 10 s sweep
-  // interval to process an image got the SAME request re-sent, the server
-  // replied once per send, and one /process logged several DONEs.
-  // grpc.ack_timeout_ms (default 30 s) is how long we wait for the reply
-  // before the sweep may retry; if the reply arrives, MarkDone takes the
-  // record out of the retry set. (If the Enqueue below fails, the first
-  // retry then also waits out the ack timeout — acceptable backpressure
-  // while the write queue is full.)
+  // next_retry_at is the SEND GRACE deadline, not an ack timeout (retry
+  // design §3.1): it only has to carry the record until the write outcome
+  // is known — MarkSent re-arms it to outbox.sent_timeout_ms when the
+  // write lands (SENT), write-lost re-arms it to due-now when the request
+  // is dropped. The old grpc.ack_timeout_ms here made every re-send ride
+  // the full ack deadline, which dead-lettered slow-but-alive servers
+  // (design G1).
   const std::int64_t now_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::system_clock::now().time_since_epoch())
           .count();
+  // Re-process of an id still awaiting a reply: its previous send holds a
+  // flow-control slot as SENT. The Put below supersedes that send (its
+  // late reply, if any, hits MarkDone-false and releases nothing), so the
+  // old slot returns here — otherwise the window slowly leaks shut.
+  const auto existing = ctx.outbox.Get(image_id);
+  if (ctx.flow_control != nullptr && existing.has_value() &&
+      existing->state == infra::OutboxState::kSent) {
+    ctx.flow_control->Release();
+  }
   infra::OutboxRecord record;
   record.image_id = image_id;
   record.image_data = request.image_data();
   record.memo = request.memo();
   record.owner_id = request.owner_id();
   record.state = infra::OutboxState::kPending;
-  record.next_retry_at_ms = now_ms + ctx.config.grpc.ack_timeout_ms;
+  record.next_retry_at_ms = now_ms + ctx.config.outbox.send_grace_ms;
   ctx.outbox.Put(record);
 
   // Bytes are safe in the Outbox BLOB — this consumer is done with the
@@ -169,9 +173,23 @@ void MediaThumbnailHandler::FinishProcess(ExtractedMedia media,
   // when the Enqueue below fails and the record stays PENDING.
   files_.Release(media.file_id);
 
+  // Flow-control window (retry design §2(c)): cap sent-but-unreplied
+  // process requests. When full, leave the record PENDING (due after the
+  // grace) — the retry sweep picks it up once a slot frees. Never Enqueue
+  // past the cap.
+  if (ctx.flow_control != nullptr && !ctx.flow_control->TryAcquire()) {
+    spdlog::warn("process: {} held in outbox — flow-control window full "
+                 "({} in flight, cap {})", image_id,
+                 ctx.flow_control->in_flight(), ctx.flow_control->window());
+    return;
+  }
+
   if (!ctx.process_images.Enqueue(std::move(request), kEnqueueTimeout)) {
-    // Not fatal: PENDING record is picked up by the Outbox retry thread.
-    spdlog::warn("process: {} write queue full; left PENDING in outbox",
+    if (ctx.flow_control != nullptr) ctx.flow_control->Release();
+    // Not fatal: FAILED due-now is replayed by the retry thread within
+    // seconds, instead of waiting out the whole grace/ack deadline (G2).
+    ctx.outbox.MarkFailed(image_id, "queue full", 0);
+    spdlog::warn("process: {} write queue full; re-armed FAILED in outbox",
                  image_id);
     return;
   }

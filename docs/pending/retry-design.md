@@ -3,6 +3,36 @@
 Date: 2026-11-10 · Scope: analysis only, no code changed.
 Baseline: `925a0aa` ("Fix duplicate send / duplicate DONE for one /process").
 
+## Decisions (Hong, 2026-11-12) — these settle §4's open questions
+
+1. **SearchImages: follow the Python contract, NO retry mechanism added for
+   now.** The search path stays as-is (write-failed / stream-failed requests
+   are dropped; the user re-triggers). The lightweight search retry sketched
+   in the 2026-11-12 three-file review is NOT to be implemented. Only the
+   ProcessImages path gets the (a2) treatment.
+2. **Server-side dedup key is `(cid, image_id)`, NOT `image_id` alone.**
+   `image_id` is `str(message_id)` and is only unique within one chat, so
+   the server must dedup on `(owner_id, image_id)` together. (The vector
+   record already stores both as `cid` / `mid`.)
+3. **Flow-control window W = 60** (process path only; search bypasses it).
+   With W = 60 the worst legitimate in-flight latency is ≈ 60 × per-image
+   time, which the `sent_timeout_ms` safety net (default 600 s) must cover.
+4. **The server may be modified, but keep the changes minimal.** Server
+   work is limited to the `(cid, image_id)` dedup (in-memory; see §4 Q1).
+   The "always reply on failure" and "don't drain the whole queue on a dead
+   connection" items are deferred — the system stays correct without them
+   (failed images reach DEAD_LETTER via the safety net; a drained queue is
+   recovered by the safety-net re-send), just slower to recover.
+
+§4 status after these decisions: Q1 answered (no server dedup today — read
+`face_server_tx2.py`; dedup key `(cid, image_id)`, in-memory first); Q2 open
+(per-image time T still unmeasured — measure from live reply latency, then
+re-check `sent_timeout_ms` against 60 × T); Q3 moot for now (no proto change);
+Q4 answered (duplicate replies are harmless client-side — watermark is
+idempotent — but duplicate *processing* pollutes Milvus, which is why the
+server dedup exists); Q5: dead-letter SENT on permanent errors (as §3.1);
+Q6 answered (safety net 600 s is acceptable with W = 60 bounding the queue).
+
 Files read: `src/infra/Outbox.h/.cpp`, `src/app/Application.cpp/.h`,
 `src/app/AppContext.h`, `src/app/Config.h/.cpp`,
 `src/features/media_thumbnail/MediaThumbnailHandler.cpp`,

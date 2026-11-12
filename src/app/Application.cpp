@@ -59,7 +59,9 @@ void RequestGlobalShutdown() {
 
 Application::Application(Config config)
     : config_(std::move(config)),
-      outbox_(config_.outbox.db_path),
+      // reopen_grace = send_grace: SENT records recovered at startup replay
+      // on the first sweep after the same short grace a fresh send gets.
+      outbox_(config_.outbox.db_path, config_.outbox.send_grace_ms),
       workers_(std::make_shared<WorkerPool>(
           static_cast<std::size_t>(config_.worker_count),
           10'000,  // handler queue capacity
@@ -73,6 +75,8 @@ Application::Application(Config config)
           /*max_attempts=*/3}),
       files_(telegram_, &flood_retry_),
       transport_(config_.grpc),
+      // Flow-control window for the process path (retry design §2(c)).
+      flow_control_(config_.outbox.max_in_flight),
       // chat_state.enabled=false keeps the store memory-only (Chunk 1
       // behaviour); otherwise the Python `chathis` SQLite schema backs it.
       chat_state_(telegram_,
@@ -136,7 +140,7 @@ Application::Application(Config config)
 
   ctx_ = std::make_unique<AppContext>(AppContext{
       *workers_, telegram_, files_, process_pool_, search_pool_, outbox_,
-      config_});
+      config_, &flow_control_});
   WireHandlers();
   WireStreamerCallbacks();
 }
@@ -233,7 +237,40 @@ void Application::WireStreamerCallbacks() {
         }
       });
 
-  // Permanent gRPC failure -> dead-letter all pending (v5 §2.5).
+  // Write-ok: the request left the client (gRPC accepted it into the
+  // transport). PENDING/FAILED -> SENT until the safety deadline, out of
+  // the retry set — this is what removes the duplicate-send class (retry
+  // design §3.3: "whatever the server's latency"). A false MarkSent means
+  // this was a duplicate copy of a record already SENT/DONE/dead: its
+  // window slot returns immediately (the record's own slot resolves
+  // through its own path).
+  process_pool_.SetOnWritten([this](const ImageRequest& request) {
+    if (outbox_.MarkSent(request.image_id(),
+                         NowMs() + config_.outbox.sent_timeout_ms)) {
+      return;
+    }
+    flow_control_.Release();
+  });
+
+  // Write-lost (write failed, or dropped from a breaking stream's queue):
+  // the request provably never reached the server. The copy's window slot
+  // returns unconditionally; the record re-arms FAILED due-now when it was
+  // still PENDING (MarkFailed's PENDING guard is a no-op for SENT /
+  // DONE / DEAD_LETTER — a lost DUPLICATE copy must not re-arm a record
+  // whose real request is already on the wire). The reconnect / periodic
+  // sweep replays it within seconds, not the old full ack deadline (fixes
+  // G2/G3).
+  process_pool_.SetOnWriteLost([this](const ImageRequest& request) {
+    flow_control_.Release();
+    outbox_.MarkFailed(request.image_id(), "write lost", 0);
+  });
+
+  // Permanent gRPC failure -> dead-letter all pending (v5 §2.5), and the
+  // SENT records too (retry design §4 Q5): a server that rejects the
+  // stream outright will reject the replay, and a dead-lettered SENT
+  // record's window slot only a reply or the safety net would release.
+  // PENDING/FAILED records release nothing here — their queued copies
+  // resolve through write-lost (FailStream's ClearQueue runs after this).
   process_pool_.SetOnStreamFailed(
       [this](const grpc::Status& status) {
         if (!IsPermanentGrpcError(status.error_code())) return;
@@ -244,6 +281,14 @@ void Application::WireStreamerCallbacks() {
           spdlog::error("process: dead-lettered {} ({})", record.image_id,
                         status.error_message());
         }
+        const auto sent =
+            outbox_.SentPastDeadline(NowMs() + 24 * 3600 * 1000LL, 10'000);
+        for (const auto& record : sent) {
+          outbox_.MarkDeadLetter(record.image_id, status.error_message());
+          flow_control_.Release();
+          spdlog::error("process: dead-lettered sent {} ({})",
+                        record.image_id, status.error_message());
+        }
       });
 
   // Stream (re)connected -> sweep the Outbox: unacked records replay by
@@ -253,8 +298,24 @@ void Application::WireStreamerCallbacks() {
 }
 
 void Application::SweepOutbox() {
+  // Flow-control window (retry design §2(c)): never deal more than
+  // outbox.max_in_flight sent-but-unreplied process requests to the server.
+  // A window-blocked record stays PENDING/FAILED due — picked up by a later
+  // sweep once replies / the safety net free slots. Window-blocked records
+  // are never MarkRequeued, so window pressure cannot burn attempts.
+  bool window_full_logged = false;
   const auto due = outbox_.DueForRetry(NowMs(), kSweepBatch);
   for (const auto& record : due) {
+    if (!flow_control_.TryAcquire()) {
+      if (!window_full_logged) {
+        window_full_logged = true;
+        spdlog::warn(
+            "outbox: flow-control window full ({} in flight, cap {}) — "
+            "deferring sends", flow_control_.in_flight(),
+            flow_control_.window());
+      }
+      continue;
+    }
     ImageRequest request;
     request.set_image_id(record.image_id);
     request.set_image_data(record.image_data);
@@ -267,8 +328,30 @@ void Application::SweepOutbox() {
       outbox_.MarkRequeued(record.image_id, config_.outbox.retry_backoff_ms,
                            config_.outbox.max_attempts, "requeued for send");
     } else {
+      flow_control_.Release();
       spdlog::warn("outbox: retry sweep could not enqueue {} — will retry",
                    record.image_id);
+    }
+  }
+
+  // Safety net (retry design §3.1/§3.2): records whose request WAS written
+  // but that got no reply within outbox.sent_timeout_ms. Fate unknown (the
+  // stream may have died after the write) — one at-least-once re-send,
+  // server dedup is the backstop. Requeued (PENDING, attempts++, dead-letter
+  // at max_attempts) and the held window slot released; the next sweep
+  // re-acquires when it re-sends. This is the only place a SENT record
+  // re-enters the retry set on a timer, and where `attempts` now means
+  // only "un-acked re-sends" (fixes G1: a slow-but-alive server can no
+  // longer dead-letter records).
+  const auto stale = outbox_.SentPastDeadline(NowMs(), kSweepBatch);
+  for (const auto& record : stale) {
+    if (outbox_.MarkRequeued(record.image_id, config_.outbox.retry_backoff_ms,
+                             config_.outbox.max_attempts, "ack timeout")) {
+      flow_control_.Release();
+      spdlog::warn("outbox: {} sent-but-unreplied past ack timeout "
+                   "({} ms) — requeued (attempts {})",
+                   record.image_id, config_.outbox.sent_timeout_ms,
+                   record.attempts + 1);
     }
   }
 }

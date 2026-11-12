@@ -12,7 +12,7 @@
 // names, order, and the ON CONFLICT(chat_id) upsert are byte-compatible
 // (app_client.py schedule2db 1229-1237). Swapping in D1Client later means
 // implementing this interface, not touching ChatStateStore or Application;
-// the full D1 design lives in docs/state-persistence-and-d1.md.
+// the full D1 design lives in docs/pending/state-persistence-and-d1.md.
 //
 // All timestamps are GMT+8 civil strings in the Python formats (common/Gmt8.h)
 // so D1 rows written by either deployment parse back in both.

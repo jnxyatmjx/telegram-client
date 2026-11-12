@@ -884,7 +884,7 @@ of libraries.
   app_client.py schedule2db), a separate database file from the Outbox.
   Timestamps are GMT+8 civil strings in the Python formats
   (`common/Gmt8`), so D1 rows written by either deployment parse back
-  in both. Full D1 design: `docs/state-persistence-and-d1.md`.
+  in both. Full D1 design: `docs/pending/state-persistence-and-d1.md`.
 - `features/commands/ControlCommandsHandler` — The control-chat command
   surface (chunk 2; Python `handlersm` / `handlerfetchhistory` /
   `handrestore`). `/rsme` lists dialogs (channels/groups then users,
@@ -1114,7 +1114,7 @@ is set):
   `flush_interval_seconds` (30 s), entries active within
   `active_window_seconds` (45 s), schema and GMT+8 fields byte-compatible
   with the Python `chathis` table. The D1 backend arrives later behind the
-  same interface (`docs/state-persistence-and-d1.md`).
+  same interface (`docs/pending/state-persistence-and-d1.md`).
 
 ## Extending the client — how to add a new feature
 
@@ -1330,7 +1330,7 @@ Per IMPLEMENTATION_TASK.md / v5 §7 — a live run is NOT possible yet:
 4. Auto-search chat allowlist (phase 2; disabled by default).
 5. Cloudflare D1 credentials (Hong, via Secure Vault): `CLOUDFLARE_ACCOUNT_ID`,
    `CLOUDFLARE_API_TOKEN`, `D1_DATABASE_ID` — for the chat-state backend swap
-   (SQLite default works today; design in `docs/state-persistence-and-d1.md`).
+   (SQLite default works today; design in `docs/pending/state-persistence-and-d1.md`).
 6. Restricted private channels: Python auto-left them during `/rsme`
    (LeaveChannelRequest — destructive); the C++ port only marks them ⚠️.
    Confirm whether to migrate the auto-leave or keep report-only.
@@ -1366,7 +1366,8 @@ src/infra/          Outbox (SQLite + legacy-id migration, chunk 2),
 src/common/         Logger (spdlog), Idempotency (bare-ID conversion,
                     MakeImageId/MakeWireImageId), MemoCipher (AES-256-GCM
                     memo, chunk 1), Gmt8 (chunk 2), ResumeTimer (chunk 2)
-docs/               state-persistence-and-d1.md (chunk 2)
+docs/pending/       state-persistence-and-d1.md (chunk 2, D1 design),
+                    retry-design.md, PENDING_FEATURES.md (pending features)
 tests/              GTest unit tests
 config/             config.example.yaml
 third_party/td/     TDLib shallow clone (commit 4c6377a; built 2026-11-08,

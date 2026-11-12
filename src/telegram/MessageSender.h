@@ -9,10 +9,21 @@
 // 4096 chars (line boundaries preferred) and disables link previews on
 // every chunk.
 //
-// Markdown dialect: TDLib parses its own Markdown flavour, not Telethon's;
-// the generated content (inline code in backticks, [text](url) links) is
-// compatible — free-form user markdown may render differently (SURVEY
-// §8.5-1).
+// Markdown rendering (fixed 2026-11-12): TDLib does NOT parse markdown
+// from inputMessageText — a formattedText with raw "[text](url)" / "**bold**"
+// source is sent as literal plain text. So SendMarkdown first runs each
+// chunk through parseTextEntities with textParseModeMarkdown version 2
+// (MarkdownV2 — the flavour whose **bold** matches Python/Telethon's
+// "markdown" output) and sends the returned formattedText. A chunk whose
+// markdown fails to parse (e.g. an unescaped special character in a
+// display name) falls back to plain text so the reply still goes through.
+// Callers MUST escape MarkdownV2 specials in user-controlled text
+// (_ * [ ] ( ) ~ ` > # + - = | { } . !) before handing it to SendMarkdown.
+//
+// Chunks are sent strictly in order: chunk N+1 is only parsed after chunk
+// N's sendMessage has been dispatched, so a multi-chunk reply cannot
+// arrive scrambled. (A FloodWait retry re-sends a chunk later, so a
+// retried chunk can still land after a later chunk — same as before.)
 //
 // Fire-and-forget: sends are async, errors are logged with the chat id and
 // the first 200 chars of the chunk. No retry for ordinary errors — a failed
@@ -26,6 +37,8 @@
 #include <telegram/TelegramClient.h>
 
 #include <cstddef>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -51,15 +64,35 @@ class MessageSender {
       const std::string& text,
       std::size_t max_chars = kMaxMessageChars);
 
-  // Sends `text` as markdown with link previews disabled, in as many
-  // messages as the 4096-char split needs. Safe from any thread.
+  // Sends `text` as markdown (MarkdownV2, parsed via parseTextEntities)
+  // with link previews disabled, in as many messages as the 4096-char
+  // split needs, strictly in order. Safe from any thread.
   void SendMarkdown(std::int64_t chat_id, const std::string& text) const;
 
  private:
-  // Sends one chunk (attempt 1 from SendMarkdown; the flood retry path
-  // re-enters with attempt + 1).
-  void SendChunk(std::int64_t chat_id, const std::string& chunk,
-                 int attempt) const;
+  // Sends the chunks of one SendMarkdown call strictly in order: chunk
+  // `index` is parsed and dispatched, then the next chunk starts. `chunks`
+  // is shared so the chain can outlive the SendMarkdown call.
+  void SendChunksInOrder(
+      std::int64_t chat_id,
+      std::shared_ptr<const std::vector<std::string>> chunks,
+      std::size_t index) const;
+
+  // Parses one chunk as MarkdownV2, then sends it (via SendParsedChunk)
+  // and invokes `on_done` once the send has been dispatched. A parse
+  // failure falls back to the raw chunk as plain text.
+  void ParseAndSendChunk(std::int64_t chat_id, const std::string& chunk,
+                         int attempt,
+                         std::function<void()> on_done) const;
+
+  // Sends one already-parsed chunk (attempt 1 from ParseAndSendChunk; the
+  // flood retry path re-parses `chunk` and re-enters with attempt + 1).
+  // `on_done` runs once the send has been dispatched.
+  void SendParsedChunk(
+      std::int64_t chat_id,
+      td_api::object_ptr<td_api::formattedText> formatted,
+      const std::string& chunk, int attempt,
+      std::function<void()> on_done) const;
 
   ITdSender& sender_;
   FloodRetry* flood_retry_;  // not owned; may be null (see ctor comment)

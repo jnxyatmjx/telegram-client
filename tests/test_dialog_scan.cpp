@@ -38,7 +38,8 @@ class FakeTdSender : public tg::telegram::ITdSender {
   // --- programming --------------------------------------------------------
   int load_chats_ok_calls = 1;  // loadChats answers Ok this often, then 404
   std::string getChats_error;   // non-empty: hard-fail getChats with this
-  std::vector<std::int64_t> chat_list;
+  std::vector<std::int64_t> chat_list;          // main list
+  std::vector<std::int64_t> chat_list_archive;  // archive list
   struct ChatSpec {
     std::string title;
     int kind = 0;  // 0 supergroup, 1 basic group, 2 private, 3 secret
@@ -123,9 +124,15 @@ class FakeTdSender : public tg::telegram::ITdSender {
               getChats_error.substr(colon + 2));
           break;
         }
+        const auto& req = static_cast<const td_api::getChats&>(*request);
+        const bool archive =
+            req.chat_list_ != nullptr &&
+            req.chat_list_->get_id() == td_api::chatListArchive::ID;
+        const std::vector<std::int64_t>& list =
+            archive ? chat_list_archive : chat_list;
         auto result = td_api::make_object<td_api::chats>();
-        result->total_count_ = static_cast<std::int32_t>(chat_list.size());
-        result->chat_ids_ = chat_list;
+        result->total_count_ = static_cast<std::int32_t>(list.size());
+        result->chat_ids_ = list;
         response.object = std::move(result);
         break;
       }
@@ -473,6 +480,34 @@ TEST_F(DialogScanTest, ListScanResolvesAllChatKinds) {
 
   // kList never probes.
   EXPECT_EQ(sender_.sent_getSupergroupFullInfo, 0);
+  EXPECT_FALSE(scanner_->running());
+}
+
+TEST_F(DialogScanTest, ArchiveDialogsAreIncluded) {
+  // Python get_dialogs / iter_dialogs counts archived dialogs; the C++
+  // scanner used to enumerate only the main list, so archived dialogs
+  // were missing from /rsme. The scanner now loads the archive list too.
+  const std::int64_t main_bare = 2'100'000'001;
+  const std::int64_t archived_bare = 2'100'000'002;
+  sender_.load_chats_ok_calls = 1;
+  sender_.chat_list = {SgDialog(main_bare)};
+  sender_.chat_list_archive = {SgDialog(archived_bare)};
+  sender_.chats[SgDialog(main_bare)] = {"Main", 0, main_bare};
+  sender_.chats[SgDialog(archived_bare)] = {"Archived", 0, archived_bare};
+  sender_.supergroups[main_bare] = {"mainchannel", true, false, false, false,
+                                    false, "", ""};
+  sender_.supergroups[archived_bare] = {"archivedchannel", true, false, false,
+                                        false, false, "", ""};
+  MakeScanner(commands::DialogScanner::Config{});
+
+  const auto views = ScanAndWait(commands::DialogScanner::Mode::kList);
+  ASSERT_EQ(views.size(), 2u);
+  EXPECT_EQ(views[0].bare_id, main_bare);
+  EXPECT_EQ(views[0].title, "Main");
+  EXPECT_EQ(views[1].bare_id, archived_bare);
+  EXPECT_EQ(views[1].title, "Archived");
+  // Both lists were enumerated (main + archive getChats).
+  EXPECT_EQ(sender_.sent_getChats, 2);
   EXPECT_FALSE(scanner_->running());
 }
 

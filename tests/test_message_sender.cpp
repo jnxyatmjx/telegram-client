@@ -27,7 +27,16 @@ class FakeTdSender : public tg::telegram::ITdSender {
                     tg::telegram::ResponseCallback callback) override {
     td::ClientManager::Response response;
     response.request_id = next_id_++;
-    if (request->get_id() == td_api::sendMessage::ID) {
+    if (request->get_id() == td_api::parseTextEntities::ID) {
+      // Simulate a successful MarkdownV2 parse that returns the text
+      // unchanged (no entity stripping in this fake — the flow, not
+      // TDLib's parser, is what these tests cover).
+      const auto& parse =
+          static_cast<const td_api::parseTextEntities&>(*request);
+      auto formatted = td_api::make_object<td_api::formattedText>();
+      formatted->text_ = parse.text_;
+      response.object = std::move(formatted);
+    } else if (request->get_id() == td_api::sendMessage::ID) {
       const auto& send = static_cast<const td_api::sendMessage&>(*request);
       sent_chat_ids.push_back(send.chat_id_);
       EXPECT_TRUE(send.input_message_content_ != nullptr);
@@ -182,6 +191,89 @@ TEST(SendMarkdown, ErrorsAreLoggedNotThrown) {
   EXPECT_EQ(sender.sent_texts.size(), 1u);
 }
 
+// parseTextEntities answers with an error: the chunk still goes out as
+// plain text (the raw markdown source) instead of being dropped.
+class ParseFailingTdSender : public tg::telegram::ITdSender {
+ public:
+  std::int64_t Send(td_api::object_ptr<td_api::Function>&& request,
+                    tg::telegram::ResponseCallback callback) override {
+    td::ClientManager::Response response;
+    response.request_id = next_id_++;
+    if (request->get_id() == td_api::parseTextEntities::ID) {
+      response.object = td_api::make_object<td_api::error>(
+          400, "Can't find end of the entity starting at byte offset 3");
+    } else if (request->get_id() == td_api::sendMessage::ID) {
+      const auto& send = static_cast<const td_api::sendMessage&>(*request);
+      const auto& content = static_cast<const td_api::inputMessageText&>(
+          *send.input_message_content_);
+      sent_texts.push_back(content.text_->text_);
+      response.object = td_api::make_object<td_api::message>();
+    } else {
+      response.object = td_api::make_object<td_api::error>(400, "unexpected");
+    }
+    callback(std::move(response));
+    return static_cast<std::int64_t>(response.request_id);
+  }
+
+  std::vector<std::string> sent_texts;
+
+ private:
+  std::uint64_t next_id_ = 1;
+};
+
+TEST(SendMarkdown, ParseFailureFallsBackToPlainText) {
+  ParseFailingTdSender sender;
+  const message_sender::MessageSender messenger(sender);
+  messenger.SendMarkdown(7, "a *broken markdown");
+  ASSERT_EQ(sender.sent_texts.size(), 1u);
+  EXPECT_EQ(sender.sent_texts[0], "a *broken markdown");
+}
+
+// The parse result is what gets sent, not the raw markdown source: the
+// fake's parse strips the backticks (as real TDLib would for a code span).
+class StrippingParseTdSender : public tg::telegram::ITdSender {
+ public:
+  std::int64_t Send(td_api::object_ptr<td_api::Function>&& request,
+                    tg::telegram::ResponseCallback callback) override {
+    td::ClientManager::Response response;
+    response.request_id = next_id_++;
+    if (request->get_id() == td_api::parseTextEntities::ID) {
+      const auto& parse =
+          static_cast<const td_api::parseTextEntities&>(*request);
+      std::string stripped;
+      for (const char c : parse.text_) {
+        if (c != '`') stripped.push_back(c);
+      }
+      auto formatted = td_api::make_object<td_api::formattedText>();
+      formatted->text_ = stripped;
+      response.object = std::move(formatted);
+    } else if (request->get_id() == td_api::sendMessage::ID) {
+      const auto& send = static_cast<const td_api::sendMessage&>(*request);
+      const auto& content = static_cast<const td_api::inputMessageText&>(
+          *send.input_message_content_);
+      sent_texts.push_back(content.text_->text_);
+      response.object = td_api::make_object<td_api::message>();
+    } else {
+      response.object = td_api::make_object<td_api::error>(400, "unexpected");
+    }
+    callback(std::move(response));
+    return static_cast<std::int64_t>(response.request_id);
+  }
+
+  std::vector<std::string> sent_texts;
+
+ private:
+  std::uint64_t next_id_ = 1;
+};
+
+TEST(SendMarkdown, ParsedTextIsWhatGetsSent) {
+  StrippingParseTdSender sender;
+  const message_sender::MessageSender messenger(sender);
+  messenger.SendMarkdown(7, "hello `world`");
+  ASSERT_EQ(sender.sent_texts.size(), 1u);
+  EXPECT_EQ(sender.sent_texts[0], "hello world");
+}
+
 // --- FloodWait retry (Telethon migration chunk 3) ------------------------------
 
 // sendMessage fake that answers the first `flood_left` sends with a TDLib
@@ -190,10 +282,18 @@ class FloodFakeTdSender : public tg::telegram::ITdSender {
  public:
   std::int64_t Send(td_api::object_ptr<td_api::Function>&& request,
                     tg::telegram::ResponseCallback callback) override {
-    ++send_requests;
     td::ClientManager::Response response;
     response.request_id = next_id_++;
-    if (request->get_id() == td_api::sendMessage::ID) {
+    if (request->get_id() == td_api::parseTextEntities::ID) {
+      // Parse succeeds (text unchanged); parse requests are NOT counted
+      // in send_requests — only sendMessage deliveries are.
+      const auto& parse =
+          static_cast<const td_api::parseTextEntities&>(*request);
+      auto formatted = td_api::make_object<td_api::formattedText>();
+      formatted->text_ = parse.text_;
+      response.object = std::move(formatted);
+    } else if (request->get_id() == td_api::sendMessage::ID) {
+      ++send_requests;
       const auto& send = static_cast<const td_api::sendMessage&>(*request);
       sent_chat_ids.push_back(send.chat_id_);
       const auto& content = static_cast<const td_api::inputMessageText&>(

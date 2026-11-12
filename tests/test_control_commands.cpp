@@ -414,6 +414,26 @@ TEST(ControlCommandStatics, RenderRsmeBatchesUsersFirstThenChats) {
             "2. **⚠️Priv Channel⚠️**\t`/who 400 Priv Channel`\t\n\n");
 }
 
+TEST(ControlCommandStatics, RenderRsmeBatchesEscapesMarkdownV2Specials) {
+  // A display name with MarkdownV2 specials (_ * …) must be escaped in
+  // the formatting context (link text / bold) so MessageSender's
+  // MarkdownV2 parse succeeds; inside a `code span` only a backtick can
+  // close the span, so the other specials stay literal there.
+  std::vector<commands::ChatView> views;
+  views.push_back(MakeUserView("Cool_Channel*Star", "cool", 200));
+  views.push_back(MakeChannelView("Best*Deals", "", 400));
+
+  const auto batches =
+      commands::ControlCommandsHandler::RenderRsmeBatches(views, 10);
+  // Users and chats batch separately (users first), so two batches.
+  ASSERT_EQ(batches.size(), 2u);
+  EXPECT_EQ(batches[0],
+            "1. [Cool\\_Channel\\*Star](https://t.me/cool)\t`/ym 200 "
+            "Cool_Channel*Star`\t\n\n");
+  EXPECT_EQ(batches[1],
+            "1. **⚠️Best\\*Deals⚠️**\t`/who 400 Best*Deals`\t\n\n");
+}
+
 TEST(ControlCommandStatics, RenderRsmeBatchesOneLinePerMessage) {
   std::vector<commands::ChatView> views;
   views.push_back(MakeUserView("Alice", "alice_h", 200));

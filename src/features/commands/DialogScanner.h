@@ -5,10 +5,16 @@
 // migration Chunk 2; Python handlersm 838-916 / scan_dialogs 1294-1317).
 //
 // This TDLib build has NO legacy getDialogs(offset,...): enumeration is
-//   1. loadChats(null chat_list, 100) repeatedly until it answers the
-//      404 error — TDLib's documented "all chats loaded" signal (each call
-//      loads the next chunk of the main list into the local database);
-//   2. getChats(null, dialog_limit) — the ordered list of loaded chats.
+//   1. loadChats(chat_list, 100) repeatedly until it answers the 404
+//      error — TDLib's documented "all chats loaded" signal (each call
+//      loads the next chunk of the list into the local database). The main
+//      list first, then the archive list (Python get_dialogs /
+//      iter_dialogs with archived=True counts archived dialogs too —
+//      without this step the C++ count is short by exactly the archived
+//      dialogs);
+//   2. getChats(main, dialog_limit) + getChats(archive, dialog_limit),
+//      merged and truncated to dialog_limit total (Python's limit is a
+//      total across folders).
 // Then each dialog id resolves sequentially (one outstanding request):
 //   getChat -> type:
 //     chatTypePrivate    -> getUser                     (usernames.active_usernames_, first_name)
@@ -120,6 +126,9 @@ class DialogScanner {
   // `current_` so a FloodWait retry closure only needs the peer id.
   void LoadMoreChats(app::AppContext& ctx);
   void FetchChatList(app::AppContext& ctx);
+  // Step 2b: the archive list's chats, merged with the main list's ids.
+  void FetchArchiveChatList(app::AppContext& ctx,
+                            std::vector<std::int64_t> main_ids);
   void ResolveNext(app::AppContext& ctx);
   void SendGetChat(app::AppContext& ctx, std::int64_t chat_id);
   void SendGetUser(app::AppContext& ctx, std::int64_t user_id);
@@ -157,6 +166,7 @@ class DialogScanner {
   bool running_ = false;
   Mode mode_ = Mode::kList;
   std::function<void(std::vector<ChatView>)> on_done_;
+  bool loading_archive_ = false;  // LoadMoreChats phase: main, then archive
   std::vector<std::int64_t> chat_ids_;  // enumeration result
   std::size_t next_chat_ = 0;           // resolution cursor
   std::vector<ChatView> views_;

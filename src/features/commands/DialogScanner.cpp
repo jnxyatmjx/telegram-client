@@ -5,6 +5,7 @@
 #include <common/Logger.h>
 #include <telegram/TdErrors.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <utility>
@@ -115,6 +116,7 @@ bool DialogScanner::Scan(app::AppContext& ctx, Mode mode,
     running_ = true;
     mode_ = mode;
     on_done_ = std::move(on_done);
+    loading_archive_ = false;
     chat_ids_.clear();
     next_chat_ = 0;
     views_.clear();
@@ -125,11 +127,21 @@ bool DialogScanner::Scan(app::AppContext& ctx, Mode mode,
   return true;
 }
 
-// Step 1: loadChats until the 404 "all chats loaded" error.
+// Step 1: loadChats until the 404 "all chats loaded" error — the main list
+// first, then the archive list (loading_archive_). Python's get_dialogs /
+// iter_dialogs counts archived dialogs too; TDLib keeps them in a separate
+// chatListArchive that is never loaded unless asked for.
 void DialogScanner::LoadMoreChats(app::AppContext& ctx) {
+  bool archive = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    archive = loading_archive_;
+  }
   auto request = td_api::make_object<td_api::loadChats>();
-  request->chat_list_ = nullptr;  // main chat list
-  request->limit_ = 100;          // TDLib caps the limit at 100 anyway
+  request->chat_list_ =
+      archive ? td_api::make_object<td_api::chatListArchive>()
+              : td_api::object_ptr<td_api::ChatList>{};
+  request->limit_ = 100;  // TDLib caps the limit at 100 anyway
   sender_.Send(
       std::move(request),
       [this, &ctx](td::ClientManager::Response&& response) {
@@ -139,7 +151,17 @@ void DialogScanner::LoadMoreChats(app::AppContext& ctx) {
           if (stopping_.load(std::memory_order_acquire)) return;
           if (const auto* error = AsError(*response_ptr)) {
             if (error->code_ == 404) {
-              FetchChatList(ctx);  // all chats loaded
+              bool archive = false;
+              {
+                std::lock_guard<std::mutex> lock(mutex_);
+                archive = loading_archive_;
+                if (!archive) loading_archive_ = true;
+              }
+              if (!archive) {
+                LoadMoreChats(ctx);  // main list done — now the archive
+                return;
+              }
+              FetchChatList(ctx);  // both lists loaded
               return;
             }
             if (telegram::IsFloodWait(*error)) {
@@ -156,10 +178,10 @@ void DialogScanner::LoadMoreChats(app::AppContext& ctx) {
       });
 }
 
-// Step 2: the ordered list of everything loaded in step 1.
+// Step 2: the ordered list of everything loaded in step 1 (main list).
 void DialogScanner::FetchChatList(app::AppContext& ctx) {
   auto request = td_api::make_object<td_api::getChats>();
-  request->chat_list_ = nullptr;
+  request->chat_list_ = nullptr;  // main chat list
   request->limit_ = config_.dialog_limit;
   sender_.Send(
       std::move(request),
@@ -180,15 +202,66 @@ void DialogScanner::FetchChatList(app::AppContext& ctx) {
           }
           const auto& chats =
               static_cast<const td_api::chats&>(*response_ptr->object);
+          spdlog::info("dialog_scan: {} dialogs in main list (limit {})",
+                       chats.chat_ids_.size(), config_.dialog_limit);
+          FetchArchiveChatList(ctx, chats.chat_ids_);
+        }, "getChats");
+      });
+}
+
+// Step 2b: the archive list's chats, merged with the main list's ids.
+void DialogScanner::FetchArchiveChatList(
+    app::AppContext& ctx, std::vector<std::int64_t> main_ids) {
+  auto request = td_api::make_object<td_api::getChats>();
+  request->chat_list_ = td_api::make_object<td_api::chatListArchive>();
+  request->limit_ = config_.dialog_limit;
+  sender_.Send(
+      std::move(request),
+      [this, &ctx, main_ids = std::move(main_ids)](
+          td::ClientManager::Response&& response) mutable {
+        auto response_ptr =
+            std::make_shared<td::ClientManager::Response>(std::move(response));
+        PostOrRun(ctx, [this, &ctx, response_ptr, main_ids = std::move(main_ids)] {
+          if (stopping_.load(std::memory_order_acquire)) return;
+          if (const auto* error = AsError(*response_ptr)) {
+            if (telegram::IsFloodWait(*error)) {
+              FloodPause(ctx, *error, [this, &ctx, main_ids] {
+                FetchArchiveChatList(ctx, main_ids);
+              });
+              return;
+            }
+            spdlog::error(
+                "dialog_scan: getChats(archive) failed: {} — scan aborted",
+                ErrorText(*response_ptr));
+            Finish(ctx, false);
+            return;
+          }
+          const auto& chats =
+              static_cast<const td_api::chats&>(*response_ptr->object);
+          spdlog::info("dialog_scan: {} dialogs in archive list",
+                       chats.chat_ids_.size());
+          // Merge: main first, then archive (a chat lives in exactly one
+          // list, but dedupe defensively), truncated to dialog_limit
+          // total — Python's get_dialogs(limit=1202) is a total.
+          std::vector<std::int64_t> merged = std::move(main_ids);
+          for (const std::int64_t id : chats.chat_ids_) {
+            if (std::find(merged.begin(), merged.end(), id) == merged.end()) {
+              merged.push_back(id);
+            }
+          }
+          if (config_.dialog_limit > 0 &&
+              static_cast<int>(merged.size()) > config_.dialog_limit) {
+            merged.resize(static_cast<std::size_t>(config_.dialog_limit));
+          }
           {
             std::lock_guard<std::mutex> lock(mutex_);
-            chat_ids_ = chats.chat_ids_;
+            chat_ids_ = std::move(merged);
             next_chat_ = 0;
           }
           spdlog::info("dialog_scan: {} dialogs enumerated (limit {})",
-                       chats.chat_ids_.size(), config_.dialog_limit);
+                       chat_ids_.size(), config_.dialog_limit);
           ResolveNext(ctx);
-        }, "getChats");
+        }, "getChats(archive)");
       });
 }
 

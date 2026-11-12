@@ -61,16 +61,74 @@ MessageSender::MessageSender(ITdSender& sender, FloodRetry* flood_retry)
 
 void MessageSender::SendMarkdown(std::int64_t chat_id,
                                  const std::string& text) const {
-  for (const std::string& chunk : SplitForTelegram(text)) {
-    SendChunk(chat_id, chunk, 1);
-  }
+  auto chunks = std::make_shared<const std::vector<std::string>>(
+      SplitForTelegram(text));
+  SendChunksInOrder(chat_id, chunks, 0);
 }
 
-void MessageSender::SendChunk(std::int64_t chat_id, const std::string& chunk,
-                              int attempt) const {
+void MessageSender::SendChunksInOrder(
+    std::int64_t chat_id,
+    std::shared_ptr<const std::vector<std::string>> chunks,
+    std::size_t index) const {
+  if (index >= chunks->size()) return;
+  ParseAndSendChunk(chat_id, (*chunks)[index], 1,
+                    [this, chat_id, chunks, index] {
+                      SendChunksInOrder(chat_id, chunks, index + 1);
+                    });
+}
+
+void MessageSender::ParseAndSendChunk(std::int64_t chat_id,
+                                      const std::string& chunk, int attempt,
+                                      std::function<void()> on_done) const {
+  // TDLib parses markdown locally (no network), so this is fast — but it
+  // is still an async request through the client, hence the callback chain.
+  auto parse_request = td_api::make_object<td_api::parseTextEntities>();
+  parse_request->text_ = chunk;
+  auto mode = td_api::make_object<td_api::textParseModeMarkdown>();
+  // Version 2 = MarkdownV2, whose **bold** matches Python/Telethon's
+  // "markdown" output. Version 0/1 is the classic flavour (single * for
+  // bold) and would silently strip the ** in our /rsme format.
+  mode->version_ = 2;
+  parse_request->parse_mode_ = std::move(mode);
+
+  sender_.Send(std::move(parse_request),
+               [this, chat_id, chunk, attempt, on_done = std::move(on_done)](
+                   td::ClientManager::Response&& response) mutable {
+                 td_api::object_ptr<td_api::formattedText> formatted;
+                 if (response.object != nullptr &&
+                     response.object->get_id() == td_api::formattedText::ID) {
+                   formatted = td_api::move_object_as<td_api::formattedText>(
+                       std::move(response.object));
+                 } else {
+                   // Parse failed (malformed markdown — e.g. an unescaped
+                   // special character in a display name). Fall back to
+                   // the raw chunk as plain text so the reply still goes
+                   // through; the caller should escape user-controlled
+                   // text to avoid hitting this.
+                   std::string why = "<no object>";
+                   if (response.object != nullptr &&
+                       response.object->get_id() == td_api::error::ID) {
+                     const auto& error =
+                         static_cast<const td_api::error&>(*response.object);
+                     why = std::to_string(error.code_) + ": " + error.message_;
+                   }
+                   spdlog::warn("send_text: markdown parse failed ({}) — "
+                                "sending chunk as plain text (head: {:.80})",
+                                why, chunk);
+                   formatted = td_api::make_object<td_api::formattedText>();
+                   formatted->text_ = chunk;
+                 }
+                 SendParsedChunk(chat_id, std::move(formatted), chunk, attempt,
+                                 std::move(on_done));
+               });
+}
+
+void MessageSender::SendParsedChunk(
+    std::int64_t chat_id,
+    td_api::object_ptr<td_api::formattedText> formatted,
+    const std::string& chunk, int attempt,
+    std::function<void()> on_done) const {
   auto content = td_api::make_object<td_api::inputMessageText>();
-  auto formatted = td_api::make_object<td_api::formattedText>();
-  formatted->text_ = chunk;
   content->text_ = std::move(formatted);
   auto preview = td_api::make_object<td_api::linkPreviewOptions>();
   preview->is_disabled_ = true;  // Python link_preview=False everywhere
@@ -85,36 +143,39 @@ void MessageSender::SendChunk(std::int64_t chat_id, const std::string& chunk,
   request->reply_markup_ = nullptr;
   request->input_message_content_ = std::move(content);
 
-  sender_.Send(std::move(request),
-               [this, chat_id, text = chunk, attempt](
-                   td::ClientManager::Response&& response) {
-                 if (response.object == nullptr) return;
-                 if (response.object->get_id() == td_api::error::ID) {
-                   const auto& error = static_cast<const td_api::error&>(
-                       *response.object);
-                   if (IsFloodWait(error)) {
-                     // Rate-limited: re-send the SAME chunk after
-                     // retry-after + pad (it was never accepted), bounded
-                     // by the shared scheduler's attempt cap.
-                     if (flood_retry_ != nullptr &&
-                         flood_retry_->Schedule(
-                             error, attempt, [this, chat_id, text, attempt] {
-                               SendChunk(chat_id, text, attempt + 1);
-                             })) {
-                       return;
-                     }
-                     spdlog::error(
-                         "send_text: sendMessage to {} still flood-limited "
-                         "after {} attempts — chunk dropped (head: {:.80})",
-                         chat_id, attempt, text);
-                     return;
-                   }
-                   spdlog::error(
-                       "send_text: sendMessage to {} failed: {}: {} "
-                       "(text head: {:.80})", chat_id, error.code_,
-                       error.message_, text);
-                 }
-               });
+  sender_.Send(
+      std::move(request),
+      [this, chat_id, chunk, attempt](td::ClientManager::Response&& response) {
+        if (response.object == nullptr) return;
+        if (response.object->get_id() == td_api::error::ID) {
+          const auto& error =
+              static_cast<const td_api::error&>(*response.object);
+          if (IsFloodWait(error)) {
+            // Rate-limited: re-parse and re-send the SAME chunk after
+            // retry-after + pad (it was never accepted), bounded by the
+            // shared scheduler's attempt cap. Re-parsing (local, fast)
+            // preserves the markdown entities.
+            if (flood_retry_ != nullptr &&
+                flood_retry_->Schedule(
+                    error, attempt, [this, chat_id, chunk, attempt] {
+                      ParseAndSendChunk(chat_id, chunk, attempt + 1, [] {});
+                    })) {
+              return;
+            }
+            spdlog::error("send_text: sendMessage to {} still flood-limited "
+                          "after {} attempts — chunk dropped (head: {:.80})",
+                          chat_id, attempt, chunk);
+            return;
+          }
+          spdlog::error("send_text: sendMessage to {} failed: {}: {} "
+                        "(text head: {:.80})",
+                        chat_id, error.code_, error.message_, chunk);
+        }
+      });
+  // The send has been dispatched; the next chunk may start. (A FloodWait
+  // retry re-parses and re-sends this chunk later, so it can land after a
+  // later chunk — same as the pre-parse behaviour.)
+  if (on_done) on_done();
 }
 
 }  // namespace tg::telegram

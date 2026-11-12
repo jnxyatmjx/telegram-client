@@ -100,6 +100,58 @@ std::string ControlCommandsHandler::SanitizeTitle(const std::string& title) {
   return out;
 }
 
+namespace {
+// MarkdownV2 escaping (MessageSender parses with textParseModeMarkdown
+// version 2). In a formatting context (bold text, link text) every one of
+// these must be escaped or the parse fails / misfires:
+//   _ * [ ] ( ) ~ ` > # + - = | { } . !
+std::string EscapeMarkdownV2(const std::string& text) {
+  std::string out;
+  out.reserve(text.size() * 2);
+  for (const char c : text) {
+    switch (c) {
+      case '_':
+      case '*':
+      case '[':
+      case ']':
+      case '(':
+      case ')':
+      case '~':
+      case '`':
+      case '>':
+      case '#':
+      case '+':
+      case '-':
+      case '=':
+      case '|':
+      case '{':
+      case '}':
+      case '.':
+      case '!':
+        out.push_back('\\');
+        break;
+      default:
+        break;
+    }
+    out.push_back(c);
+  }
+  return out;
+}
+
+// Inside a `code span` the content is literal — only a backtick can close
+// the span early, so only it needs escaping.
+std::string EscapeCodeSpan(const std::string& text) {
+  std::string out;
+  out.reserve(text.size() + 2);
+  for (const char c : text) {
+    if (c == '`') out.push_back('\\');
+    out.push_back(c);
+  }
+  return out;
+}
+
+}  // namespace
+
 std::vector<std::string> ControlCommandsHandler::RenderRsmeBatches(
     const std::vector<ChatView>& views, int batch_lines) {
   if (batch_lines < 1) batch_lines = 1;
@@ -113,13 +165,17 @@ std::vector<std::string> ControlCommandsHandler::RenderRsmeBatches(
     if (view.kind == ChatView::Kind::kUser) {
       if (!view.username.empty()) {
         // handlersm 881/883: [{first_name}](https://t.me/{username}) + /ym.
-        user_lines.push_back(std::to_string(j) + ". [" + view.first_name +
+        // The display name is user-controlled: escape it for the link text
+        // (MarkdownV2) and for the code span (backtick only).
+        user_lines.push_back(std::to_string(j) + ". [" +
+                             EscapeMarkdownV2(view.first_name) +
                              "](https://t.me/" + view.username + ")\t`/ym " +
                              std::to_string(view.bare_id) + " " +
-                             view.first_name + "`\t\n\n");
+                             EscapeCodeSpan(view.first_name) + "`\t\n\n");
       } else {
         // handlersm 885: **🎯name🎯** + /who.
-        user_lines.push_back(std::to_string(j) + ". **🎯" + view.title +
+        user_lines.push_back(std::to_string(j) + ". **🎯" +
+                             EscapeMarkdownV2(view.title) +
                              "🎯**\t`/who " + std::to_string(view.bare_id) +
                              "`\t\n\n");
       }
@@ -136,9 +192,12 @@ std::vector<std::string> ControlCommandsHandler::RenderRsmeBatches(
     } else {
       // handlersm 874/894: private channel or basic group — the ⚠️ line
       // (restricted-channel auto-leave NOT migrated: destructive).
-      chat_lines.push_back(std::to_string(i) + ". **⚠️" + view.title +
+      // Title is user-controlled: escape it for the bold text and for the
+      // code span (backtick only).
+      chat_lines.push_back(std::to_string(i) + ". **⚠️" +
+                           EscapeMarkdownV2(view.title) +
                            "⚠️**\t`/who " + std::to_string(view.bare_id) +
-                           " " + view.title + "`\t\n\n");
+                           " " + EscapeCodeSpan(view.title) + "`\t\n\n");
     }
     ++i;
   }
@@ -178,8 +237,15 @@ std::string ControlCommandsHandler::RenderRsor(
     const ChatView& view = *findings[k];
     const std::string uname =
         view.username.empty() ? "私有" : "@" + view.username;
-    body += "• " + view.title + " [" + uname + "]\n  " + view.Link() +
-            "\n  原因：" + view.FindingReason();
+    // Plain-text report, but it is sent through SendMarkdown (MarkdownV2
+    // parse) — escape the user-controlled title / name / reason so a
+    // special character cannot misfire the parse. The link is left
+    // unescaped (a bare URL: if its '.' ever trips the parse, the
+    // plain-text fallback sends the whole report verbatim, which is
+    // exactly what this report is).
+    body += "• " + EscapeMarkdownV2(view.title) + " [" +
+            EscapeMarkdownV2(uname) + "]\n  " + view.Link() +
+            "\n  原因：" + EscapeMarkdownV2(view.FindingReason());
     if (k + 1 < shown) body += "\n\n";
   }
   return "共发现 " + std::to_string(findings.size()) +

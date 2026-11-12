@@ -17,6 +17,10 @@
 // a stream, and the stream object may only be destroyed once its Finish tag
 // has been delivered. So every failure path funnels into FailStream(), which
 // issues Finish once; OnFinish() is the only place that destroys the stream.
+// Finish() must also wait for a WritesDone already in flight to complete:
+// calling Finish() while WritesDone is pending is a gRPC API misuse that
+// aborts the process (call_op_set.h assertion, live 2026-11-12), so
+// FailStream defers Finish in that case and OnWritesDone() issues it.
 // Stop() respects this too: it lets the CQ thread drain the stream (cancel
 // -> WritesDone -> Finish -> OnFinish) and joins it BEFORE shutting the CQ
 // down. Shutting the CQ down first would strand the stream with an
@@ -320,10 +324,16 @@ class AsyncStreamer {
   }
 
   void OnWritesDone() {
-    // WritesDone completed. If a failure already scheduled Finish, that
-    // Finish call already happened (or happens next via FailStream) — do
-    // nothing there. Otherwise this is a clean close: issue Finish.
-    if (finish_requested_ || finish_called_ || stream_ == nullptr) return;
+    // WritesDone completed. Finish() must be issued exactly once and only
+    // AFTER WritesDone has completed: calling Finish() while a WritesDone
+    // is still in flight is a gRPC API misuse — grpc_call_start_batch
+    // rejects it and the process aborts on an assertion in call_op_set.h
+    // (seen live 2026-11-12 when the keepalive watchdog closed the
+    // transport mid-backfill: the Read failed first so WritesDone went
+    // out, then the Write failed and FailStream called Finish() while
+    // WritesDone was still pending). So FailStream defers Finish when a
+    // WritesDone is in flight, and this handler issues it.
+    if (finish_called_ || stream_ == nullptr) return;
     finish_requested_ = true;
     finish_called_ = true;
     stream_->Finish(&finish_status_, &finish_tag_);
@@ -370,6 +380,16 @@ class AsyncStreamer {
     state_.store(StreamState::kBackingOff, std::memory_order_release);
 
     if (stream_ != nullptr && !finish_called_) {
+      if (writes_done_called_) {
+        // A WritesDone is still in flight (the Read failed first, so
+        // TryWritesDone issued it before this Write failure arrived).
+        // Do NOT call Finish() yet: Finish() while WritesDone is pending
+        // is a gRPC API misuse that aborts the process (call_op_set.h
+        // assertion, live 2026-11-12). OnWritesDone() issues Finish()
+        // when the WritesDone tag lands; OnFinish() then destroys the
+        // stream and reconnects.
+        return;
+      }
       finish_called_ = true;
       finish_status_ = status;
       // Last op on the stream; OnFinish() will destroy + reconnect.

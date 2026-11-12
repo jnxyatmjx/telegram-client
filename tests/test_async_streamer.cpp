@@ -258,4 +258,62 @@ TEST_F(StreamerTest, ReconnectAfterServerRestart) {
   StopServer();
 }
 
+TEST_F(StreamerTest, ReconnectAfterServerKillWithPendingWrites) {
+  // Regression test for the live crash 2026-11-12: during an /xm backfill
+  // the ProcessImages stream was busy (write queue full) when the keepalive
+  // watchdog closed the transport, and the process aborted on a gRPC
+  // assertion in call_op_set.h. Root cause: the Read failed first so a
+  // WritesDone went out, then the Write failed and FailStream called
+  // Finish() while that WritesDone was still in flight — a gRPC API
+  // misuse. The fix defers Finish until the WritesDone tag lands. This
+  // test kills the server while writes are pending and requires a clean
+  // reconnect afterwards (no abort, no hang, work flows again).
+  StartServer();
+  auto streamer = MakeStreamer();
+  streamer->Start();
+  ASSERT_TRUE(WaitForRunning(*streamer, std::chrono::seconds(10)));
+  ASSERT_TRUE(streamer->Enqueue(MakeRequest("c1:m1:before"),
+                                std::chrono::milliseconds(1000)));
+  ASSERT_TRUE(WaitForReplies(1, std::chrono::seconds(10)));
+
+  // Queue several more writes so the stream is busy when the server dies.
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_TRUE(streamer->Enqueue(
+        MakeRequest("c1:burst-" + std::to_string(i)),
+        std::chrono::milliseconds(1000)));
+  }
+
+  // Kill the server mid-burst: the stream must break and the streamer must
+  // notice (and must not abort on the WritesDone/Finish ordering).
+  StopServer();
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(10);
+  while (streamer->IsStreamRunning() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  EXPECT_FALSE(streamer->IsStreamRunning());
+
+  // Bring the server back on the same socket; the streamer must reconnect
+  // on its own and work must flow again.
+  ::grpc::ServerBuilder builder;
+  builder.AddListeningPort("unix://" + socket_path_,
+                           ::grpc::InsecureServerCredentials());
+  builder.RegisterService(&service_);
+  server_ = builder.BuildAndStart();
+  ASSERT_NE(server_, nullptr);
+
+  ASSERT_TRUE(WaitForReconnected(1, std::chrono::seconds(10)));
+  ASSERT_TRUE(WaitForRunning(*streamer, std::chrono::seconds(10)));
+  const std::size_t before = replies_.size();
+  ASSERT_TRUE(streamer->Enqueue(MakeRequest("c1:m2:after"),
+                                std::chrono::milliseconds(1000)));
+  ASSERT_TRUE(WaitForReplies(before + 1, std::chrono::seconds(10)));
+  EXPECT_EQ(replies_.back().image_id(), "c1:m2:after");
+  EXPECT_EQ(replies_.back().result(), "ok:c1:m2:after");
+
+  streamer->Stop();
+  StopServer();
+}
+
 }  // namespace

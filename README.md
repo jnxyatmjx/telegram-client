@@ -16,15 +16,17 @@ Architecture: `~/workspace/tdlib-grpc-architecture.md` (v5).
   此后绝不再重编（见 Build 一节铁律）。
 - 真实实现：登录、接收、派发、下载、两个触发器、全异步 gRPC 流、
   SQLite Outbox、bare-ID 换算。
-- 测试：24 个 GTest 二进制，含假服务器端到端测试，全部通过
-  （见 Test 一节）。
+- 测试：26 个 GTest 二进制（`tests/CMakeLists.txt`；见 Test 一节）。
 - **Telethon 迁移**：chunk 1（线上协议对齐：memo AES-256-GCM、
   `image_id = str(message_id)`、bare owner_id、`ImageReply.result`
   JSON、整图发送）已合入（commit a939e0b）；chunk 2（状态持久化、
   控制命令面 `/rsme` `/rsor` `/xm` 族、历史回填引擎、媒体频道白名单、
-  Outbox 旧 id 迁移）已实现并通过全部测试；chunk 3（gRPC channel args
-  健壮性 + 统一 FloodWait 处理 + 扩展文档）已实现并通过全部测试
-  （见 §Extending）。改动未提交，等 Hong 验收。
+  Outbox 旧 id 迁移）已合入（`da529f0`）；chunk 3（gRPC channel args
+  健壮性 + 统一 FloodWait 处理 + 扩展文档）已合入（`9707ed9`，
+  见 §Extending）。其后的 Outbox `kSent` 重试（`42c75b0`）和
+  ProcessImages 流控窗口（`outbox.max_in_flight`；槽位在 `MarkDone`
+  成功时释放，`4cec0e3`）也在当前 `main` 上。见
+  [Outbox state](#outbox-state)。
 
 ## Dependencies (apt, Ubuntu 24.04 / Debian 11 — no vcpkg, no source builds)
 
@@ -361,8 +363,8 @@ cmake --build build --target tdclient -j1
 ## Architecture
 
 Design doc: `~/workspace/tdlib-grpc-architecture.md` (v5, settled 2026-11-07).
-This section is the short version for the README; the design doc is
-authoritative when the two disagree.
+This section is the short version. Where that doc and the code disagree,
+the code wins; this README follows the code.
 
 ### Design
 
@@ -383,15 +385,22 @@ authoritative when the two disagree.
   the media, calls `downloadFile`, waits for `updateFile`, reads the
   thumbnail bytes from `local.path`, builds an `ImageRequest` and pushes
   it to the streamer's bounded write queue. The CompletionQueue thread
-  writes it to the server. The SQLite Outbox is retry-only, not the
-  main path.
-- **At-least-once delivery, server dedup.** Every `ImageRequest` carries
-  `image_id = str(message_id)` (Telethon-migration chunk 1: the
-  message-level id the Python server uses; cross-chat collisions are
-  accepted, same as the Python client). On reconnect the Outbox replays
-  unacked records by `image_id` and the server deduplicates on that key.
-  The old composite `"<chat>:<msg>:<uid>"` form (`MakeImageId`) survives
-  only inside the in-memory SearchReq correlation table.
+  writes it to the server. The handler writes the SQLite Outbox before
+  that enqueue, so the bytes survive a crash. The streamer's happy path
+  sends the in-memory request; the retry thread reads the Outbox only
+  for rows that are still due. See [Outbox state](#outbox-state).
+- **At-least-once delivery.** Every `ImageRequest` carries
+  `image_id = str(message_id)` and `owner_id` (the bare chat id). The
+  outbox primary key is `image_id` alone, so two chats that share a
+  message id share one row; `MakeWireImageId` accepts that collision.
+  A row still in `kSent` is not replayed on reconnect. Startup recovery
+  and the sent-timeout safety net do re-send, and
+  `Outbox::RecoverSentRecords` names server dedup of `(cid, image_id)`
+  — the same pair as `(owner_id, image_id)` — as the backstop.
+  Chat-state watermarks are per bare chat id: `ImageReply.result`
+  `{"cid","mid"}` only moves that chat's `offset_id` forward. The old
+  composite `"<chat>:<msg>:<uid>"` form (`MakeImageId`) survives only
+  inside the in-memory SearchReq correlation table, keyed by `(oid, id)`.
 - **Triggers.** Nothing is sent automatically on receiving an image.
   `ProcessImages` and `SearchImages` fire only on a command from a
   specified bot in Telegram (mode (a): the bot itself is the sender,
@@ -408,23 +417,126 @@ authoritative when the two disagree.
   first — URLs, t.me links, whitespace and `[]*_ -` removed). Plaintext
   is never sent: an unconfigured `KEYME` or a failed encryption means
   the message is not sent at all. `owner_id` is the bare MTProto chat id
-  (same conversion as `SearchReq.oid`: channel `-chat_id - 1e12`,
-  basic group `-chat_id`, user `chat_id`), range-checked to
-  `0..4294967295` — out of range is a loud error, never truncated.
-  `SearchReq` uses the same uint32 bare MTProto IDs for `oid`/`id` and
-  is not replayed from the Outbox because its correlation table
-  `(oid, id) -> message` lives only in memory. `ImageReply.result` is
-  the server contract `{"cid": <bare id>, "mid": <msg id>}`; it is
-  parsed into the in-memory `ChatStateStore` (per-chat watermark,
-  on-demand chat-URL resolution) and a malformed result is logged and
-  dropped, never crashing the pipeline.
-- **Failure handling.** `downloadFile` timeout/failure retries 3 times
-  with backoff, then dead-letter. A full write queue blocks the worker
-  with a timeout and leaves the record PENDING for the retry thread.
-  A broken gRPC stream reconnects with backoff (1s → 2s → 4s … cap 30s)
-  and replays unacked Outbox records. `INVALID_ARGUMENT` /
-  `PERMISSION_DENIED` from the server dead-letters immediately without
-  retry.
+  (`ToBareChatId64`: channel `-chat_id - 1e12`, basic group `-chat_id`,
+  user `chat_id`) with no uint32 cap — user ids above 2^32 are valid.
+  An id that is not a dialog id is a loud error and is not sent.
+  `SearchReq.oid` / `SearchReq.id` are the uint32 bare ids, range-checked
+  to `0..4294967295` (out of range is a loud error, never truncated),
+  and `SearchReq` is not replayed from the Outbox because its correlation
+  table `(oid, id) -> message` lives only in memory. `ImageReply.result`
+  is the server contract `{"cid": <bare id>, "mid": <msg id>}`; it is
+  parsed into `ChatStateStore` (per-chat watermark, on-demand chat-URL
+  resolution; persisted when `chat_state.enabled`) and a malformed result
+  is logged and dropped, never crashing the pipeline.
+- **Failure handling.** `FileDownloader` has no download timer: a
+  download that never completes simply never resolves. A TDLib 429 on
+  `downloadFile` is retried through `FloodRetry` (up to 3 re-issues),
+  then the download fails; that path does not dead-letter the Outbox.
+  A full ProcessImages write queue does not block the worker (`Enqueue`
+  timeout 0): the record goes to `kFailed`, due immediately, for the
+  retry thread. A broken gRPC stream reconnects with backoff
+  (1s → 2s → 4s … cap 30s). Reconnect replays only `kPending` /
+  `kFailed` rows whose `next_retry_at` has passed; a `kSent` row stays
+  sent until its reply, its safety deadline, or a permanent error.
+  `INVALID_ARGUMENT`, `PERMISSION_DENIED`, `UNIMPLEMENTED` and
+  `NOT_FOUND` dead-letter `kPending`, `kFailed` and `kSent` immediately.
+
+### Outbox state
+
+`outbox.state` is `tg::infra::OutboxState` (`src/infra/Outbox.h`),
+stored as an INTEGER. Names and values:
+
+| value | name | meaning |
+|---|---|---|
+| 0 | `kPending` | In the queue, not yet accepted by a stream write, or re-armed for another send. `DueForRetry` returns it once `next_retry_at` has passed. |
+| 4 | `kSent` | The request was written to a stream (`MarkSent`) and is waiting for `ImageReply`. Invisible to `DueForRetry`. `next_retry_at` is the safety deadline. |
+| 1 | `kDone` | `MarkDone` recorded the reply. Eligible for purge after `outbox.purge_done_after_seconds`. |
+| 2 | `kFailed` | The send did not leave the client (`MarkFailed`: queue full, or the write was lost while the row was still `kPending`). Still inside the retry window: `DueForRetry` picks it up when `next_retry_at` passes. |
+| 3 | `kDeadLetter` | No automatic send. `DueForRetry` and `SentPastDeadline` both skip it. |
+
+There is no other state. The usual path is `kPending` → `kSent` →
+`kDone`. A lost write goes to `kFailed` and is sent again; once
+`MarkRequeued` has incremented `attempts` to `outbox.max_attempts`
+(default 5) the row becomes `kDeadLetter`.
+
+Transitions, as the SQL actually filters them:
+
+- **`Put`** inserts or replaces on `image_id`. `FinishProcess` stores
+  `kPending` with `next_retry_at = now + outbox.send_grace_ms` (default
+  5 s) and `attempts` 0. Re-processing an id that is still `kSent`
+  releases that flow-control slot first, then overwrites the row.
+- **`MarkSent(id, sent_until_ms)`** — `kPending` or `kFailed` →
+  `kSent`, `next_retry_at = sent_until_ms` (`now + outbox.sent_timeout_ms`,
+  default 600 s). Returns false (no change) for an id that is already
+  `kSent`, `kDone`, `kDeadLetter`, or unknown. A false write-ok
+  releases the flow-control slot; a true one keeps it.
+- **`MarkDone(id, result)`** — `kPending`, `kFailed` or `kSent` →
+  `kDone`, `last_status = result`, `updated_at = now`. Returns false
+  for `kDone`, `kDeadLetter`, or an unknown id. **A true result
+  releases one ProcessImages flow-control slot, before the
+  `{"cid","mid"}` parse, so a non-JSON `result` still frees the
+  window.** A false result releases nothing — a second reply must
+  not under-count the window. The duplicate-`kDone` case is logged as
+  already done; any other false result is logged as an unknown
+  `image_id`. When `result` parses as `{"cid","mid"}`, the watermark
+  update still runs, including after a duplicate reply.
+- **`MarkFailed(id, error, delay_ms)`** — only `kPending` → `kFailed`,
+  `next_retry_at = now + delay_ms`. The call sites pass `0`, so the
+  row is due immediately. A write-lost callback always releases the
+  slot, then calls this; a lost duplicate of a row that is already
+  `kSent`, `kDone` or `kDeadLetter` does not move it.
+- **`MarkRequeued(id, delay_ms, max_attempts, note)`** — any existing
+  row. `attempts` becomes `attempts + 1`. If that value is `>=
+  max_attempts` the state is `kDeadLetter`, otherwise `kPending`, and
+  `next_retry_at = now + delay_ms`. The retry sweep calls it after a
+  successful re-enqueue (`retry_backoff_ms`, default 5 s, note
+  `"requeued for send"`). The safety net calls it for a `kSent` row
+  past its deadline (note `"ack timeout"`) and, on success, releases
+  the slot. A window-blocked row is not `MarkRequeued`, so sitting
+  behind the cap does not burn attempts.
+- **`MarkDeadLetter(id, error)`** — any existing row → `kDeadLetter`.
+  A permanent gRPC status selects `kPending` / `kFailed` with
+  `DueForRetry(now + 24h, 10000)` and `kSent` with
+  `SentPastDeadline(now + 24h, 10000)`, then dead-letters each.
+  Queued `kPending` / `kFailed` copies release the slot later, via
+  write-lost. Each dead-lettered `kSent` row releases one slot in
+  this callback.
+- **Startup** (`RecoverSentRecords`, grace = `send_grace_ms`): every
+  `kSent` row becomes `kPending` with `next_retry_at = now + grace`.
+  Shutdown does not clear `kSent`; the next open does. If no `kSent`
+  rows are left, the update changes nothing.
+- **`PurgeDoneBefore(cutoff)`** deletes rows with `state = kDone` AND
+  `updated_at <= cutoff`. Nothing else is deleted. The retry thread
+  calls it once per sweep with
+  `cutoff = now - outbox.purge_done_after_seconds * 1000` (default
+  86400 s, so a day after `MarkDone`). `0` makes the cutoff `now`, so
+  every `kDone` row goes on the next sweep. `kPending`, `kSent`,
+  `kFailed` and `kDeadLetter` stay until some other transition moves
+  them.
+
+`SweepOutbox` (retry thread every `outbox.retry_interval_ms`, default
+10 s, and on every lane reconnect, including SearchImages) does two
+passes, each capped at 100 rows:
+
+1. `DueForRetry`: `kPending` and `kFailed` with `next_retry_at <= now`.
+   Each one `TryAcquire`s a flow-control slot, then `Enqueue`s. Success
+   → `MarkRequeued`. The window is full → leave the row alone. Enqueue
+   fails → release the slot, leave the row due.
+2. `SentPastDeadline`: `kSent` with `next_retry_at <= now` →
+   `MarkRequeued` and release the slot. That is the only timer that
+   puts a written request back into the retry set.
+
+Flow control (`src/app/FlowControl.h`, `outbox.max_in_flight`, default
+60; `0` disables it) counts ProcessImages requests from `TryAcquire`
+until their fate is known: copies sitting in a lane queue and rows
+already `kSent`. SearchImages never takes a slot. `Release` decrements
+unconditionally (a rare double release can make the counter negative;
+it does not clamp at zero, so a real release cannot be lost). Slots
+come back on a successful `MarkDone`, a write-lost, a failed enqueue
+after acquire, a false `MarkSent`, a safety-net requeue, a permanent
+error's `kSent` dead-letter, or `FinishProcess` replacing a `kSent`
+row. A full window leaves the new row `kPending` until `send_grace_ms`,
+then a later sweep sends it.
 
 ### Process and thread model
 
@@ -441,6 +553,8 @@ tg-client (1 process)
   ProcessImages CQ threads (grpc.connections, 1 by default)
   SearchImages CQ threads (grpc.connections, 1 by default)
   Outbox Retry thread (1)
+  ResumeTimer threads (3: FloodRetry, HistoryBackfill, DialogScanner)
+  Chat-state flush thread (1, only when chat_state.enabled)
   TDLib internal threads (N, owned by TDLib)
 ```
 
@@ -451,7 +565,9 @@ tg-client (1 process)
 | Worker Pool | 4 | Handler stages (short, never blocking): extract tier, start download, finish stage (read file, hash, build `ImageRequest`, write Outbox, enqueue to streamer) | Call `receive()`; call gRPC `Write`/`Read` directly (only `Enqueue`); block on a TDLib response or a download |
 | ProcessImages CQ | grpc.connections | One per lane: owns that lane's `ProcessImages` CompletionQueue and `ClientAsyncReaderWriter`; loops `cq.Next()`, handles Write done, Read replies, Finish, reconnect | Call TDLib `send`/`receive` (use thread-safe `TelegramClient::Send`) |
 | SearchImages CQ | grpc.connections | Same as above, for the `SearchImages` stream, its own CQ and stub per lane | Same; the two streams are isolated, one breaking does not affect the other |
-| Outbox Retry | 1 | Every 10 s, re-enqueues PENDING/FAILED Outbox records whose retry time has come | Call gRPC `Write` directly (only `Enqueue`) |
+| Outbox Retry | 1 | Every `outbox.retry_interval_ms` (10 s): `SweepOutbox` (due `kPending`/`kFailed`, plus `kSent` past `sent_timeout_ms`), then `PurgeDoneBefore` | Call gRPC `Write` directly (only `Enqueue`) |
+| ResumeTimer | 3 | One thread each for `FloodRetry`, `HistoryBackfill` and `DialogScanner`; idle until a FloodWait deadline | Block, or do file I/O, in the fire callback |
+| Chat-state flush | 0 or 1 | When `chat_state.enabled`: every `flush_interval_seconds`, `FlushActive`; a final full flush on shutdown | Run when the feature is off |
 | TDLib internal | N | Actors, network, crypto, local database, created by TDLib | Not created, joined or driven by us |
 
 - **Async message processing — no message blocks another (2026-11-09).**
@@ -465,8 +581,8 @@ tg-client (1 process)
   call `FileDownloader::DownloadAsync`, then return; the download
   callback (Receive thread) only posts the finish stage, which reads the
   file, builds the request, writes the Outbox and enqueues (one
-  non-blocking attempt — a full queue leaves the record PENDING for the
-  retry thread). `FileDownloader` has no timer: a download that never
+  non-blocking attempt — a full queue `MarkFailed`s the record, due
+  immediately, for the retry thread). `FileDownloader` has no timer: a download that never
   completes simply never resolves, and no thread is blocked waiting for
   it. There is no blocking wait API at all — `ITdSender::SendWithFuture`
   was removed, and `FileDownloader::Download` (future) exists only for
@@ -492,8 +608,10 @@ tg-client (1 process)
   `FINISH` (server closed the stream, error, or shutdown) →
   `RECONNECT` (backoff 1s → 2s → 4s … cap 30s, then CREATE again).
   Each stream gets a fresh `ClientContext` with auth metadata attached
-  once per stream, never per message. There is no per-message deadline;
-  the app-level ack timeout (30 s per `image_id`) decides replays.
+  once per stream, never per message. There is no per-message deadline.
+  Replays are the Outbox sweep: write-ok moves the row to `kSent` until
+  `outbox.sent_timeout_ms`; `kPending` / `kFailed` are sent again when
+  `next_retry_at` passes. `grpc.ack_timeout_ms` is parsed and unused.
 - **Synchronization.** `receive()` needs no lock because only one thread
   calls it. `send()` is thread-safe in TDLib; `request_id` comes from an
   atomic counter starting at 1. The `FileDownloader` map is guarded by
@@ -509,11 +627,16 @@ tg-client (1 process)
   and joins it before shutting the CQ down. Shutting the CQ down first
   strands the stream with an outstanding Read and the server hangs in
   `Read()` forever.
-- **Shutdown order.** (1) Stop dispatching new updates. (2) Drain the
-  worker pool with a timeout; unfinished work stays in the Outbox.
-  (3) Both streamers: `WritesDone()`, wait for `Finish()`, shut the CQ,
-  join the CQ thread. (4) `TelegramClient::Stop()`: `close()`, wait for
-  the Receive thread. (5) Flush the Outbox, join the retry thread, exit.
+- **Shutdown order** (`Application::Run`). (1) `HistoryBackfill` and
+  `DialogScanner` refuse new TDLib sends; `FloodRetry::Shutdown` drops
+  pending 429 re-sends. (2) `TelegramClient::Stop()` completes pending
+  TDLib callbacks (their download callbacks post finish stages).
+  (3) `FileDownloader::FailAll` for anything still pending.
+  (4) Drain the worker pool (10 s). Unfinished Outbox rows stay on
+  disk. (5) Both streamers: cancel, `WritesDone`, `Finish`, then shut
+  the CQ and join the CQ thread. (6) Join the Outbox retry thread.
+  (7) Join the chat-state flush thread and, when it is enabled, flush
+  every entry (not only the 45 s window).
 
 ### Parallel gRPC connections (lanes)
 
@@ -555,9 +678,11 @@ own pair of stubs (`ProcessImagesClient` / `SearchImagesClient`,
 constructed with that lane's channel) and its own pair of
 `AsyncStreamer`s, each with its own CompletionQueue and its own CQ
 thread. `StreamerPool` (one per RPC) owns the N streamers for that RPC.
-Application threads are therefore **7 + 2 × connections**: Main (1) +
-TDLib Receive (1) + Worker Pool (4) + Outbox Retry (1) + 2 CQ threads
-per lane. Each lane also holds 2 stubs and 2 long-lived streams.
+Threads besides the per-lane CQ pair: Main (1) + TDLib Receive (1) +
+Worker Pool (4) + Outbox Retry (1) + three `ResumeTimer` threads, so
+**10 + 2 × connections**, plus the chat-state flush thread when
+`chat_state.enabled`. Each lane also holds 2 stubs and 2 long-lived
+streams. TDLib's own threads are extra and not in that count.
 
 #### Why one connection is not enough
 
@@ -625,11 +750,14 @@ lane keeps running — the two streams are isolated from each other.
 means depends on the RPC:
 
 - **ProcessImages: not lost.** Every request was recorded in the
-  Outbox before it was enqueued. On reconnect, the streamer's
-  `OnReconnected` handler fires `SweepOutbox`, which re-enqueues the
-  unacknowledged records by `image_id`; the server deduplicates on
-  that key (at-least-once delivery). So a dead lane delays ProcessImages
-  traffic, it does not drop it.
+  Outbox before it was enqueued. On reconnect, `OnReconnected` fires
+  `SweepOutbox`, which re-enqueues `kPending` / `kFailed` rows whose
+  retry time has come (under the flow-control window) and requeues
+  `kSent` rows past `sent_timeout_ms`. A `kSent` row still inside its
+  deadline is not sent again. A later safety-net or restart replay is
+  at-least-once; the backstop named in `RecoverSentRecords` is server
+  dedup of `(cid, image_id)`. A dead lane delays ProcessImages traffic,
+  it does not drop it.
 - **SearchImages: lost.** Search requests are never written to the
   Outbox (by design — search is idempotent/read-only, and the
   `(oid, id)` correlation lives only in memory). A search that was
@@ -643,15 +771,17 @@ not rejected. (If the stream fails again while they are queued, the
 rule above applies: ProcessImages is Outbox-covered, SearchImages is
 lost.)
 
-**Reconnect side effects.** `OnReconnected` fires once per lane, and
-each firing sweeps the Outbox. The sweep is idempotent (it only picks
-up records that are still unacknowledged), so several lanes
-reconnecting at once is harmless — the same record is never sent twice
-in a harmful way, and the server dedupes by `image_id` anyway.
+**Reconnect side effects.** `OnReconnected` fires once per lane (both
+RPCs), and each firing sweeps the Outbox. The sweep only takes rows
+that are already due, so several lanes reconnecting at once do not
+re-send a `kSent` row that is still inside its deadline. A safety-net
+requeue can send a written request again; that replay is at-least-once.
 Permanent gRPC errors (`INVALID_ARGUMENT`, `PERMISSION_DENIED`,
 `UNIMPLEMENTED`, `NOT_FOUND`) are different from a dead connection:
-they dead-letter all pending Outbox records instead of retrying them,
-because retrying cannot help.
+they dead-letter `kPending`, `kFailed` and `kSent` rows (up to 10000
+of each, anything due within 24 h) instead of retrying, because
+retrying cannot help. Each dead-lettered `kSent` row releases its
+flow-control slot in that callback.
 
 #### What this design deliberately does NOT do
 
@@ -729,10 +859,13 @@ of libraries.
 ### Modules
 
 - `app/Application` — Assembles everything and owns the lifecycle.
-  Wires the streamer callbacks: `ImageReply` → Outbox `MarkDone` by
-  `image_id`; `SearchRsp` → correlation-table lookup; stream
-  (re)connected → Outbox sweep (replay unacked records). Owns the
-  shutdown order.
+  Wires the streamer callbacks: `ImageReply` → `OnProcessImageReply`
+  (`MarkDone` by `image_id`, and `FlowControl::Release` only when that
+  returns true) plus the `{"cid","mid"}` watermark; write-ok →
+  `MarkSent` (false → release the slot); write-lost → release the slot
+  and `MarkFailed`; permanent gRPC status → `MarkDeadLetter`;
+  `SearchRsp` → correlation-table lookup; stream (re)connected →
+  `SweepOutbox`. Owns the shutdown order above.
 - `app/Config` — Loads `config.yaml`, expands `${ENV}` placeholders.
   Secrets (`api_id`/`api_hash`, TDLib encryption key, gRPC token, phone)
   come only from the environment, never from code or git.
@@ -798,11 +931,13 @@ of libraries.
   chain: extract → download → read bytes → SHA-256 (log only) → build
   `ImageRequest` (`image_id = str(message_id)`, media bytes, `memo` =
   AES-256-GCM ciphertext of the cleaned caption, `owner_id` = bare
-  chat id) → Outbox PENDING → enqueue to the ProcessImages stream.
-  Fails fast before downloading when the chat id does not fit the bare
-  uint32 range or `KEYME` is unconfigured; an encryption failure sends
-  nothing. Enqueue failure leaves the record PENDING for the retry
-  thread. After the Outbox `Put` (bytes safe in the BLOB) — and on every
+  chat id) → Outbox `kPending` (`next_retry_at` = now +
+  `send_grace_ms`) → flow-control `TryAcquire` → enqueue to the
+  ProcessImages stream. A full window leaves the row `kPending` for a
+  later sweep. Fails fast before downloading when the chat id is not a
+  valid bare id or `KEYME` is unconfigured; an encryption failure sends
+  nothing. Enqueue failure releases the slot and `MarkFailed`s the row
+  (due now) for the retry thread. After the Outbox `Put` (bytes safe in the BLOB) — and on every
   early-return path — the handler drops its claim on the local file
   (`FileDownloader::Release` → `deleteFile` at the last consumer); the
   retry replays from the BLOB, never from the file.
@@ -833,16 +968,20 @@ of libraries.
   Thin owners of the `ImageProcessor::Stub` halves. Each produces the
   `StartFn` (`PrepareAsync*`) its streamer uses. Reply handling lives
   in `Application`, not here.
-- `infra/Outbox` — SQLite persistence in WAL mode: `Put`, `Get`,
-  `MarkDone`, `MarkDeadLetter`, `DueForRetry`. One connection behind
-  one mutex, shared by workers and the retry thread. On open it runs
+- `infra/Outbox` — SQLite persistence in WAL mode, primary key
+  `image_id`. `Put`, `Get`, `MarkSent`, `MarkDone`, `MarkFailed`,
+  `MarkRequeued`, `MarkDeadLetter`, `DueForRetry`, `SentPastDeadline`,
+  `PurgeDoneBefore`. State values and transitions:
+  [Outbox state](#outbox-state). One connection behind one mutex,
+  shared by workers, CQ threads and the retry thread. On open it runs
   the legacy-id migration (chunk 2): rows whose image_id contains `:`
   (the Telethon client's `<chat>:<message_id>:<uid>` keys) are rewritten
-  to the wire format `str(message_id)`; a collision with an existing
-  current-format row drops the legacy row (both dedupe to the same
-  server key); a non-numeric middle segment is dead-lettered for
-  inspection — never replayed, never wedging the retry loop. Idempotent
-  on every reopen.
+  to `str(message_id)`; a collision with an existing current-format row
+  drops the legacy row (the local key is the message-id string); a
+  non-numeric middle segment is dead-lettered for inspection — never
+  replayed, never wedging the retry loop. Then `RecoverSentRecords`
+  turns leftover `kSent` rows into `kPending`. Both passes are
+  idempotent on every reopen.
 - `infra/Sha256`, `infra/FileStore` — SHA-256 hex (log only) and
   `ReadFileBytes` with a max-bytes cap.
 - `common/Idempotency` — `MakeWireImageId` (`str(message_id)`, the wire
@@ -1041,9 +1180,10 @@ same regex the Python client applies (URLs, `t.me` links, Unicode
 whitespace, `[]*_ -` all removed). The server must hold the same
 `KEYME` to decrypt the memo. Treat it as a secret on the level of
 `api_hash`: env only, never code, never git, never logs. If it is
-unset or encryption fails, the message is NOT sent (fail loud) —
-the record stays in the Outbox and the retry thread re-encounters the
-error each pass.
+unset, `SendProcessImages` refuses before the download and nothing is
+written to the Outbox. If encryption fails after the download, the
+finish stage logs and returns before `Put` — again nothing is queued,
+and the retry thread has no row to re-encounter.
 
 ### Private CA (grpc.ca_cert)
 
@@ -1086,10 +1226,25 @@ defaults below are what a fresh `config.yaml` gets:
 | `grpc.http2_lookahead_bytes` | 1048576 (1 MiB) | `GRPC_ARG_HTTP2_STREAM_LOOKAHEAD_BYTES` | how far ahead gRPC requests stream data (gRPC default 64 KiB) — larger = fewer flow-control stalls on big image sends |
 | `grpc.http2_write_buffer_bytes` | 524288 (512 KiB) | `GRPC_ARG_HTTP2_WRITE_BUFFER_SIZE` | per-call write buffer, smooths large sends |
 
-`grpc.ack_timeout_ms` is NOT one of these: it was already wired in an
-earlier change — it sets the Outbox ack deadline (PENDING → DONE when
-the `image_id` ack arrives, else MarkRequeued). It is app-level, not a
-channel arg, and chunk 3 did not change its behaviour.
+`grpc.ack_timeout_ms` is NOT one of these. It is still parsed (default
+30000) so an old `config.yaml` loads, and nothing in the send path
+reads it. Deadlines live on the outbox, below.
+
+### Outbox
+
+Keys under `outbox:` (`src/app/Config.h`; the example file comments
+them). State names are in [Outbox state](#outbox-state).
+
+| key | default | effect |
+|---|---|---|
+| `outbox.db_path` | `/data/outbox.sqlite` | WAL database. Primary key is `image_id` |
+| `outbox.retry_interval_ms` | 10000 | Retry-thread period: sweep, then purge |
+| `outbox.retry_backoff_ms` | 5000 | `next_retry_at` delay applied by `MarkRequeued` |
+| `outbox.max_attempts` | 5 | `MarkRequeued` dead-letters when the incremented `attempts` reaches this |
+| `outbox.send_grace_ms` | 5000 | `Put` deadline, and the grace that turns leftover `kSent` rows into `kPending` on open |
+| `outbox.sent_timeout_ms` | 600000 | Safety deadline stored by `MarkSent` (`kSent` → requeue) |
+| `outbox.max_in_flight` | 60 | ProcessImages flow-control window. `0` disables it. SearchImages ignores it |
+| `outbox.purge_done_after_seconds` | 86400 | Each sweep deletes `kDone` rows whose `updated_at` is at least this old. `0` deletes every `kDone` row on the next sweep. Other states are kept |
 
 ### Feature toggles (Telethon migration chunk 2)
 
@@ -1119,8 +1274,9 @@ is set):
 ## Extending the client — how to add a new feature
 
 This is the recipe for the three most common extensions, with the real
-file paths. The authoritative (Chinese) version is §4 of
-`~/workspace/tdlib-grpc-architecture.md`. Existing features to copy from:
+file paths. §4 of `~/workspace/tdlib-grpc-architecture.md` is the
+original Chinese write-up; follow the paths in this section when they
+differ. Existing features to copy from:
 a small handler is `features/media_channels/MediaChannelHandler`, a
 command is `/rsme` in `features/commands/ControlCommandsHandler`, an RPC
 is `SearchImages`.
@@ -1224,9 +1380,12 @@ is `SearchImages`.
    streams inherit the lane channel args (keepalive, 64 MiB caps,
    window) automatically.
 4. Decide replay semantics up front: at-least-once ⇒ `Outbox.Put`
-   BEFORE `Enqueue`, ack ⇒ `MarkDone` (the ProcessImages pattern); no
+   BEFORE `Enqueue`, write-ok ⇒ `MarkSent`, ack ⇒ `MarkDone` and
+   release the flow-control slot only when `MarkDone` returns true
+   (the ProcessImages pattern; see [Outbox state](#outbox-state)); no
    replay ⇒ say so in the header and accept loss on a dead lane (the
-   SearchImages pattern — its correlation table is memory-only).
+   SearchImages pattern — its correlation table is memory-only, and it
+   does not take a flow-control slot).
 5. Test against the in-process fake server: `tests/test_async_streamer.cpp`
    for the CQ state machine, `tests/test_e2e_fake_server.cpp` for the
    full pipeline (both use a Unix domain socket — see the note in
@@ -1280,7 +1439,7 @@ program's own log lines.
 ctest --test-dir build/tests --output-on-failure
 ```
 
-24 test binaries, all green (2026-11-11, deleteFile cache cleanup):
+26 test binaries, registered in `tests/CMakeLists.txt`:
 
 | test | covers |
 |---|---|
@@ -1289,7 +1448,7 @@ ctest --test-dir build/tests --output-on-failure
 | test_memo_cipher | chunk 1: Python-compatible caption cleaning (case by case), cross-language AES-GCM vectors in BOTH directions (Python ciphertext decrypted here; fixed-nonce C++ ciphertext byte-equal to Python's), round-trips incl. every base64 padding length, tamper/wrong-key rejection, a DISABLED live token dump for re-running the C++→Python check |
 | test_chat_state | chunk 1: `{"cid","mid"}` parsing, watermark only increases, supergroup/basic/user URL forms, migrated group follows its supergroup, placeholder on failure with NO retry storm, single in-flight resolution |
 | test_media_extractor | photo largest-tier (full image), tier tie-break, file-less tier skip, video/animation thumbnail-only, document `image/*`/`video/*`/reject |
-| test_outbox | PENDING -> DONE / retry / dead-letter / replay; legacy-id migration on reopen: numeric-middle `<chat>:<msg>:<uid>` rewritten to `str(message_id)` and kept pending, collision keeps the current-format row, converted rows dedupe among themselves, unparseable rows dead-letter, migration idempotent on every reopen |
+| test_outbox | `kPending` → `kDone` / retry / `kDeadLetter` / replay; `MarkSent` leaves the retry set until the deadline; `MarkDone` on `kSent`; reopen turns `kSent` into `kPending`; `MarkFailed` only from `kPending`; `PurgeDoneBefore` deletes old `kDone` rows only; legacy-id migration on reopen: numeric-middle `<chat>:<msg>:<uid>` rewritten to `str(message_id)` and kept pending, collision keeps the current-format row, converted rows dedupe among themselves, unparseable rows dead-letter, migration idempotent on every reopen |
 | test_bot_command | only the configured bot's command accepted, arg parsing; wire request checks: `image_id = str(message_id)`, `memo` = KEYME-encrypted cleaned caption (decrypt-verified), `owner_id` = bare id; `SecondCommandCompletesWhileFirstDownloadPending` proves async message processing (B completes while A's download is still pending) |
 | test_auto_search | allowlisted chat triggers Search only (disabled by default) |
 | test_handler_registry | dispatcher registration / dispatch |
@@ -1308,6 +1467,8 @@ ctest --test-dir build/tests --output-on-failure
 | test_flood_retry | chunk 3: `TdErrors` 429/retry-after parsing (code match, wire-text parse, unparseable → `RetryAfterOr` fallback); `FloodRetry` (fires after retry-after + pad, fallback delay when the text carries no number, attempt cap drops, Shutdown drops pending, Schedule after Shutdown refused, multiple pending all run); FileDownloader flood path (same-file retry lands once, cap gives up and fails the future, ride-along callbacks fail with the give-up, null scheduler keeps the old fail-fast, no double send while a retry is pending) |
 | test_grpc_channel_args | chunk 3: `MakeChannelArgs` — keepalive trio, 64 MiB send/receive caps, HTTP/2 lookahead + write buffer, per-lane subchannel-pool flag; `0` keeps the gRPC default for that arg; config values reach the raw `grpc_channel_args` (read back via `c_channel_args()` — gRPC 1.51 has no getter API) |
 | test_delete_file | deleteFile cache cleanup: one consumer downloads → `Release` sends `deleteFile` exactly once with the right file_id (and only after the bytes are delivered); shared file_id with the download in flight → both callbacks from ONE request, first `Release` deletes nothing, second deletes exactly once; failed download deletes nothing and the downloader stays usable; `Release` of an unknown file_id / double `Release` is a no-op; a `deleteFile` error response is swallowed (best-effort) |
+| test_flow_control | ProcessImages window: `TryAcquire` → enqueue → write-ok `MarkSent` (slot stays held) → `ImageReply` `MarkDone` → `Release`; the send past `max_in_flight` stays queued until one reply frees a slot |
+| test_application_flow_control | The same window through `Application`'s real `ImageReply` callback: a successful `MarkDone` releases the slot; a duplicate reply, a `kDeadLetter` row, and an unknown id do not |
 
 Note: the socket-based tests (test_async_streamer, test_e2e_fake_server,
 test_streamer_pool)
@@ -1341,7 +1502,7 @@ Per IMPLEMENTATION_TASK.md / v5 §7 — a live run is NOT possible yet:
 CMakeLists.txt  CMakePresets.json  Dockerfile  README.md
 proto/image_stream.proto            (verbatim, do not edit)
 src/main.cpp
-src/app/            Application, Config, AppContext
+src/app/            Application, Config, AppContext, FlowControl
 src/telegram/       TelegramClient, AuthManager, UpdateDispatcher,
                     UpdateHandler, FileDownloader, MessageSender (chunk 2),
                     TdErrors (chunk 2: 429/retry-after parsing),

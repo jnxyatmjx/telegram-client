@@ -1,5 +1,19 @@
 # Implementation task for Claude Code (GLM, opus model)
 
+> **Historical brief, not current behavior.** The client on `main` has
+> moved past several requirements below. Where this file disagrees with
+> the code, the code and `README.md` win. In particular: `ImageRequest.image_id`
+> is `str(message_id)`, not `"<chat_id>:<message_id>:<file_unique_id>"`;
+> `memo` is AES-256-GCM ciphertext of the cleaned caption, not the raw
+> caption; `owner_id` is the bare MTProto chat id (`ToBareChatId64`, no
+> uint32 cap); downloads are `DownloadAsync` with no blocking wait;
+> the Outbox has `kSent` (4) and a flow-control window
+> (`outbox.max_in_flight`, default 60); `ImageReply` releases that slot
+> only when `MarkDone` succeeds. The original task text is unchanged
+> below so the brief stays readable as a brief.
+
+
+
 You are Claude Code running on this cloud Linux VM (Ubuntu 24.04, 4 CPU, 7.7 GB RAM,
 ~150 GB home disk). Your job: implement the C++ Telegram client described in
 `~/workspace/tdlib-grpc-architecture.md` (v5, read it fully first) in this directory

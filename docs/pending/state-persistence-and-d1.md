@@ -14,7 +14,7 @@ The Python client's `chathis` table — one row per bare chat id:
 
 | column       | form                                    | C++ source            |
 |--------------|-----------------------------------------|-----------------------|
-| `chat_id`    | bare MTProto id (uint32 range, int64)   | `ChatStateStore` key  |
+| `chat_id`    | bare MTProto id (int64; user ids above 2^32 are valid) | `ChatStateStore` key  |
 | `offset_id`  | watermark, only increases               | `ApplyReply`          |
 | `chat_url`   | `https://t.me/...` or the placeholder   | on-demand resolution  |
 | `init_date`  | `YYYYMMDD`, GMT+8                       | `common/Gmt8::Date`   |
@@ -73,9 +73,10 @@ Authoritative reference: the Python `D1Database` wrapper (app_client.py
 - **Config keys** (env, never git/logs): `CLOUDFLARE_ACCOUNT_ID`,
   `CLOUDFLARE_API_TOKEN`, `D1_DATABASE_ID`, `D1_API_BASE`,
   `D1_BATCH_SIZE`, `D1_MAX_SQL_VARIABLES`, `D1_MAX_ATTEMPTS`, `D1_TIMEOUT`.
-- **Transport**: an HTTPS client in the C++ process (chunk 3 scope, like
-  the other robustness items). Flushing happens on the Application flush
-  thread; the D1 backend must never block a worker or the Receive thread.
+- **Transport**: an HTTPS client in the C++ process. Not built — chunk 3
+  did not add it. When it exists, flushing stays on the Application
+  flush thread; the D1 backend must never block a worker or the Receive
+  thread.
 
 Credentials arrive via Hong (Secure Vault). Until then the SQLite backend
 keeps the process fully functional — same schema, same flush semantics, so

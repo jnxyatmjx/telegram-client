@@ -1,5 +1,15 @@
 # Build notes — tg-client
 
+> **Session log, not current behavior.** Entries below record what was
+> true on the date in the heading (test counts, the pre-migration
+> `image_id` form, `memo` equal to the caption). Later protocol,
+> Outbox and flow-control behavior is in `README.md`
+> ([Outbox state](README.md#outbox-state)). Do not treat a dated result
+> such as "ctest 9/9" or "image_id = -100…:777:u-m" as what `main` does
+> now.
+
+
+
 ## TDLib: build once, never rebuild (Hong, 2026-11-08 10:18)
 
 TDLib (`tdcore` / `Td::TdStatic`) is built once. After that, later code

@@ -1,7 +1,48 @@
 # Retry / dedup design review — ImageRequest path (ProcessImages)
 
-Date: 2026-11-10 · Scope: analysis only, no code changed.
-Baseline: `925a0aa` ("Fix duplicate send / duplicate DONE for one /process").
+Date: 2026-11-10 · Written as analysis. **The client has since implemented
+(a2) and the flow-control window (c).** Current behavior is
+[Outbox state](../../README.md#outbox-state). This file is the design
+record, not a description of today's code.
+
+- **§0 "The system as built" is the pre-change baseline at `925a0aa`.**
+  It is not current behavior. In particular, write outcomes are now
+  observable, `kSent` exists, and `grpc.ack_timeout_ms` is parsed and
+  unread.
+- **§3 is the sketch that was implemented, with the differences below.**
+- **§2(b) and §2(d) were not implemented.**
+- **§4's questions are answered by the Decisions block under this
+  banner.** The question text further down is the original list.
+
+Where the code differs from the §3 sketch (`src/infra/Outbox.cpp`,
+`src/app/Application.cpp`, `src/features/media_thumbnail/MediaThumbnailHandler.cpp`):
+
+- `MarkFailed` updates only a `kPending` row. A write-lost of an
+  already-`kSent` / `kDone` / `kDeadLetter` id does not move it. The
+  write-lost callback still releases the flow-control slot.
+- The safety-net `MarkRequeued` sets `next_retry_at = now +
+  retry_backoff_ms` (default 5 s), not due-now. The sweep also calls
+  `MarkRequeued` after every successful re-enqueue of a due
+  `kPending` / `kFailed` row, so `attempts` counts those re-sends as
+  well as safety-net requeues.
+- `outbox.max_in_flight` (default 60) gates `FinishProcess` and
+  `SweepOutbox`. A full window does not enqueue and does not
+  `MarkRequeued`. SearchImages does not use the window.
+- `OnProcessImageReply` releases a slot only when `MarkDone` returns
+  true, and it does that before parsing `{"cid","mid"}`.
+- Permanent gRPC errors (`INVALID_ARGUMENT`, `PERMISSION_DENIED`,
+  `UNIMPLEMENTED`, `NOT_FOUND`) dead-letter `kPending`, `kFailed` and
+  `kSent`. Only the `kSent` rows release a slot in that callback.
+- `PurgeDoneBefore` deletes `kDone` rows with `updated_at <= now -
+  purge_done_after_seconds * 1000` (default 86400). It is not part of
+  the sketch; it runs on every retry-thread pass.
+- The local primary key is still `image_id` alone. `owner_id` is a
+  column. `RecoverSentRecords` names server dedup of `(cid, image_id)`
+  as the replay backstop; that dedup is not implemented in this
+  repository.
+
+Baseline of the analysis below: `925a0aa` ("Fix duplicate send /
+duplicate DONE for one /process").
 
 ## Decisions (Hong, 2026-11-12) — these settle §4's open questions
 
@@ -13,7 +54,10 @@ Baseline: `925a0aa` ("Fix duplicate send / duplicate DONE for one /process").
 2. **Server-side dedup key is `(cid, image_id)`, NOT `image_id` alone.**
    `image_id` is `str(message_id)` and is only unique within one chat, so
    the server must dedup on `(owner_id, image_id)` together. (The vector
-   record already stores both as `cid` / `mid`.)
+   record already stores both as `cid` / `mid`.) This is a server-side
+   decision. This client's outbox primary key is still `image_id` alone;
+   `owner_id` is a column on the same row. The server change is not in
+   this repository.
 3. **Flow-control window W = 60** (process path only; search bypasses it).
    With W = 60 the worst legitimate in-flight latency is ≈ 60 × per-image
    time, which the `sent_timeout_ms` safety net (default 600 s) must cover.

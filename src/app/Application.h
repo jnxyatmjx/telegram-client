@@ -65,8 +65,16 @@ class Application {
   int Run();
 
  private:
+  // Test seam: drives the production ImageReply handler and reads the
+  // flow-control counter. Production code does not use it.
+  friend class ProcessImagesFlowControlProbe;
+
   void WireHandlers();
   void WireStreamerCallbacks();
+  // ProcessImages ImageReply. MarkDone(PENDING/FAILED/SENT → DONE) releases
+  // the flow-control slot taken before that request was enqueued. A false
+  // MarkDone (already DONE, DEAD_LETTER, or an unknown id) releases nothing.
+  void OnProcessImageReply(const ImageReply& reply);
   void StartOutboxRetryThread();
   void StopOutboxRetryThread();
   // Chat-state flush loop (Chunk 2): FlushActive every

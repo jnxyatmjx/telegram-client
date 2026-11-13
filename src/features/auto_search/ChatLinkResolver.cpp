@@ -44,15 +44,13 @@ std::string AsciiLower(std::string s) {
   return s;
 }
 
-std::optional<std::string> PublicUsername(const td_api::supergroup& group) {
-  if (group.usernames_ == nullptr) return std::nullopt;
-  if (!group.usernames_->active_usernames_.empty() &&
-      !group.usernames_->active_usernames_.front().empty()) {
-    return group.usernames_->active_usernames_.front();
+std::optional<std::string> PublicUsername(const td_api::usernames* names) {
+  if (names == nullptr) return std::nullopt;
+  if (!names->active_usernames_.empty() &&
+      !names->active_usernames_.front().empty()) {
+    return names->active_usernames_.front();
   }
-  if (!group.usernames_->editable_username_.empty()) {
-    return group.usernames_->editable_username_;
-  }
+  if (!names->editable_username_.empty()) return names->editable_username_;
   return std::nullopt;
 }
 
@@ -243,93 +241,183 @@ void ChatLinkResolver::StartCid(const std::shared_ptr<Batch>& batch,
       batch, 1,
       [dialog] { return td_api::make_object<td_api::getChat>(dialog); },
       [this, batch, cid](td::ClientManager::Response response) {
-        OnChat(batch, cid, std::move(response));
+        OnChannelChat(batch, cid, std::move(response));
       });
 }
 
-void ChatLinkResolver::OnChat(const std::shared_ptr<Batch>& batch,
-                              std::int64_t cid,
-                              td::ClientManager::Response response) {
-  if (IsError(response) || response.object->get_id() != td_api::chat::ID) {
-    const std::string why = ErrorText(response);
-    spdlog::info(
-        "search: cid {} — no public username ({}) — using https://t.me/c/{}/",
-        cid, why, cid);
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!stopped_) Remember(cid, false, {});
+void ChatLinkResolver::OnChannelChat(const std::shared_ptr<Batch>& batch,
+                                     std::int64_t cid,
+                                     td::ClientManager::Response response) {
+  std::int64_t supergroup_id = 0;
+  bool confirmed = false;
+  if (!IsError(response) && response.object->get_id() == td_api::chat::ID) {
+    const auto chat =
+        td_api::move_object_as<td_api::chat>(std::move(response.object));
+    if (chat->type_ != nullptr &&
+        chat->type_->get_id() == td_api::chatTypeSupergroup::ID) {
+      supergroup_id =
+          static_cast<const td_api::chatTypeSupergroup&>(*chat->type_)
+              .supergroup_id_;
+      confirmed = true;
     }
-    Complete(batch, cid, std::nullopt);
-    return;
   }
-  const auto chat = td_api::move_object_as<td_api::chat>(std::move(response.object));
-  if (chat->type_ == nullptr ||
-      chat->type_->get_id() != td_api::chatTypeSupergroup::ID) {
-    spdlog::info(
-        "search: cid {} — not a channel or supergroup — using "
-        "https://t.me/c/{}/",
-        cid, cid);
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!stopped_) Remember(cid, false, {});
-    }
-    Complete(batch, cid, std::nullopt);
-    return;
-  }
-  const auto& type =
-      static_cast<const td_api::chatTypeSupergroup&>(*chat->type_);
-  const std::int64_t supergroup_id = type.supergroup_id_;
+  if (!confirmed) supergroup_id = cid;
   SendOff(
       batch, 1,
       [supergroup_id] {
         return td_api::make_object<td_api::getSupergroup>(supergroup_id);
       },
-      [this, batch, cid](td::ClientManager::Response supergroup) {
-        OnSupergroup(batch, cid, std::move(supergroup));
+      [this, batch, cid, confirmed](td::ClientManager::Response info) {
+        OnChannelInfo(batch, cid, std::move(info), confirmed);
       });
 }
 
-void ChatLinkResolver::OnSupergroup(const std::shared_ptr<Batch>& batch,
-                                    std::int64_t cid,
-                                    td::ClientManager::Response response) {
+void ChatLinkResolver::OnChannelInfo(const std::shared_ptr<Batch>& batch,
+                                     std::int64_t cid,
+                                     td::ClientManager::Response response,
+                                     bool confirmed) {
   std::optional<std::string> username;
-  if (!IsError(response) &&
-      response.object->get_id() == td_api::supergroup::ID) {
+  const bool is_group = !IsError(response) &&
+                        response.object->get_id() == td_api::supergroup::ID;
+  if (is_group) {
     username = PublicUsername(
-        static_cast<const td_api::supergroup&>(*response.object));
+        static_cast<const td_api::supergroup&>(*response.object).usernames_.get());
   }
-  if (!username.has_value()) {
-    const std::string why = IsError(response) ? ErrorText(response)
-                                              : "no public username";
-    spdlog::info(
-        "search: cid {} — no public username ({}) — using https://t.me/c/{}/",
-        cid, why, cid);
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!stopped_) Remember(cid, false, {});
-    }
-    Complete(batch, cid, std::nullopt);
+  if (username.has_value()) {
+    Accept(batch, cid, *username, "channel/supergroup username");
     return;
   }
+  if (confirmed || is_group) {
+    const std::string why = IsError(response) ? ErrorText(response)
+                                              : "no public username";
+    GiveUp(batch, cid,
+           "channel/supergroup has no public username (" + why + ")");
+    return;
+  }
+  ProbeUser(batch, cid);
+}
+
+void ChatLinkResolver::ProbeUser(const std::shared_ptr<Batch>& batch,
+                                 std::int64_t cid) {
+  SendOff(
+      batch, 1,
+      [cid] { return td_api::make_object<td_api::getUser>(cid); },
+      [this, batch, cid](td::ClientManager::Response response) {
+        OnUser(batch, cid, std::move(response), /*after_private=*/false);
+      });
+}
+
+void ChatLinkResolver::OnUser(const std::shared_ptr<Batch>& batch,
+                              std::int64_t cid,
+                              td::ClientManager::Response response,
+                              bool after_private) {
+  if (!IsError(response) && response.object->get_id() == td_api::user::ID) {
+    const auto& user = static_cast<const td_api::user&>(*response.object);
+    if (const auto username = PublicUsername(user.usernames_.get())) {
+      Accept(batch, cid, *username, "user/bot username");
+      return;
+    }
+    GiveUp(batch, cid, after_private
+                           ? "private chat loaded but user/bot has no public username"
+                           : "user/bot has no public username");
+    return;
+  }
+  const std::string why = ErrorText(response);
+  if (after_private) {
+    GiveUp(batch, cid,
+           "private chat loaded but getUser still failed (" + why +
+               "); searchPublicChat needs a username");
+    return;
+  }
+  ProbePrivate(batch, cid, why);
+}
+
+void ChatLinkResolver::ProbePrivate(const std::shared_ptr<Batch>& batch,
+                                    std::int64_t cid, std::string user_error) {
+  // Private chat id == user id. This can load a user the account already
+  // knows. searchPublicChat is not possible without a username.
+  SendOff(
+      batch, 1,
+      [cid] { return td_api::make_object<td_api::getChat>(cid); },
+      [this, batch, cid, user_error = std::move(user_error)](
+          td::ClientManager::Response response) {
+        OnPrivate(batch, cid, user_error, std::move(response));
+      });
+}
+
+void ChatLinkResolver::OnPrivate(const std::shared_ptr<Batch>& batch,
+                                 std::int64_t cid, std::string user_error,
+                                 td::ClientManager::Response response) {
+  if (!IsError(response) && response.object->get_id() == td_api::chat::ID) {
+    SendOff(
+        batch, 1,
+        [cid] { return td_api::make_object<td_api::getUser>(cid); },
+        [this, batch, cid](td::ClientManager::Response again) {
+          OnUser(batch, cid, std::move(again), /*after_private=*/true);
+        });
+    return;
+  }
+  ProbeBasic(batch, cid,
+             "getUser: " + user_error + "; getChat: " + ErrorText(response));
+}
+
+void ChatLinkResolver::ProbeBasic(const std::shared_ptr<Batch>& batch,
+                                  std::int64_t cid, std::string detail) {
+  SendOff(
+      batch, 1,
+      [cid] { return td_api::make_object<td_api::getBasicGroup>(cid); },
+      [this, batch, cid, detail = std::move(detail)](
+          td::ClientManager::Response response) {
+        OnBasic(batch, cid, detail, std::move(response));
+      });
+}
+
+void ChatLinkResolver::OnBasic(const std::shared_ptr<Batch>& batch,
+                               std::int64_t cid, std::string detail,
+                               td::ClientManager::Response response) {
+  if (!IsError(response) &&
+      response.object->get_id() == td_api::basicGroup::ID) {
+    GiveUp(batch, cid, "basic group has no public link");
+    return;
+  }
+  GiveUp(batch, cid,
+         "user/bot unknown to this account (" + detail +
+             "); searchPublicChat needs a username");
+}
+
+void ChatLinkResolver::Accept(const std::shared_ptr<Batch>& batch,
+                              std::int64_t cid, const std::string& username,
+                              const char* kind) {
   std::string url;
   bool from_config = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (const auto it = by_username_.find(AsciiLower(*username));
+    if (const auto it = by_username_.find(AsciiLower(username));
         it != by_username_.end()) {
       url = it->second;
       from_config = true;
     } else {
-      url = NormalizeLinkBase("https://t.me/" + *username);
+      url = NormalizeLinkBase("https://t.me/" + username);
     }
     if (!stopped_) Remember(cid, true, url);
   }
   if (from_config) {
     spdlog::info("search: cid {} -> {} (chat_links)", cid, url);
   } else {
-    spdlog::info("search: cid {} -> {} (public username)", cid, url);
+    spdlog::info("search: cid {} -> {} ({})", cid, url, kind);
   }
   Complete(batch, cid, std::move(url));
+}
+
+void ChatLinkResolver::GiveUp(const std::shared_ptr<Batch>& batch,
+                              std::int64_t cid, const std::string& reason) {
+  spdlog::info("search: cid {} — {} — using https://t.me/c/{}/", cid, reason,
+               cid);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!stopped_) Remember(cid, false, {});
+  }
+  Complete(batch, cid, std::nullopt);
 }
 
 void ChatLinkResolver::Complete(const std::shared_ptr<Batch>& batch,

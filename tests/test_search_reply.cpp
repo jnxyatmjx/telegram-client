@@ -142,6 +142,37 @@ class FakeTdSender : public tg::telegram::ITdSender {
 
 }  // namespace
 
+TEST(SearchResultLink, TdlibMessageIdShiftsAndSmallMidStays) {
+  EXPECT_EQ(search::SearchResultLink(7974301646LL, 31799115776LL,
+                                     std::string("https://t.me/hiops8888_bot/")),
+            "https://t.me/hiops8888_bot/30326");
+  EXPECT_EQ(search::SearchResultLink(7974301646LL, 31799115776LL, std::nullopt),
+            "https://t.me/c/7974301646/30326");
+  EXPECT_EQ(search::SearchResultLink(42, 88, std::string("https://t.me/name/")),
+            "https://t.me/name/88");
+  EXPECT_EQ(search::SearchResultLink(42, (1LL << 20) - 1, std::nullopt),
+            "https://t.me/c/42/1048575");
+}
+
+TEST(FormatSearchReply, LargeCidAndTdlibMidAreNotTruncated) {
+  const std::string result =
+      R"({"code":0,"data":[{"id":3834120,"distance":0.9999,"memo":"tok","cid":7974301646,"mid":31799115776}]})";
+  const auto cids = search::SearchReplyCids(result);
+  ASSERT_EQ(cids.size(), 1u);
+  EXPECT_EQ(cids[0], 7974301646LL);
+  const auto message = search::FormatSearchReply(
+      result,
+      [](const std::string&) { return std::optional<std::string>("hi"); },
+      [](std::int64_t cid) -> std::optional<std::string> {
+        EXPECT_EQ(cid, 7974301646LL);
+        return std::string("https://t.me/hiops8888_bot/");
+      });
+  EXPECT_NE(message.text.find("https://t.me/hiops8888_bot/30326"),
+            std::string::npos);
+  EXPECT_EQ(message.text.find("31799115776"), std::string::npos);
+  EXPECT_EQ(message.text.find("7974301646"), std::string::npos);
+}
+
 TEST(SearchResultLink, HttpUrlIsConcatenatedPlaceholderFallsBack) {
   EXPECT_EQ(search::SearchResultLink(42, 7, std::string("https://t.me/name/")),
             "https://t.me/name/7");
@@ -324,11 +355,26 @@ class LinkFakeSender : public tg::telegram::ITdSender {
               td_api::make_object<td_api::error>(400, "Chat not found");
         } else if (hold_dialog != 0 && dialog == hold_dialog) {
           hold = true;
-        } else if (is_private) {
-          auto chat = td_api::make_object<td_api::chat>();
-          chat->id_ = dialog;
-          chat->type_ = td_api::make_object<td_api::chatTypePrivate>(1);
-          response.object = std::move(chat);
+        } else if (dialog > 0) {
+          if (private_missing) {
+            response.object =
+                td_api::make_object<td_api::error>(400, "Chat not found");
+          } else {
+            auto chat = td_api::make_object<td_api::chat>();
+            chat->id_ = dialog;
+            chat->type_ = td_api::make_object<td_api::chatTypePrivate>(dialog);
+            response.object = std::move(chat);
+          }
+        } else if (fail_channel || is_private) {
+          if (is_private) {
+            auto chat = td_api::make_object<td_api::chat>();
+            chat->id_ = dialog;
+            chat->type_ = td_api::make_object<td_api::chatTypePrivate>(1);
+            response.object = std::move(chat);
+          } else {
+            response.object =
+                td_api::make_object<td_api::error>(400, "Chat not found");
+          }
         } else {
           const std::int64_t bare = -dialog - 1'000'000'000'000LL;
           auto chat = td_api::make_object<td_api::chat>();
@@ -339,22 +385,59 @@ class LinkFakeSender : public tg::telegram::ITdSender {
           response.object = std::move(chat);
         }
       } else if (request->get_id() == td_api::getSupergroup::ID) {
-        auto group = td_api::make_object<td_api::supergroup>();
-        group->id_ =
+        const auto id =
             static_cast<const td_api::getSupergroup&>(*request).supergroup_id_;
-        std::vector<std::string> active;
-        std::string editable;
-        if (!no_username) {
-          if (!editable_only.empty()) {
-            editable = editable_only;
-          } else {
-            active.push_back(username);
+        if (not_found || fail_supergroup) {
+          response.object =
+              td_api::make_object<td_api::error>(400, "Supergroup not found");
+        } else {
+          auto group = td_api::make_object<td_api::supergroup>();
+          group->id_ = id;
+          std::vector<std::string> active;
+          std::string editable;
+          if (!no_username) {
+            if (!editable_only.empty()) {
+              editable = editable_only;
+            } else {
+              active.push_back(username);
+            }
           }
+          group->usernames_ = td_api::make_object<td_api::usernames>(
+              std::move(active), std::vector<std::string>{},
+              std::move(editable), std::vector<std::string>{}, "");
+          response.object = std::move(group);
         }
-        group->usernames_ = td_api::make_object<td_api::usernames>(
-            std::move(active), std::vector<std::string>{}, std::move(editable),
-            std::vector<std::string>{}, "");
-        response.object = std::move(group);
+      } else if (request->get_id() == td_api::getUser::ID) {
+        const auto id = static_cast<const td_api::getUser&>(*request).user_id_;
+        last_user_id = id;
+        if (user_fails_left > 0) {
+          --user_fails_left;
+          response.object =
+              td_api::make_object<td_api::error>(400, "User not found");
+        } else if (not_found || user_missing) {
+          response.object =
+              td_api::make_object<td_api::error>(400, "User not found");
+        } else {
+          auto user = td_api::make_object<td_api::user>();
+          user->id_ = id;
+          const std::string name =
+              user_username.empty() ? username : user_username;
+          user->usernames_ = td_api::make_object<td_api::usernames>(
+              std::vector<std::string>{name}, std::vector<std::string>{}, "",
+              std::vector<std::string>{}, "");
+          response.object = std::move(user);
+        }
+      } else if (request->get_id() == td_api::getBasicGroup::ID) {
+        if (is_basic_group) {
+          response.object = td_api::make_object<td_api::basicGroup>(
+              static_cast<const td_api::getBasicGroup&>(*request)
+                  .basic_group_id_,
+              1, td_api::make_object<td_api::chatMemberStatusMember>(), true,
+              0);
+        } else {
+          response.object =
+              td_api::make_object<td_api::error>(400, "Basic group not found");
+        }
       } else {
         response.object =
             td_api::make_object<td_api::error>(400, "unexpected");
@@ -376,9 +459,17 @@ class LinkFakeSender : public tg::telegram::ITdSender {
   bool not_found = false;
   bool is_private = false;
   bool no_username = false;
+  bool fail_channel = false;
+  bool fail_supergroup = false;
+  bool user_missing = false;
+  bool private_missing = true;
+  bool is_basic_group = false;
+  int user_fails_left = 0;
   std::int64_t hold_dialog = 0;
   std::atomic<std::int64_t> last_dialog{0};
+  std::atomic<std::int64_t> last_user_id{0};
   std::string username = "publicxme";
+  std::string user_username;
   std::string editable_only;
   tg::telegram::ResponseCallback held_;
   td::ClientManager::Response held_response_;
@@ -508,4 +599,47 @@ TEST(ChatLinkResolve, OrderCacheTimeoutAndUsername) {
   EXPECT_EQ(both.at(12), "https://t.me/publicxme/");
   EXPECT_FALSE(both.at(13).has_value());
   workers.WaitForIdle(std::chrono::seconds(1));
+}
+
+TEST(ChatLinkResolve, UserBotCidAndBasicGroup) {
+  LinkFakeSender sender;
+  app::WorkerPool workers(2);
+  tg::telegram::FloodRetry flood(tg::telegram::FloodRetry::Options{0, 0, 3});
+  search::ChatLinkResolveOptions options;
+  options.timeout = std::chrono::milliseconds(500);
+  search::ChatLinkResolver resolver({}, &sender, &workers, &flood, options);
+
+  constexpr std::int64_t kBot = 7974301646LL;
+  sender.fail_channel = true;
+  sender.fail_supergroup = true;
+  sender.user_username = "hiops8888_bot";
+  sender.private_missing = true;
+  const auto bot = ResolveNow(resolver, {kBot}, workers);
+  EXPECT_EQ(bot.at(kBot), "https://t.me/hiops8888_bot/");
+  EXPECT_EQ(sender.last_user_id.load(), kBot);
+
+  // Channel path still wins when the -100 chat exists.
+  sender.fail_channel = false;
+  sender.fail_supergroup = false;
+  sender.username = "publicxme";
+  const auto channel = ResolveNow(resolver, {8}, workers);
+  EXPECT_EQ(channel.at(8), "https://t.me/publicxme/");
+  EXPECT_EQ(sender.last_dialog.load(), -8 - 1'000'000'000'000LL);
+
+  // getUser fails until getChat(user id) loads the private chat.
+  sender.fail_channel = true;
+  sender.fail_supergroup = true;
+  sender.user_fails_left = 1;
+  sender.private_missing = false;
+  sender.user_username = "loaded_bot";
+  const auto loaded = ResolveNow(resolver, {kBot + 1}, workers);
+  EXPECT_EQ(loaded.at(kBot + 1), "https://t.me/loaded_bot/");
+  EXPECT_EQ(sender.last_user_id.load(), kBot + 1);
+
+  sender.user_missing = true;
+  sender.private_missing = true;
+  sender.is_basic_group = true;
+  sender.user_fails_left = 0;
+  const auto group = ResolveNow(resolver, {55}, workers);
+  EXPECT_FALSE(group.at(55).has_value());
 }

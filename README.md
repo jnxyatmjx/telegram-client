@@ -956,9 +956,19 @@ of libraries.
   the fixed "No One Find" line (preview on). Each hit's URL uses that
   hit's `cid`, not the request oid. The base is `chat_links` (numeric
   key, or `@name` once the username is known), else an http(s) `chathis`
-  `chat_url` (read only), else `https://t.me/<username>/` from
-  `getChat` + `getSupergroup` (worker pool, 3s timeout, in-memory cache;
-  not written back to chathis), else `https://t.me/c/<cid>/<mid>`.
+  `chat_url` (read only), else TDLib in order: channel/supergroup
+  (`getChat` of the `-100…` id, or `getSupergroup(cid)`), then user/bot
+  (`getUser(cid)`, and `getChat(cid)` when the user is not loaded), then
+  basic group (no public link). Ids stay int64, including user ids above
+  2^32. A hit is logged as
+  `search: cid <id> -> https://t.me/<username>/ (user/bot username)` or
+  `(channel/supergroup username)`. Lookup runs on the worker pool with a
+  3s timeout and an in-memory cache, and is not written back to chathis.
+  Otherwise the link is `https://t.me/c/<cid>/<mid>`. A TDLib message id
+  (`mid >= 2^20` and divisible by `2^20`, such as `31799115776` → `30326`)
+  is shifted to the server id for every link kind; a smaller mid is
+  unchanged. The conversion is logged at debug:
+  `search: cid <id> mid <tdlib> is a TDLib message id — link uses <server>`.
   The send uses the correlation entry's TDLib chat id, never the
   uint32 `oid`. `/search` replies use the same path.
 - `features/media_thumbnail/MediaExtractor` — Pure tier selection

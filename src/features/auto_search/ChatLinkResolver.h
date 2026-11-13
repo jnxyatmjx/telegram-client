@@ -7,8 +7,12 @@
 //   1. features.auto_search.chat_links (numeric key: -100 id or bare id)
 //   2. chathis chat_url when it starts with http(s) — read only, never written
 //   3. in-memory cache (positive, or a negative that has not expired)
-//   4. TDLib: dialog id -(cid)-10^12 → getChat → getSupergroup →
-//      active_usernames[0] or editable_username → https://t.me/<username>/
+//   4. TDLib, in order, ids kept as int64 (user ids above 2^32 included):
+//      (a) channel/supergroup — getChat(-(cid)-10^12), or getSupergroup(cid)
+//      (b) user/bot — getUser(cid); if the user is unknown, getChat(cid)
+//          (private chat id == user id) and getUser once more
+//      (c) basic group — getBasicGroup(cid), which has no public link
+//      Usernames are active_usernames[0] or editable_username.
 //      An @name chat_links entry wins over that public URL.
 //   5. otherwise no base (the formatter uses https://t.me/c/<cid>/<mid>)
 //
@@ -100,10 +104,25 @@ class ChatLinkResolver {
   void SendOff(const std::shared_ptr<Batch>& batch, int attempt,
                MakeRequest make_request, OnResponse on_response);
   void StartCid(const std::shared_ptr<Batch>& batch, std::int64_t cid);
-  void OnChat(const std::shared_ptr<Batch>& batch, std::int64_t cid,
-              td::ClientManager::Response response);
-  void OnSupergroup(const std::shared_ptr<Batch>& batch, std::int64_t cid,
-                    td::ClientManager::Response response);
+  void OnChannelChat(const std::shared_ptr<Batch>& batch, std::int64_t cid,
+                     td::ClientManager::Response response);
+  void OnChannelInfo(const std::shared_ptr<Batch>& batch, std::int64_t cid,
+                     td::ClientManager::Response response, bool confirmed);
+  void ProbeUser(const std::shared_ptr<Batch>& batch, std::int64_t cid);
+  void OnUser(const std::shared_ptr<Batch>& batch, std::int64_t cid,
+              td::ClientManager::Response response, bool after_private);
+  void ProbePrivate(const std::shared_ptr<Batch>& batch, std::int64_t cid,
+                    std::string user_error);
+  void OnPrivate(const std::shared_ptr<Batch>& batch, std::int64_t cid,
+                 std::string user_error, td::ClientManager::Response response);
+  void ProbeBasic(const std::shared_ptr<Batch>& batch, std::int64_t cid,
+                  std::string detail);
+  void OnBasic(const std::shared_ptr<Batch>& batch, std::int64_t cid,
+               std::string detail, td::ClientManager::Response response);
+  void Accept(const std::shared_ptr<Batch>& batch, std::int64_t cid,
+              const std::string& username, const char* kind);
+  void GiveUp(const std::shared_ptr<Batch>& batch, std::int64_t cid,
+              const std::string& reason);
   void Complete(const std::shared_ptr<Batch>& batch, std::int64_t cid,
                 std::optional<std::string> base);
   void FinishTimeout(const std::shared_ptr<Batch>& batch);

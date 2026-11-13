@@ -356,13 +356,28 @@ std::string NormalizeLinkBase(std::string url) {
   return url;
 }
 
+// TDLib message ids are server ids shifted left by 20. A public t.me link
+// needs the server id. 31799115776 == 30326 << 20.
+std::int64_t LinkMessageId(std::int64_t bare_cid, std::int64_t mid) {
+  constexpr std::int64_t kShift = 1LL << 20;
+  if (mid >= kShift && mid % kShift == 0) {
+    const std::int64_t server = mid >> 20;
+    spdlog::debug(
+        "search: cid {} mid {} is a TDLib message id — link uses {}",
+        bare_cid, mid, server);
+    return server;
+  }
+  return mid;
+}
+
 std::string SearchResultLink(std::int64_t bare_cid, std::int64_t mid,
                              const std::optional<std::string>& chat_url) {
+  const std::int64_t message_id = LinkMessageId(bare_cid, mid);
   if (chat_url.has_value() && StartsWithHttp(*chat_url)) {
-    return NormalizeLinkBase(*chat_url) + std::to_string(mid);
+    return NormalizeLinkBase(*chat_url) + std::to_string(message_id);
   }
   const std::string fallback = "https://t.me/c/" + std::to_string(bare_cid) +
-                               "/" + std::to_string(mid);
+                               "/" + std::to_string(message_id);
   spdlog::info("search: cid {} has no public link — using {}", bare_cid,
                fallback);
   return fallback;

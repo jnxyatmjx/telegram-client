@@ -35,10 +35,12 @@ namespace tg::features::auto_search {
 // Collapse trailing slashes to exactly one, so the mid is one path segment.
 std::string NormalizeLinkBase(std::string url);
 
-// http(s) chat_url is joined with the decimal mid (Python
-// build_message_link), with exactly one '/' before mid. Anything else —
-// missing, empty, or a placeholder such as ">>>>Nrror>…" / ">>Chat>…" —
-// becomes https://t.me/c/{bare_cid}/{mid}.
+// http(s) chat_url is joined with the decimal message id (Python
+// build_message_link), with exactly one '/' before it. A TDLib message id
+// (mid >= 2^20 and mid % 2^20 == 0) is shifted down (mid >> 20) first;
+// any other mid is used as-is. This applies to every link kind. Anything
+// else — missing, empty, or a placeholder such as ">>>>Nrror>…" —
+// becomes https://t.me/c/{bare_cid}/{message id}.
 std::string SearchResultLink(std::int64_t bare_cid, std::int64_t mid,
                              const std::optional<std::string>& chat_url);
 

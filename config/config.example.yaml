@@ -89,8 +89,9 @@ features:
     # public username, or a private invite). Key: -100 id, bare id, or
     # @name. Value: base URL. Numeric keys apply immediately. @name applies
     # when that public username is known. Otherwise the client uses chathis
-    # when the stored URL is http(s), then getChat/getSupergroup for
-    # https://t.me/<username>/, then https://t.me/c/<cid>/<mid>.
+    # when the stored URL is http(s), then a channel/supergroup username,
+    # then a user/bot username (getUser), then https://t.me/c/<cid>/<mid>.
+    # TDLib message ids (mid = server_id << 20) are shifted to the server id.
     enabled: false
     chats:
       - "@publicxme"

@@ -507,6 +507,9 @@ int Application::Run() {
     }
     StartOutboxRetryThread();
     StartStateFlushThread();
+    // Usernames in auto_search.chats are resolved on the worker pool
+    // (searchPublicChat / getChat). Numeric ids are already allowlisted.
+    auto_search_handler_->ResolveAllowlist(telegram_, &flood_retry_, *workers_);
 
     // Signal wait: both stop paths are relaxed atomic stores (async-signal
     // safe), polled here.

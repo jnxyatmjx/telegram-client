@@ -273,3 +273,37 @@ TEST(ConfigDefaults, Chunk2Sections) {
   EXPECT_EQ(config.grpc.http2_lookahead_bytes, 1LL * 1024 * 1024);
   EXPECT_EQ(config.grpc.http2_write_buffer_bytes, 512LL * 1024);
 }
+
+TEST(ConfigAutoSearch, MixedChatListParsesIdsAndUsernames) {
+  const std::string path =
+      "/tmp/tg_client_config_autosearch_" + std::to_string(getpid()) + ".yaml";
+  {
+    std::ofstream out(path);
+    out << R"(
+features:
+  auto_search:
+    enabled: true
+    chats:
+      - "@publicxme"
+      - @yykisschat
+      - https://t.me/yakio16366
+      - t.me/c/3822626821
+      - -1003822626821
+    dedup_ttl_seconds: 600
+)";
+  }
+  const app::Config config = app::Config::FromFile(path);
+  std::remove(path.c_str());
+
+  ASSERT_EQ(config.auto_search.chat_specs.size(), 5u);
+  EXPECT_FALSE(config.auto_search.chat_specs[0].numeric);
+  EXPECT_EQ(config.auto_search.chat_specs[0].username, "publicxme");
+  EXPECT_EQ(config.auto_search.chat_specs[1].username, "yykisschat");
+  EXPECT_EQ(config.auto_search.chat_specs[2].username, "yakio16366");
+  EXPECT_TRUE(config.auto_search.chat_specs[3].numeric);
+  EXPECT_EQ(config.auto_search.chat_specs[3].dialog_id, -1003822626821LL);
+  EXPECT_TRUE(config.auto_search.chat_specs[4].numeric);
+  EXPECT_EQ(config.auto_search.chat_specs[4].dialog_id, -1003822626821LL);
+  ASSERT_EQ(config.auto_search.chats.size(), 2u);
+  EXPECT_EQ(config.auto_search.chats[0], -1003822626821LL);
+}

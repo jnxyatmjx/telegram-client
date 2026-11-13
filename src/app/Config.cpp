@@ -119,12 +119,74 @@ void ParseBlock(const std::vector<YamlLine>& lines, size_t& pos, int indent,
 }
 
 std::optional<std::int64_t> ToInt64(const std::string& s) {
+  if (s.empty()) return std::nullopt;
   std::int64_t v = 0;
   const auto* first = s.data();
   const auto* last = s.data() + s.size();
   const auto [ptr, ec] = std::from_chars(first, last, v, 10);
   if (ec != std::errc() || ptr != last) return std::nullopt;
   return v;
+}
+
+std::string AsciiLower(std::string s) {
+  for (char& c : s) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return s;
+}
+
+// auto_search.chats item -> dialog id or public username.
+// Accepts -100…, @name, name, https://t.me/name, t.me/name/123,
+// and t.me/c/<bare id> (private-channel link -> supergroup dialog id).
+AutoSearchChatSpec ParseAutoSearchChat(std::string raw) {
+  AutoSearchChatSpec spec;
+  spec.raw = raw;
+  std::string s = raw;
+  std::string lower = AsciiLower(s);
+  auto strip_prefix = [&](const char* prefix) {
+    const std::string p(prefix);
+    if (lower.rfind(p, 0) == 0) {
+      s = s.substr(p.size());
+      lower = lower.substr(p.size());
+      return true;
+    }
+    return false;
+  };
+  strip_prefix("https://");
+  strip_prefix("http://");
+  strip_prefix("t.me/");
+  strip_prefix("telegram.me/");
+  const auto cut = s.find_first_of("?#");
+  if (cut != std::string::npos) s = s.substr(0, cut);
+  while (!s.empty() && (s.back() == '/' ||
+                        std::isspace(static_cast<unsigned char>(s.back())))) {
+    s.pop_back();
+  }
+  while (!s.empty() && s.front() == '@') s.erase(s.begin());
+  if (s.empty()) return spec;
+
+  const std::string path_lower = AsciiLower(s);
+  if (path_lower.rfind("c/", 0) == 0) {
+    std::string digits = s.substr(2);
+    const auto slash = digits.find('/');
+    if (slash != std::string::npos) digits = digits.substr(0, slash);
+    if (const auto bare = ToInt64(digits); bare && *bare > 0) {
+      spec.numeric = true;
+      // TDLib channel/supergroup dialog id = -(bare + 10^12).
+      spec.dialog_id = -(*bare) - 1'000'000'000'000LL;
+      return spec;
+    }
+  }
+  const auto slash = s.find('/');
+  if (slash != std::string::npos) s = s.substr(0, slash);
+  if (s.empty()) return spec;
+  if (const auto id = ToInt64(s)) {
+    spec.numeric = true;
+    spec.dialog_id = *id;
+    return spec;
+  }
+  spec.username = s;
+  return spec;
 }
 
 std::optional<bool> ToBool(const std::string& s) {
@@ -322,7 +384,15 @@ Config Config::FromFile(const std::string& path) {
     if (const YamlNode* a = f->Find("auto_search")) {
       cfg.auto_search.enabled = Bool(*a, "enabled", cfg.auto_search.enabled);
       if (const YamlNode* chats = a->Find("chats")) {
-        cfg.auto_search.chats = chats->AsInt64List();
+        // Mixed list: integers stay dialog ids; @name / t.me/name are
+        // usernames. AsInt64List would silently drop the names.
+        for (const auto& item : chats->list) {
+          const auto text = item.AsString();
+          if (!text || text->empty()) continue;
+          const AutoSearchChatSpec spec = ParseAutoSearchChat(*text);
+          cfg.auto_search.chat_specs.push_back(spec);
+          if (spec.numeric) cfg.auto_search.chats.push_back(spec.dialog_id);
+        }
       }
       cfg.auto_search.dedup_ttl_seconds =
           Int(*a, "dedup_ttl_seconds", cfg.auto_search.dedup_ttl_seconds);

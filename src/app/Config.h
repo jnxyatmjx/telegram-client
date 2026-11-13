@@ -103,9 +103,25 @@ struct BotCommandConfig {
   std::string search_command = "/search";
 };
 
+// One auto_search.chats entry. Numeric tokens are TDLib dialog ids
+// (-100… int64). Anything else is a public username (@name, name, or a
+// t.me/name link) resolved with searchPublicChat after authorization.
+// t.me/c/<bare id> is stored as the supergroup/channel dialog id.
+struct AutoSearchChatSpec {
+  std::string raw;
+  bool numeric = false;
+  std::int64_t dialog_id = 0;  // set when numeric
+  std::string username;        // without '@'; empty when numeric or invalid
+};
+
 struct AutoSearchConfig {
   bool enabled = false;  // phase-2 trigger; OFF by default
-  std::vector<std::int64_t> chats;  // TDLib dialog chat_ids (-100... form)
+  // Numeric dialog ids only, in list order. Existing callers and tests
+  // that assign this directly keep working; username entries live in
+  // chat_specs and are resolved later.
+  std::vector<std::int64_t> chats;
+  // Every list entry, numeric and username, in config order.
+  std::vector<AutoSearchChatSpec> chat_specs;
   std::int64_t dedup_ttl_seconds = 600;
 };
 

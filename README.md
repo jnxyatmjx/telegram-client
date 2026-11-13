@@ -918,15 +918,24 @@ of libraries.
   placeholders until the user confirms the real ones.
 - `features/auto_search/AutoSearchHandler` — Disabled by default.
   Fires when a photo, video, animation, `image/*` document, or
-  `video/mp4` document is posted in an allowlisted chat
-  (`auto_search.chats`, TDLib `-100…` ids), including a forward of one
-  of those. Verifies only `chat_id`, not the sender (channel posts may
-  have no sender). Produces `SearchImages` only, never `ProcessImages`.
-  Dedups by `(oid, id)` with a 10-minute TTL. `SearchReply` turns the
-  `SearchRsp` into one MarkdownV2 reply to that message: numbered
-  `[memo](url)` hits (memo decrypted with `KEYME`, 28 code points,
-  preview off) or the fixed "No One Find" line (preview on). The send
-  uses the correlation entry's TDLib chat id, never the uint32 `oid`.
+  `video/mp4` document is posted in an allowlisted chat, including a
+  forward of one of those. `auto_search.chats` accepts TDLib dialog ids
+  (`-100…`) and public usernames (`@name`, `name`, `t.me/name`,
+  `https://t.me/name`); `t.me/c/<bare>` becomes the `-100…` dialog id.
+  Quoted and unquoted `@name` both parse. After authorization,
+  usernames are resolved with `searchPublicChat` on a worker (never the
+  receive thread); FloodWait goes through `FloodRetry`. Each entry is
+  logged as `auto_search: @name -> chat_id <id> (title "...", type ...)`
+  and the effective id list is logged once resolution finishes. A chat
+  that is not a channel/supergroup is not added; not-found and
+  not-a-member are warnings (not a member still keeps the id, but
+  updates will not arrive). Verifies only `chat_id`, not the sender.
+  Produces `SearchImages` only, never `ProcessImages`. Dedups by
+  `(oid, id)` with a 10-minute TTL. `SearchReply` turns the `SearchRsp`
+  into one MarkdownV2 reply to that message: numbered `[memo](url)`
+  hits (memo decrypted with `KEYME`, 28 code points, preview off) or
+  the fixed "No One Find" line (preview on). The send uses the
+  correlation entry's TDLib chat id, never the uint32 `oid`.
 - `features/media_thumbnail/MediaExtractor` — Pure tier selection
   (Telethon-migration chunk 1 semantics). Photo: the LARGEST tier — the
   full-resolution original, no size cap (ties by larger max edge;

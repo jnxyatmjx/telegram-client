@@ -64,10 +64,22 @@ features:
     # image/* document, or a video/mp4 document — a forward counts) starts
     # SearchImages only, never ProcessImages. DISABLED by default. The
     # SearchRsp is sent back as one reply to that message: a numbered
-    # hit list, or the "No One Find" line (link preview on). chats are
-    # TDLib dialog ids (the -100... form), not @usernames.
+    # hit list, or the "No One Find" line (link preview on).
+    #
+    # chats entries are either a TDLib dialog id (-100… int64) or a public
+    # username. Both forms may be mixed. @name works quoted or unquoted;
+    # t.me/name and https://t.me/name links are the same username.
+    # t.me/c/<bare id> is the private-channel link and becomes the -100…
+    # dialog id. Usernames are resolved with searchPublicChat after login.
+    # Look for:
+    #   auto_search: @name -> chat_id <id> (title "...", type channel)
+    #   auto_search: effective allowlist (N): <id>, ...
+    # A warning means the name was not found, the chat is not a
+    # channel/supergroup, or this account is not a member (then updates
+    # for that chat never arrive). If nothing is logged, auto_search is
+    # disabled or the process has not finished authorization.
     enabled: false
-    chats: []                  # TDLib dialog chat_ids (the -100... form)
+    chats: []                  # e.g. "@publicxme", -1003822626821
     dedup_ttl_seconds: 600     # (oid, id) recent-search dedup TTL
   commands:
     # Control-chat command surface (Telethon migration chunk 2):

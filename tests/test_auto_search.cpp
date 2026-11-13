@@ -7,6 +7,7 @@
 #include <features/media_thumbnail/SearchHandler.h>
 #include <infra/Outbox.h>
 #include <telegram/FileDownloader.h>
+#include <telegram/FloodRetry.h>
 #include <telegram/TelegramClient.h>
 #include <transport/AsyncStreamer.h>
 
@@ -14,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -315,4 +317,182 @@ TEST_F(AutoSearchTest, EmptyAllowlistClaimsNothingEvenWhenEnabled) {
   auto handler = MakeHandler();
   td_api::object_ptr<td_api::Update> base = MakePhotoUpdate(-1'001'234'567'890LL);
   EXPECT_FALSE(handler->CanHandle(base));
+}
+
+namespace {
+
+class ResolveFakeSender : public tg::telegram::ITdSender {
+ public:
+  int search_floods_left = 0;
+
+  std::int64_t Send(td_api::object_ptr<td_api::Function>&& request,
+                    tg::telegram::ResponseCallback callback) override {
+    td::ClientManager::Response response;
+    response.request_id = ++next_id_;
+    const auto id = request->get_id();
+    if (id == td_api::getMe::ID) {
+      auto user = td_api::make_object<td_api::user>();
+      user->id_ = 42;
+      response.object = std::move(user);
+    } else if (id == td_api::searchPublicChat::ID) {
+      const auto& search =
+          static_cast<const td_api::searchPublicChat&>(*request);
+      if (search_floods_left > 0) {
+        --search_floods_left;
+        response.object = td_api::make_object<td_api::error>(
+            429, "Too Many Requests: retry after 0");
+      } else if (search.username_ == "missing") {
+        response.object = td_api::make_object<td_api::error>(
+            400, "USERNAME_NOT_OCCUPIED");
+      } else if (search.username_ == "bob") {
+        response.object = MakeChat(700, "Bob", /*channel=*/false);
+      } else if (search.username_ == "publicxme") {
+        response.object = MakeChat(-100111, "Public X", /*channel=*/true);
+      } else if (search.username_ == "leftchat") {
+        response.object = MakeChat(-100222, "Left Channel", /*channel=*/true);
+      } else {
+        response.object =
+            td_api::make_object<td_api::error>(400, "unexpected username");
+      }
+    } else if (id == td_api::getChat::ID) {
+      const auto chat_id = static_cast<const td_api::getChat&>(*request).chat_id_;
+      response.object = MakeChat(chat_id, "Configured", /*channel=*/true);
+    } else if (id == td_api::getChatMember::ID) {
+      const auto chat_id =
+          static_cast<const td_api::getChatMember&>(*request).chat_id_;
+      auto member = td_api::make_object<td_api::chatMember>();
+      if (chat_id == -100222) {
+        member->status_ = td_api::make_object<td_api::chatMemberStatusLeft>();
+      } else {
+        member->status_ = td_api::make_object<td_api::chatMemberStatusMember>();
+      }
+      response.object = std::move(member);
+    } else {
+      response.object = td_api::make_object<td_api::error>(400, "unexpected");
+    }
+    callback(std::move(response));
+    return response.request_id;
+  }
+
+ private:
+  static td_api::object_ptr<td_api::chat> MakeChat(std::int64_t id,
+                                                  const std::string& title,
+                                                  bool channel) {
+    auto chat = td_api::make_object<td_api::chat>();
+    chat->id_ = id;
+    chat->title_ = title;
+    if (channel) {
+      chat->type_ =
+          td_api::make_object<td_api::chatTypeSupergroup>(id, /*is_channel=*/true);
+    } else {
+      chat->type_ = td_api::make_object<td_api::chatTypePrivate>(id);
+    }
+    return chat;
+  }
+
+  std::int64_t next_id_ = 0;
+};
+
+bool WaitUntil(const std::function<bool()>& pred) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (pred()) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return pred();
+}
+
+const auto_search::AutoSearchHandler::ResolveRecord* FindRecord(
+    const std::vector<auto_search::AutoSearchHandler::ResolveRecord>& records,
+    const std::string& raw) {
+  for (const auto& record : records) {
+    if (record.raw == raw) return &record;
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+TEST(AutoSearchResolve, UsernamesIdsMembershipAndClaim) {
+  ResolveFakeSender sender;
+  sender.search_floods_left = 1;  // first searchPublicChat is a 429
+  app::WorkerPool workers(2);
+  tg::telegram::FloodRetry flood(tg::telegram::FloodRetry::Options{
+      /*pad_seconds=*/0, /*fallback_seconds=*/0, /*max_attempts=*/3});
+
+  app::AutoSearchConfig config;
+  config.enabled = true;
+  app::AutoSearchChatSpec name;
+  name.raw = "@publicxme";
+  name.username = "publicxme";
+  app::AutoSearchChatSpec missing;
+  missing.raw = "missing";
+  missing.username = "missing";
+  app::AutoSearchChatSpec left;
+  left.raw = "@leftchat";
+  left.username = "leftchat";
+  app::AutoSearchChatSpec user;
+  user.raw = "https://t.me/bob";
+  user.username = "bob";
+  app::AutoSearchChatSpec numeric;
+  numeric.raw = "-100333";
+  numeric.numeric = true;
+  numeric.dialog_id = -100333;
+  config.chat_specs = {name, missing, left, user, numeric};
+  config.chats = {-100333};
+
+  auto files = std::make_unique<tg::telegram::FileDownloader>(sender);
+  media::SearchHandler search(media::MediaExtractor(app::MediaThumbnailConfig{}),
+                             sender, *files);
+  auto_search::AutoSearchHandler handler(config, search);
+
+  // Username is not allowlisted until searchPublicChat returns.
+  td_api::object_ptr<td_api::Update> early = MakePhotoUpdate(-100111);
+  EXPECT_FALSE(handler.CanHandle(early));
+
+  handler.ResolveAllowlist(sender, &flood, workers);
+  ASSERT_TRUE(WaitUntil([&] { return handler.resolve_finished(); }));
+
+  const auto records = handler.resolve_records();
+  const auto* pub = FindRecord(records, "@publicxme");
+  ASSERT_NE(pub, nullptr);
+  EXPECT_TRUE(pub->added);
+  EXPECT_TRUE(pub->member);
+  EXPECT_EQ(pub->chat_id, -100111);
+  EXPECT_TRUE(pub->failure.empty());
+
+  const auto* gone = FindRecord(records, "missing");
+  ASSERT_NE(gone, nullptr);
+  EXPECT_FALSE(gone->added);
+  EXPECT_EQ(gone->failure, "not found");
+
+  const auto* left_rec = FindRecord(records, "@leftchat");
+  ASSERT_NE(left_rec, nullptr);
+  EXPECT_TRUE(left_rec->added);
+  EXPECT_FALSE(left_rec->member);
+  EXPECT_EQ(left_rec->failure, "not a member");
+  EXPECT_EQ(left_rec->chat_id, -100222);
+
+  const auto* bob = FindRecord(records, "https://t.me/bob");
+  ASSERT_NE(bob, nullptr);
+  EXPECT_FALSE(bob->added);
+  EXPECT_EQ(bob->failure, "not a channel or supergroup");
+
+  const auto* num = FindRecord(records, "-100333");
+  ASSERT_NE(num, nullptr);
+  EXPECT_TRUE(num->added);
+  EXPECT_TRUE(num->member);
+  EXPECT_EQ(num->chat_id, -100333);
+
+  const auto ids = handler.allowlist();
+  EXPECT_NE(std::find(ids.begin(), ids.end(), -100111), ids.end());
+  EXPECT_NE(std::find(ids.begin(), ids.end(), -100222), ids.end());
+  EXPECT_NE(std::find(ids.begin(), ids.end(), -100333), ids.end());
+  EXPECT_EQ(std::find(ids.begin(), ids.end(), 700), ids.end());
+
+  td_api::object_ptr<td_api::Update> resolved = MakePhotoUpdate(-100111);
+  EXPECT_TRUE(handler.CanHandle(resolved));
+  td_api::object_ptr<td_api::Update> other = MakePhotoUpdate(-100999);
+  EXPECT_FALSE(handler.CanHandle(other));
 }

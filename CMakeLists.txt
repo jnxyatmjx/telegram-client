@@ -105,6 +105,7 @@ add_library(tg_core STATIC
   src/features/bot_command/BotCommandHandler.cpp
   src/features/bot_command/CommandParser.cpp
   src/features/auto_search/AutoSearchHandler.cpp
+  src/features/auto_search/ChatLinkResolver.cpp
   src/features/auto_search/SearchReply.cpp
   src/features/chat_state/ChatStateStore.cpp
   src/features/chat_state/SqliteChatStateBackend.cpp

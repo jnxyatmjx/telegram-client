@@ -70,16 +70,34 @@ features:
     # username. Both forms may be mixed. @name works quoted or unquoted;
     # t.me/name and https://t.me/name links are the same username.
     # t.me/c/<bare id> is the private-channel link and becomes the -100…
-    # dialog id. Usernames are resolved with searchPublicChat after login.
+    # dialog id. Prefer the block list below (indentation under
+    # features.auto_search). A one-line flow list is also accepted:
+    #   chats: ["@publicxme", -1003822626821]  # comment
+    # Usernames are resolved with searchPublicChat after login.
     # Look for:
+    #   auto_search: parsed chats (N): @name, -100…
     #   auto_search: @name -> chat_id <id> (title "...", type channel)
     #   auto_search: effective allowlist (N): <id>, ...
+    # If enabled is true and the list parsed empty:
+    #   auto_search: enabled but chats list is empty — check indentation/format of features.auto_search.chats
     # A warning means the name was not found, the chat is not a
     # channel/supergroup, or this account is not a member (then updates
     # for that chat never arrive). If nothing is logged, auto_search is
     # disabled or the process has not finished authorization.
+    #
+    # chat_links overrides the URL base for a hit's cid (groups with no
+    # public username, or a private invite). Key: -100 id, bare id, or
+    # @name. Value: base URL. Numeric keys apply immediately. @name applies
+    # when that public username is known. Otherwise the client uses chathis
+    # when the stored URL is http(s), then getChat/getSupergroup for
+    # https://t.me/<username>/, then https://t.me/c/<cid>/<mid>.
     enabled: false
-    chats: []                  # e.g. "@publicxme", -1003822626821
+    chats:
+      - "@publicxme"
+      - -1003822626821
+    chat_links:
+      -1003822626821: "https://t.me/somegroup/"
+      "@privategroup": "https://t.me/+AbCdEf/"
     dedup_ttl_seconds: 600     # (oid, id) recent-search dedup TTL
   commands:
     # Control-chat command surface (Telethon migration chunk 2):

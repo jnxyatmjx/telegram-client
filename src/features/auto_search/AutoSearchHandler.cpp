@@ -273,9 +273,34 @@ void SendOffReceive(const std::shared_ptr<ResolveJob>& job, int attempt,
 
 class AllowlistDriver {
  public:
+  static void LogParsed(AutoSearchHandler* self) {
+    std::string joined;
+    std::size_t n = 0;
+    if (!self->config_.chat_specs.empty()) {
+      n = self->config_.chat_specs.size();
+      for (const auto& spec : self->config_.chat_specs) {
+        if (!joined.empty()) joined += ", ";
+        joined += spec.raw;
+      }
+    } else {
+      n = self->config_.chats.size();
+      for (const std::int64_t id : self->config_.chats) {
+        if (!joined.empty()) joined += ", ";
+        joined += std::to_string(id);
+      }
+    }
+    spdlog::info("auto_search: parsed chats ({}): {}", n, joined);
+    if (self->config_.enabled && n == 0) {
+      spdlog::warn(
+          "auto_search: enabled but chats list is empty — check "
+          "indentation/format of features.auto_search.chats");
+    }
+  }
+
   static void Start(AutoSearchHandler* self, telegram::ITdSender& sender,
                     telegram::FloodRetry* flood, app::WorkerPool& workers) {
     self->resolve_finished_.store(false);
+    LogParsed(self);
     if (!self->config_.enabled) {
       spdlog::info("auto_search: disabled — not resolving chat allowlist");
       self->resolve_finished_.store(true);

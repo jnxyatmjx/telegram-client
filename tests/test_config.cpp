@@ -307,3 +307,63 @@ features:
   ASSERT_EQ(config.auto_search.chats.size(), 2u);
   EXPECT_EQ(config.auto_search.chats[0], -1003822626821LL);
 }
+
+TEST(ConfigAutoSearch, FlowListAndChatLinks) {
+  const std::string path =
+      "/tmp/tg_client_config_autosearch_flow_" + std::to_string(getpid()) +
+      ".yaml";
+  {
+    std::ofstream out(path);
+    out << R"(
+features:
+  auto_search:
+    enabled: true
+    chats: ["@publicxme", yykisschat, -1003822626821]  # inline comment
+    chat_links:
+      -1003822626821: "https://t.me/somegroup/"
+      4242: https://t.me/baregroup//
+      "@privategroup": "https://t.me/+AbCdEf"
+)";
+  }
+  const app::Config config = app::Config::FromFile(path);
+  std::remove(path.c_str());
+
+  ASSERT_EQ(config.auto_search.chat_specs.size(), 3u);
+  EXPECT_EQ(config.auto_search.chat_specs[0].username, "publicxme");
+  EXPECT_EQ(config.auto_search.chat_specs[1].username, "yykisschat");
+  EXPECT_TRUE(config.auto_search.chat_specs[2].numeric);
+  EXPECT_EQ(config.auto_search.chat_specs[2].dialog_id, -1003822626821LL);
+  ASSERT_EQ(config.auto_search.chats.size(), 1u);
+  EXPECT_EQ(config.auto_search.chats[0], -1003822626821LL);
+
+  ASSERT_EQ(config.auto_search.chat_links.size(), 3u);
+  EXPECT_TRUE(config.auto_search.chat_links[0].numeric);
+  EXPECT_EQ(config.auto_search.chat_links[0].dialog_id, -1003822626821LL);
+  EXPECT_EQ(config.auto_search.chat_links[0].bare_id, 3822626821LL);
+  EXPECT_EQ(config.auto_search.chat_links[0].url, "https://t.me/somegroup/");
+  EXPECT_EQ(config.auto_search.chat_links[1].bare_id, 4242);
+  EXPECT_EQ(config.auto_search.chat_links[1].url, "https://t.me/baregroup//");
+  EXPECT_FALSE(config.auto_search.chat_links[2].numeric);
+  EXPECT_EQ(config.auto_search.chat_links[2].username, "privategroup");
+  EXPECT_EQ(config.auto_search.chat_links[2].url, "https://t.me/+AbCdEf");
+}
+
+TEST(ConfigAutoSearch, SingleFlowIdIsNotDropped) {
+  const std::string path =
+      "/tmp/tg_client_config_autosearch_one_" + std::to_string(getpid()) +
+      ".yaml";
+  {
+    std::ofstream out(path);
+    out << R"(
+features:
+  auto_search:
+    enabled: true
+    chats: [-1003822626821]
+)";
+  }
+  const app::Config config = app::Config::FromFile(path);
+  std::remove(path.c_str());
+  ASSERT_EQ(config.auto_search.chat_specs.size(), 1u);
+  EXPECT_EQ(config.auto_search.chat_specs[0].dialog_id, -1003822626821LL);
+  ASSERT_EQ(config.auto_search.chats.size(), 1u);
+}

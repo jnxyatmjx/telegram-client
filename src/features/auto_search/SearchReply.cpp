@@ -6,6 +6,7 @@
 #include <cctype>
 #include <charconv>
 #include <utility>
+#include <vector>
 
 namespace tg::features::auto_search {
 namespace {
@@ -345,13 +346,43 @@ SearchReplyMessage NoMatch() {
 
 }  // namespace
 
+std::string NormalizeLinkBase(std::string url) {
+  while (!url.empty() &&
+         std::isspace(static_cast<unsigned char>(url.back()))) {
+    url.pop_back();
+  }
+  while (!url.empty() && url.back() == '/') url.pop_back();
+  if (!url.empty()) url.push_back('/');
+  return url;
+}
+
 std::string SearchResultLink(std::int64_t bare_cid, std::int64_t mid,
                              const std::optional<std::string>& chat_url) {
   if (chat_url.has_value() && StartsWithHttp(*chat_url)) {
-    return *chat_url + std::to_string(mid);
+    return NormalizeLinkBase(*chat_url) + std::to_string(mid);
   }
-  return "https://t.me/c/" + std::to_string(bare_cid) + "/" +
-         std::to_string(mid);
+  const std::string fallback = "https://t.me/c/" + std::to_string(bare_cid) +
+                               "/" + std::to_string(mid);
+  spdlog::info("search: cid {} has no public link — using {}", bare_cid,
+               fallback);
+  return fallback;
+}
+
+std::vector<std::int64_t> SearchReplyCids(const std::string& result) {
+  const auto parsed = ParseResult(result);
+  std::vector<std::int64_t> cids;
+  if (!parsed.has_value()) return cids;
+  for (const Hit& hit : parsed->hits) {
+    bool seen = false;
+    for (const std::int64_t cid : cids) {
+      if (cid == hit.cid) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) cids.push_back(hit.cid);
+  }
+  return cids;
 }
 
 SearchReplyMessage FormatSearchReply(

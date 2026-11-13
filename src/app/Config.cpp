@@ -1,5 +1,6 @@
 #include "app/Config.h"
 
+#include <common/Idempotency.h>
 #include <common/Logger.h>
 
 #include <algorithm>
@@ -74,9 +75,57 @@ std::vector<YamlLine> ScanLines(const std::string& text) {
   return lines;
 }
 
+// A block sequence entry is "-" or "- " (YAML requires whitespace after
+// the dash). "-100123:" is a map key, not a list item.
+bool IsBlockSequenceEntry(const std::string& text) {
+  if (text.empty() || text.front() != '-') return false;
+  return text.size() == 1 ||
+         std::isspace(static_cast<unsigned char>(text[1]));
+}
+
+// Flow sequence: [a, "b", -100]. nullopt when `value` is not one.
+// Throws on an unclosed '[' so a bad list is not silently dropped.
+std::optional<std::vector<std::string>> TryParseFlowSequence(
+    const std::string& value) {
+  if (value.empty() || value.front() != '[') return std::nullopt;
+  if (value.back() != ']') {
+    throw std::runtime_error("yaml: unclosed flow sequence: " + value);
+  }
+  std::vector<std::string> items;
+  std::string current;
+  bool in_single = false;
+  bool in_double = false;
+  for (size_t i = 1; i + 1 < value.size(); ++i) {
+    const char c = value[i];
+    if (c == '\'' && !in_double) {
+      in_single = !in_single;
+      current.push_back(c);
+      continue;
+    }
+    if (c == '"' && !in_single) {
+      in_double = !in_double;
+      current.push_back(c);
+      continue;
+    }
+    if (c == ',' && !in_single && !in_double) {
+      const std::string item = Unquote(Trim(current));
+      if (!item.empty()) items.push_back(item);
+      current.clear();
+      continue;
+    }
+    current.push_back(c);
+  }
+  if (in_single || in_double) {
+    throw std::runtime_error("yaml: unclosed quote in flow sequence: " + value);
+  }
+  const std::string item = Unquote(Trim(current));
+  if (!item.empty()) items.push_back(item);
+  return items;
+}
+
 void ParseBlock(const std::vector<YamlLine>& lines, size_t& pos, int indent,
                 YamlNode& out) {
-  if (pos < lines.size() && lines[pos].text.rfind("-", 0) == 0) {
+  if (pos < lines.size() && IsBlockSequenceEntry(lines[pos].text)) {
     // sequence
     while (pos < lines.size() && lines[pos].indent == indent &&
            lines[pos].text.rfind("-", 0) == 0) {
@@ -110,6 +159,12 @@ void ParseBlock(const std::vector<YamlLine>& lines, size_t& pos, int indent,
       // Nested block (map or list) or genuinely empty value.
       if (pos < lines.size() && lines[pos].indent > indent) {
         ParseBlock(lines, pos, lines[pos].indent, child);
+      }
+    } else if (auto items = TryParseFlowSequence(value)) {
+      for (auto& item : *items) {
+        YamlNode entry;
+        entry.scalar = std::move(item);
+        child.list.push_back(std::move(entry));
       }
     } else {
       child.scalar = Unquote(value);
@@ -386,12 +441,66 @@ Config Config::FromFile(const std::string& path) {
       if (const YamlNode* chats = a->Find("chats")) {
         // Mixed list: integers stay dialog ids; @name / t.me/name are
         // usernames. AsInt64List would silently drop the names.
-        for (const auto& item : chats->list) {
-          const auto text = item.AsString();
-          if (!text || text->empty()) continue;
-          const AutoSearchChatSpec spec = ParseAutoSearchChat(*text);
+        // A block list, a flow list `[...]`, or a single scalar all work.
+        auto add_chat = [&](const std::string& text) {
+          if (text.empty()) return;
+          const AutoSearchChatSpec spec = ParseAutoSearchChat(text);
           cfg.auto_search.chat_specs.push_back(spec);
           if (spec.numeric) cfg.auto_search.chats.push_back(spec.dialog_id);
+        };
+        if (!chats->list.empty()) {
+          for (const auto& item : chats->list) {
+            if (const auto text = item.AsString()) add_chat(*text);
+          }
+        } else if (chats->map.empty() && !chats->scalar.empty()) {
+          add_chat(chats->scalar);
+        }
+      }
+      if (const YamlNode* links = a->Find("chat_links")) {
+        if (!links->list.empty()) {
+          spdlog::warn(
+              "auto_search: chat_links must be a map of chat -> URL — "
+              "list ignored");
+        }
+        for (const auto& [key, node] : links->map) {
+          const auto url = node.AsString();
+          if (!url || url->empty()) {
+            spdlog::warn(
+                "auto_search: chat_links key \"{}\" has an empty URL — skipped",
+                key);
+            continue;
+          }
+          if (url->rfind("https://", 0) != 0 && url->rfind("http://", 0) != 0) {
+            spdlog::warn(
+                "auto_search: chat_links \"{}\" -> \"{}\" is not an http(s) "
+                "URL — skipped",
+                key, *url);
+            continue;
+          }
+          const AutoSearchChatSpec spec = ParseAutoSearchChat(key);
+          if (!spec.numeric && spec.username.empty()) {
+            spdlog::warn(
+                "auto_search: chat_links key \"{}\" is not a chat id or "
+                "username — skipped",
+                key);
+            continue;
+          }
+          AutoSearchChatLink link;
+          link.raw_key = key;
+          link.url = *url;
+          link.numeric = spec.numeric;
+          link.username = spec.username;
+          if (spec.numeric) {
+            link.dialog_id = spec.dialog_id;
+            if (spec.dialog_id > 0) {
+              link.bare_id = spec.dialog_id;
+            } else {
+              const std::int64_t bare =
+                  -spec.dialog_id - common::kSupergroupMark;
+              if (bare > 0) link.bare_id = bare;
+            }
+          }
+          cfg.auto_search.chat_links.push_back(std::move(link));
         }
       }
       cfg.auto_search.dedup_ttl_seconds =

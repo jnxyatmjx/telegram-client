@@ -114,6 +114,18 @@ struct AutoSearchChatSpec {
   std::string username;        // without '@'; empty when numeric or invalid
 };
 
+// One features.auto_search.chat_links entry. The key names a chat (TDLib
+// dialog id, bare id, or @name / t.me/name). `url` is the link base used
+// for search-result hits in that chat (public t.me URL or a private invite).
+struct AutoSearchChatLink {
+  std::string raw_key;
+  bool numeric = false;
+  std::int64_t dialog_id = 0;  // the number as written, when numeric
+  std::int64_t bare_id = 0;    // positive bare id when it can be derived
+  std::string username;        // without '@'; empty when numeric
+  std::string url;
+};
+
 struct AutoSearchConfig {
   bool enabled = false;  // phase-2 trigger; OFF by default
   // Numeric dialog ids only, in list order. Existing callers and tests
@@ -122,6 +134,9 @@ struct AutoSearchConfig {
   std::vector<std::int64_t> chats;
   // Every list entry, numeric and username, in config order.
   std::vector<AutoSearchChatSpec> chat_specs;
+  // Per-chat link bases. Numeric keys are indexed by bare id and by the
+  // number as written; @name keys are matched when a public username is known.
+  std::vector<AutoSearchChatLink> chat_links;
   std::int64_t dedup_ttl_seconds = 600;
 };
 

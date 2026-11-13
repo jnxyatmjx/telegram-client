@@ -3,6 +3,8 @@
 #include <common/Logger.h>
 #include <common/MemoCipher.h>
 #include <features/auto_search/SearchReply.h>
+
+#include <memory>
 #include <telegram/AuthManager.h>
 
 #include <csignal>
@@ -110,6 +112,8 @@ Application::Application(Config config)
                            search_handler_, &flood_retry_),
       auto_search_handler_(std::make_shared<features::auto_search::AutoSearchHandler>(
           config_.auto_search, search_handler_)),
+      chat_link_resolver_(config_.auto_search, &telegram_, workers_.get(),
+                          &flood_retry_),
       dispatcher_(workers_) {
   // Lanes: one channel + one ProcessImages stream + one SearchImages stream
   // each (grpc.connections, default 1). The pools deal requests round-robin
@@ -143,6 +147,11 @@ Application::Application(Config config)
   ctx_ = std::make_unique<AppContext>(AppContext{
       *workers_, telegram_, files_, process_pool_, search_pool_, outbox_,
       config_, &flow_control_});
+  chat_link_resolver_.SetChatUrlLookup([this](std::int64_t cid) {
+    const auto state = chat_state_.Get(cid);
+    if (!state.has_value()) return std::optional<std::string>{};
+    return std::optional<std::string>(state->chat_url);
+  });
   WireHandlers();
   WireStreamerCallbacks();
 }
@@ -158,6 +167,7 @@ Application::~Application() {
   // finish stages to the pool — so the pool must still be running here,
   // and is drained after. FailAll is the safety net for any download
   // still pending after the TDLib callbacks completed.
+  chat_link_resolver_.Shutdown();
   flood_retry_.Shutdown();
   backfill_.Shutdown();
   dialog_scanner_.Shutdown();
@@ -236,8 +246,9 @@ void Application::WireStreamerCallbacks() {
 
   // SearchRsp -> correlation lookup, then ONE reply to that message
   // (app_bot_client.rspwork). The chat_id is the TDLib dialog id stored
-  // when the SearchReq was sent, never the uint32 oid. Chat URLs are read
-  // from memory; this callback does not call TDLib.
+  // when the SearchReq was sent, never the uint32 oid. Hit links use each
+  // hit's cid. This callback does not call TDLib; ChatLinkResolver may,
+  // on the worker pool, and then formats the reply.
   search_pool_.SetReplyHandler(
       [this](const SearchRsp& reply) {
         const auto entry = search_handler_.correlation().Lookup(
@@ -249,18 +260,25 @@ void Application::WireStreamerCallbacks() {
         }
         spdlog::info("search: rsp for {} (oid={}, id={}) result: {:.200}",
                      entry->image_id, reply.oid(), reply.id(), reply.result());
-        const common::MemoCipher cipher(config_.media_thumbnail.keyme);
-        features::auto_search::DeliverSearchReply(
-            messenger_, *entry, reply.result(),
-            [&cipher](const std::string& token) { return cipher.Decrypt(token); },
-            [this](std::int64_t cid) -> std::optional<std::string> {
-              const auto state = chat_state_.Get(cid);
-              if (!state.has_value()) return std::nullopt;
-              const std::string& url = state->chat_url;
-              if (url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0) {
-                return url;
-              }
-              return std::nullopt;
+        auto cipher = std::make_shared<common::MemoCipher>(
+            config_.media_thumbnail.keyme);
+        const auto target = *entry;
+        const std::string result = reply.result();
+        chat_link_resolver_.Resolve(
+            features::auto_search::SearchReplyCids(result),
+            [this, cipher, target, result](
+                features::auto_search::ChatLinkResolver::BaseMap bases) {
+              features::auto_search::DeliverSearchReply(
+                  messenger_, target, result,
+                  [cipher](const std::string& token) {
+                    return cipher->Decrypt(token);
+                  },
+                  [bases = std::move(bases)](std::int64_t cid)
+                      -> std::optional<std::string> {
+                    const auto it = bases.find(cid);
+                    if (it == bases.end()) return std::nullopt;
+                    return it->second;
+                  });
             });
       });
 
@@ -526,6 +544,7 @@ int Application::Run() {
   // after the pool (finish stages Enqueue to them).
   backfill_.Shutdown();                         // 0. refuse new jobs/pages
   dialog_scanner_.Shutdown();                   //    (pending callbacks no-op)
+  chat_link_resolver_.Shutdown();               //    drop in-flight link lookups
   flood_retry_.Shutdown();                      //    drop FloodWait re-sends
   telegram_.Stop();                             // 1. close TDLib session
   files_.FailAll("shutting down");              // 2. safety net for downloads

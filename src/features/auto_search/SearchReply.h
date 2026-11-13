@@ -17,7 +17,9 @@
 //
 // The reply is sent to the correlation entry's TDLib chat_id, reply_to the
 // entry's message_id. The uint32 oid is never a sendMessage chat_id.
-// Chat URLs are read from memory only — no TDLib call on the gRPC thread.
+// Each hit's link uses that hit's `cid` (not the request oid). The base is
+// resolved before formatting (chat_links, then chathis, then a public
+// username). This header's formatter does not call TDLib itself.
 
 #include <features/media_thumbnail/SearchHandler.h>
 #include <telegram/MessageSender.h>
@@ -26,15 +28,23 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace tg::features::auto_search {
 
-// http(s) chat_url is concatenated with the decimal mid (Python
-// build_message_link). Anything else — missing, empty, or a placeholder
-// such as ">>>>Nrror>…" / ">>Chat>…" — becomes
-// https://t.me/c/{bare_cid}/{mid}.
+// Collapse trailing slashes to exactly one, so the mid is one path segment.
+std::string NormalizeLinkBase(std::string url);
+
+// http(s) chat_url is joined with the decimal mid (Python
+// build_message_link), with exactly one '/' before mid. Anything else —
+// missing, empty, or a placeholder such as ">>>>Nrror>…" / ">>Chat>…" —
+// becomes https://t.me/c/{bare_cid}/{mid}.
 std::string SearchResultLink(std::int64_t bare_cid, std::int64_t mid,
                              const std::optional<std::string>& chat_url);
+
+// Distinct hit cids in `result`, in first-seen order. Empty when the
+// result is not a non-empty hit list (the "No One Find" cases).
+std::vector<std::int64_t> SearchReplyCids(const std::string& result);
 
 struct SearchReplyMessage {
   std::string text;

@@ -9,6 +9,7 @@
 #include <app/Config.h>
 #include <app/WorkerPool.h>
 #include <features/auto_search/AutoSearchHandler.h>
+#include <features/auto_search/ChatLinkResolver.h>
 #include <features/bot_command/BotCommandHandler.h>
 #include <features/chat_state/ChatStateStore.h>
 #include <features/chat_state/SqliteChatStateBackend.h>
@@ -137,6 +138,9 @@ class Application {
       media_channel_handler_;
   features::bot_command::BotCommandHandler bot_command_handler_;
   std::shared_ptr<features::auto_search::AutoSearchHandler> auto_search_handler_;
+  // Search-hit link bases. Reads chathis; never writes it. TDLib username
+  // lookups run on the worker pool with a short timeout.
+  features::auto_search::ChatLinkResolver chat_link_resolver_;
   telegram::UpdateDispatcher dispatcher_;
   std::unique_ptr<AppContext> ctx_;
 

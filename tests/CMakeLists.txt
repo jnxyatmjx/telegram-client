@@ -12,6 +12,7 @@ set(TG_TEST_SOURCES
   test_outbox.cpp
   test_bot_command.cpp
   test_auto_search.cpp
+  test_search_reply.cpp
   test_handler_registry.cpp
   test_async_streamer.cpp
   test_e2e_fake_server.cpp

@@ -1,0 +1,65 @@
+#ifndef TG_FEATURES_AUTO_SEARCH_SEARCHREPLY_H_
+#define TG_FEATURES_AUTO_SEARCH_SEARCHREPLY_H_
+
+// Turns a SearchImages SearchRsp.result into the one Telegram message
+// app_bot_client.py sends as a reply to the image that was searched.
+//
+// result is either Milvus JSON {"data":[{"memo","cid","mid"}, ...]} or a
+// non-JSON status string ("Search N No Faces", "Image Empty N", "None",
+// an exception blob). Non-JSON, missing `data`, and an empty `data` array
+// become the fixed "No One Find" line with the link preview ON. A non-empty
+// `data` array becomes one MarkdownV2 message, link preview OFF.
+//
+// memo is AES-GCM ciphertext (MemoCipher / KEYME). Decrypt failure of one
+// hit is logged and that hit uses the emoji placeholder, so the other hits
+// still go out. Python drops the whole reply on the first decrypt error;
+// keeping the rest is the deliberate difference.
+//
+// The reply is sent to the correlation entry's TDLib chat_id, reply_to the
+// entry's message_id. The uint32 oid is never a sendMessage chat_id.
+// Chat URLs are read from memory only — no TDLib call on the gRPC thread.
+
+#include <features/media_thumbnail/SearchHandler.h>
+#include <telegram/MessageSender.h>
+
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <string>
+
+namespace tg::features::auto_search {
+
+// http(s) chat_url is concatenated with the decimal mid (Python
+// build_message_link). Anything else — missing, empty, or a placeholder
+// such as ">>>>Nrror>…" / ">>Chat>…" — becomes
+// https://t.me/c/{bare_cid}/{mid}.
+std::string SearchResultLink(std::int64_t bare_cid, std::int64_t mid,
+                             const std::optional<std::string>& chat_url);
+
+struct SearchReplyMessage {
+  std::string text;
+  // True only for the "No One Find" line (Python link_preview=True).
+  bool link_preview_enabled = false;
+};
+
+// `decrypt` returns the plaintext memo, or nullopt on failure.
+// `chat_url` returns an http(s) prefix for that bare cid, or nullopt.
+SearchReplyMessage FormatSearchReply(
+    const std::string& result,
+    const std::function<std::optional<std::string>(const std::string&)>&
+        decrypt,
+    const std::function<std::optional<std::string>(std::int64_t)>& chat_url);
+
+// Formats `result` and sends it with messenger.SendMarkdownReply to
+// `target.chat_id` / `target.message_id`.
+void DeliverSearchReply(
+    telegram::MessageSender& messenger,
+    const media_thumbnail::SearchCorrelationTable::Entry& target,
+    const std::string& result,
+    const std::function<std::optional<std::string>(const std::string&)>&
+        decrypt,
+    const std::function<std::optional<std::string>(std::int64_t)>& chat_url);
+
+}  // namespace tg::features::auto_search
+
+#endif  // TG_FEATURES_AUTO_SEARCH_SEARCHREPLY_H_

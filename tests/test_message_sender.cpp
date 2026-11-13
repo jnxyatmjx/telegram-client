@@ -48,6 +48,14 @@ class FakeTdSender : public tg::telegram::ITdSender {
       sent_link_previews_disabled.push_back(
           content.link_preview_options_ != nullptr &&
           content.link_preview_options_->is_disabled_);
+      std::int64_t reply_to = 0;
+      if (send.reply_to_ != nullptr &&
+          send.reply_to_->get_id() == td_api::inputMessageReplyToMessage::ID) {
+        reply_to = static_cast<const td_api::inputMessageReplyToMessage&>(
+                       *send.reply_to_)
+                       .message_id_;
+      }
+      sent_reply_to.push_back(reply_to);
       response.object = td_api::make_object<td_api::message>();
     } else {
       response.object = td_api::make_object<td_api::error>(400, "unexpected");
@@ -59,6 +67,7 @@ class FakeTdSender : public tg::telegram::ITdSender {
   std::vector<std::int64_t> sent_chat_ids;
   std::vector<std::string> sent_texts;
   std::vector<bool> sent_link_previews_disabled;
+  std::vector<std::int64_t> sent_reply_to;
 
  private:
   std::uint64_t next_id_ = 1;
@@ -161,6 +170,21 @@ TEST(SendMarkdown, SingleChunkSendsOneMessage) {
   EXPECT_EQ(sender.sent_texts[0], "hello `world`");
   EXPECT_EQ(sender.sent_chat_ids[0], -1'001'234'567'890LL);
   EXPECT_TRUE(sender.sent_link_previews_disabled[0]);
+  EXPECT_EQ(sender.sent_reply_to[0], 0);  // control-command sends do not reply
+}
+
+TEST(SendMarkdownReply, RepliesToTheOriginalMessageAndControlsPreview) {
+  FakeTdSender sender;
+  const message_sender::MessageSender messenger(sender);
+  constexpr std::int64_t kDialog = -1001234567890LL;
+  messenger.SendMarkdownReply(kDialog, 555, "hits", false);
+  messenger.SendMarkdownReply(kDialog, 555, "none", true);
+  ASSERT_EQ(sender.sent_texts.size(), 2u);
+  EXPECT_EQ(sender.sent_chat_ids[0], kDialog);
+  EXPECT_EQ(sender.sent_reply_to[0], 555);
+  EXPECT_TRUE(sender.sent_link_previews_disabled[0]);
+  EXPECT_EQ(sender.sent_reply_to[1], 555);
+  EXPECT_FALSE(sender.sent_link_previews_disabled[1]);
 }
 
 TEST(SendMarkdown, LongTextSplitsIntoMultipleMessages) {

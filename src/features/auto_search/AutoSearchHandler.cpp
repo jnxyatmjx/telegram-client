@@ -17,6 +17,17 @@ bool AutoSearchHandler::IsMediaMessage(const td_api::message& message) {
     case td_api::messageVideo::ID:
     case td_api::messageAnimation::ID:
       return true;
+    case td_api::messageDocument::ID: {
+      // Same files MediaExtractor will actually send: image/* bytes, or a
+      // video/mp4 thumbnail (app_bot_client.handlermedia). Other MIME types
+      // are not searchable.
+      const auto* content = static_cast<const td_api::messageDocument*>(
+          message.content_.get());
+      if (content->document_ == nullptr) return false;
+      const std::string& mime = content->document_->mime_type_;
+      if (mime.compare(0, 6, "image/") == 0) return true;
+      return mime == "video/mp4";
+    }
     default:
       return false;
   }

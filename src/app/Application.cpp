@@ -1,6 +1,8 @@
 #include "app/Application.h"
 
 #include <common/Logger.h>
+#include <common/MemoCipher.h>
+#include <features/auto_search/SearchReply.h>
 #include <telegram/AuthManager.h>
 
 #include <csignal>
@@ -232,18 +234,34 @@ void Application::WireStreamerCallbacks() {
   process_pool_.SetReplyHandler(
       [this](const ImageReply& reply) { OnProcessImageReply(reply); });
 
-  // SearchRsp -> correlation table lookup (v5 §2.4), log only.
+  // SearchRsp -> correlation lookup, then ONE reply to that message
+  // (app_bot_client.rspwork). The chat_id is the TDLib dialog id stored
+  // when the SearchReq was sent, never the uint32 oid. Chat URLs are read
+  // from memory; this callback does not call TDLib.
   search_pool_.SetReplyHandler(
       [this](const SearchRsp& reply) {
         const auto entry = search_handler_.correlation().Lookup(
             reply.oid(), reply.id());
-        if (entry.has_value()) {
-          spdlog::info("search: rsp for {} (oid={}, id={}) result: {:.200}",
-                       entry->image_id, reply.oid(), reply.id(), reply.result());
-        } else {
+        if (!entry.has_value()) {
           spdlog::warn("search: rsp for unknown (oid={}, id={})", reply.oid(),
                        reply.id());
+          return;
         }
+        spdlog::info("search: rsp for {} (oid={}, id={}) result: {:.200}",
+                     entry->image_id, reply.oid(), reply.id(), reply.result());
+        const common::MemoCipher cipher(config_.media_thumbnail.keyme);
+        features::auto_search::DeliverSearchReply(
+            messenger_, *entry, reply.result(),
+            [&cipher](const std::string& token) { return cipher.Decrypt(token); },
+            [this](std::int64_t cid) -> std::optional<std::string> {
+              const auto state = chat_state_.Get(cid);
+              if (!state.has_value()) return std::nullopt;
+              const std::string& url = state->chat_url;
+              if (url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0) {
+                return url;
+              }
+              return std::nullopt;
+            });
       });
 
   // Write-ok: the request left the client (gRPC accepted it into the

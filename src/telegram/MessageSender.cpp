@@ -61,23 +61,40 @@ MessageSender::MessageSender(ITdSender& sender, FloodRetry* flood_retry)
 
 void MessageSender::SendMarkdown(std::int64_t chat_id,
                                  const std::string& text) const {
+  StartMarkdown(chat_id, MarkdownDelivery{}, text);
+}
+
+void MessageSender::SendMarkdownReply(std::int64_t chat_id,
+                                      std::int64_t reply_to_message_id,
+                                      const std::string& text,
+                                      bool link_preview_enabled) const {
+  MarkdownDelivery delivery;
+  delivery.reply_to_message_id = reply_to_message_id;
+  delivery.link_preview_enabled = link_preview_enabled;
+  StartMarkdown(chat_id, delivery, text);
+}
+
+void MessageSender::StartMarkdown(std::int64_t chat_id,
+                                  MarkdownDelivery delivery,
+                                  const std::string& text) const {
   auto chunks = std::make_shared<const std::vector<std::string>>(
       SplitForTelegram(text));
-  SendChunksInOrder(chat_id, chunks, 0);
+  SendChunksInOrder(chat_id, delivery, chunks, 0);
 }
 
 void MessageSender::SendChunksInOrder(
-    std::int64_t chat_id,
+    std::int64_t chat_id, MarkdownDelivery delivery,
     std::shared_ptr<const std::vector<std::string>> chunks,
     std::size_t index) const {
   if (index >= chunks->size()) return;
-  ParseAndSendChunk(chat_id, (*chunks)[index], 1,
-                    [this, chat_id, chunks, index] {
-                      SendChunksInOrder(chat_id, chunks, index + 1);
+  ParseAndSendChunk(chat_id, delivery, (*chunks)[index], 1,
+                    [this, chat_id, delivery, chunks, index] {
+                      SendChunksInOrder(chat_id, delivery, chunks, index + 1);
                     });
 }
 
 void MessageSender::ParseAndSendChunk(std::int64_t chat_id,
+                                      MarkdownDelivery delivery,
                                       const std::string& chunk, int attempt,
                                       std::function<void()> on_done) const {
   // TDLib parses markdown locally (no network), so this is fast — but it
@@ -92,7 +109,8 @@ void MessageSender::ParseAndSendChunk(std::int64_t chat_id,
   parse_request->parse_mode_ = std::move(mode);
 
   sender_.Send(std::move(parse_request),
-               [this, chat_id, chunk, attempt, on_done = std::move(on_done)](
+               [this, chat_id, delivery, chunk, attempt,
+                on_done = std::move(on_done)](
                    td::ClientManager::Response&& response) mutable {
                  td_api::object_ptr<td_api::formattedText> formatted;
                  if (response.object != nullptr &&
@@ -118,34 +136,39 @@ void MessageSender::ParseAndSendChunk(std::int64_t chat_id,
                    formatted = td_api::make_object<td_api::formattedText>();
                    formatted->text_ = chunk;
                  }
-                 SendParsedChunk(chat_id, std::move(formatted), chunk, attempt,
-                                 std::move(on_done));
+                 SendParsedChunk(chat_id, delivery, std::move(formatted), chunk,
+                                 attempt, std::move(on_done));
                });
 }
 
 void MessageSender::SendParsedChunk(
-    std::int64_t chat_id,
+    std::int64_t chat_id, MarkdownDelivery delivery,
     td_api::object_ptr<td_api::formattedText> formatted,
     const std::string& chunk, int attempt,
     std::function<void()> on_done) const {
   auto content = td_api::make_object<td_api::inputMessageText>();
   content->text_ = std::move(formatted);
   auto preview = td_api::make_object<td_api::linkPreviewOptions>();
-  preview->is_disabled_ = true;  // Python link_preview=False everywhere
+  // SendMarkdown keeps previews off. Search "No One Find" turns them on.
+  preview->is_disabled_ = !delivery.link_preview_enabled;
   content->link_preview_options_ = std::move(preview);
   content->clear_draft_ = false;
 
   auto request = td_api::make_object<td_api::sendMessage>();
   request->chat_id_ = chat_id;
   request->topic_id_ = nullptr;
-  request->reply_to_ = nullptr;
+  if (delivery.reply_to_message_id > 0) {
+    request->reply_to_ = td_api::make_object<td_api::inputMessageReplyToMessage>(
+        delivery.reply_to_message_id, nullptr, 0, "");
+  }
   request->options_ = nullptr;
   request->reply_markup_ = nullptr;
   request->input_message_content_ = std::move(content);
 
   sender_.Send(
       std::move(request),
-      [this, chat_id, chunk, attempt](td::ClientManager::Response&& response) {
+      [this, chat_id, delivery, chunk, attempt](
+          td::ClientManager::Response&& response) {
         if (response.object == nullptr) return;
         if (response.object->get_id() == td_api::error::ID) {
           const auto& error =
@@ -154,11 +177,14 @@ void MessageSender::SendParsedChunk(
             // Rate-limited: re-parse and re-send the SAME chunk after
             // retry-after + pad (it was never accepted), bounded by the
             // shared scheduler's attempt cap. Re-parsing (local, fast)
-            // preserves the markdown entities.
+            // preserves the markdown entities, the reply target, and the
+            // preview flag.
             if (flood_retry_ != nullptr &&
                 flood_retry_->Schedule(
-                    error, attempt, [this, chat_id, chunk, attempt] {
-                      ParseAndSendChunk(chat_id, chunk, attempt + 1, [] {});
+                    error, attempt,
+                    [this, chat_id, delivery, chunk, attempt] {
+                      ParseAndSendChunk(chat_id, delivery, chunk, attempt + 1,
+                                        [] {});
                     })) {
               return;
             }

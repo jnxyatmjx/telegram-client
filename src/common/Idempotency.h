@@ -72,12 +72,12 @@ std::string MakeImageId(std::int64_t chat_id, std::int64_t message_id,
                         const std::string& file_unique_id);
 
 // ImageRequest.image_id on the wire: str(message_id) — the decimal message
-// id string, exactly what the Python client sends (app_client.py:1388). The
-// server dedupes on it at MESSAGE level: the same Telegram message always
-// maps to the same key, so a retry/replay is deduped server-side, while two
-// different messages never collide (MTProto message ids are per-chat, so two
-// chats CAN carry the same number — Python accepted that and so do we; the
-// server's key space is the message id string, not a per-chat tuple).
+// id string, exactly what the Python client sends (app_client.py:1388).
+// The InsightFace server dedups ProcessImages by (owner_id, image_id), not
+// by image_id alone: message ids are only unique inside one chat, so the
+// same number in two chats is two inserts. owner_id is the bare chat id
+// (ToBareChatId64). A replay of the same pair returns the cached
+// {"cid","mid"} and does not insert again.
 inline std::string MakeWireImageId(std::int64_t message_id) {
   return std::to_string(message_id);
 }

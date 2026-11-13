@@ -864,7 +864,8 @@ of libraries.
   returns true) plus the `{"cid","mid"}` watermark; write-ok →
   `MarkSent` (false → release the slot); write-lost → release the slot
   and `MarkFailed`; permanent gRPC status → `MarkDeadLetter`;
-  `SearchRsp` → correlation-table lookup; stream (re)connected →
+  `SearchRsp` → correlation-table lookup, then one Telegram reply to
+  that message (hit list, or "No One Find"); stream (re)connected →
   `SweepOutbox`. Owns the shutdown order above.
 - `app/Config` — Loads `config.yaml`, expands `${ENV}` placeholders.
   Secrets (`api_id`/`api_hash`, TDLib encryption key, gRPC token, phone)
@@ -915,11 +916,17 @@ of libraries.
   target message with `getMessage`, then dispatches `/process` →
   `ProcessImages` or `/search` → `SearchImages`. Command names are
   placeholders until the user confirms the real ones.
-- `features/auto_search/AutoSearchHandler` — Phase 2, disabled by
-  default. Fires when a user posts an image/video in an allowlisted
-  chat (`auto_search.chats`); verifies only `chat_id`, not the sender
-  (channel posts may have no sender). Produces `SearchImages` only,
-  never `ProcessImages`. Dedups by `(oid, id)` with a 10-minute TTL.
+- `features/auto_search/AutoSearchHandler` — Disabled by default.
+  Fires when a photo, video, animation, `image/*` document, or
+  `video/mp4` document is posted in an allowlisted chat
+  (`auto_search.chats`, TDLib `-100…` ids), including a forward of one
+  of those. Verifies only `chat_id`, not the sender (channel posts may
+  have no sender). Produces `SearchImages` only, never `ProcessImages`.
+  Dedups by `(oid, id)` with a 10-minute TTL. `SearchReply` turns the
+  `SearchRsp` into one MarkdownV2 reply to that message: numbered
+  `[memo](url)` hits (memo decrypted with `KEYME`, 28 code points,
+  preview off) or the fixed "No One Find" line (preview on). The send
+  uses the correlation entry's TDLib chat id, never the uint32 `oid`.
 - `features/media_thumbnail/MediaExtractor` — Pure tier selection
   (Telethon-migration chunk 1 semantics). Photo: the LARGEST tier — the
   full-resolution original, no size cap (ties by larger max edge;
@@ -945,8 +952,10 @@ of libraries.
   extraction/download path, but builds a `SearchReq` with the bare-ID
   conversion and range checks, registers `(oid, id)` in the correlation
   table, and enqueues to the SearchImages stream. Never writes to the
-  Outbox. After the enqueue attempt (a dropped `SearchReq` is recovered
-  by re-triggering, not by re-reading the file) — and on every
+  Outbox. The matching `SearchRsp` is rendered by `auto_search/SearchReply`
+  and sent as a reply to the correlated message. After the enqueue
+  attempt (a dropped `SearchReq` is recovered by re-triggering, not by
+  re-reading the file) — and on every
   early-return path — the handler drops its claim on the local file
   (`FileDownloader::Release` → `deleteFile` at the last consumer).
 - `transport/GrpcTransport` — A pool of `grpc.connections` Channels

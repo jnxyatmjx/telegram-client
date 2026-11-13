@@ -60,8 +60,12 @@ features:
     process_command: "/process"
     search_command: "/search"
   auto_search:
-    # Phase 2 trigger: user posts an image in an allowlisted channel/group.
-    # DISABLED by default; SearchImages only, never ProcessImages.
+    # Media posted in an allowlisted chat (photo, video, animation, an
+    # image/* document, or a video/mp4 document — a forward counts) starts
+    # SearchImages only, never ProcessImages. DISABLED by default. The
+    # SearchRsp is sent back as one reply to that message: a numbered
+    # hit list, or the "No One Find" line (link preview on). chats are
+    # TDLib dialog ids (the -100... form), not @usernames.
     enabled: false
     chats: []                  # TDLib dialog chat_ids (the -100... form)
     dedup_ttl_seconds: 600     # (oid, id) recent-search dedup TTL

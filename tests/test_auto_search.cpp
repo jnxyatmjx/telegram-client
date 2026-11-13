@@ -280,6 +280,35 @@ TEST_F(AutoSearchTest, DedupSkipsSecondHandleWithinTtl) {
   EXPECT_EQ(search_streamer_->lane(0)->QueuedCount(), 2u);
 }
 
+td_api::object_ptr<td_api::updateNewMessage> MakeDocumentUpdate(
+    const std::string& mime) {
+  auto message = td_api::make_object<td_api::message>();
+  message->id_ = 900;
+  message->chat_id_ = -1'001'234'567'890LL;
+  auto document = td_api::make_object<td_api::document>();
+  document->mime_type_ = mime;
+  auto content = td_api::make_object<td_api::messageDocument>();
+  content->document_ = std::move(document);
+  message->content_ = std::move(content);
+  auto update = td_api::make_object<td_api::updateNewMessage>();
+  update->message_ = std::move(message);
+  return update;
+}
+
+TEST_F(AutoSearchTest, ImageAndMp4DocumentsAreMedia) {
+  config_.auto_search.enabled = true;
+  config_.auto_search.chats = {-1'001'234'567'890LL};
+  auto handler = MakeHandler();
+  td_api::object_ptr<td_api::Update> jpeg = MakeDocumentUpdate("image/jpeg");
+  td_api::object_ptr<td_api::Update> mp4 = MakeDocumentUpdate("video/mp4");
+  td_api::object_ptr<td_api::Update> pdf = MakeDocumentUpdate("application/pdf");
+  td_api::object_ptr<td_api::Update> webm = MakeDocumentUpdate("video/webm");
+  EXPECT_TRUE(handler->CanHandle(jpeg));
+  EXPECT_TRUE(handler->CanHandle(mp4));
+  EXPECT_FALSE(handler->CanHandle(pdf));
+  EXPECT_FALSE(handler->CanHandle(webm));
+}
+
 TEST_F(AutoSearchTest, EmptyAllowlistClaimsNothingEvenWhenEnabled) {
   config_.auto_search.enabled = true;
   config_.auto_search.chats.clear();

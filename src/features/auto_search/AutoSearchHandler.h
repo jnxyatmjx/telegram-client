@@ -1,8 +1,10 @@
 #ifndef TG_FEATURES_AUTO_SEARCH_AUTOSEARCHHANDLER_H_
 #define TG_FEATURES_AUTO_SEARCH_AUTOSEARCHHANDLER_H_
 
-// AutoSearchHandler (v5 §2.7, phase 2): a user posts an image/video/animation
-// in an ALLOWLISTED chat -> triggers SearchImages ONLY. Never ProcessImages.
+// AutoSearchHandler (v5 §2.7, phase 2): a photo, video, animation, image/*
+// document, or video/mp4 document posted in an ALLOWLISTED chat (including
+// a forward of one of those) triggers SearchImages ONLY. Never ProcessImages.
+// The SearchRsp is answered later, as a reply to that same message.
 //
 // DISABLED BY DEFAULT (features.auto_search.enabled: false). CanHandle short-
 // circuits on the enabled flag, so with default config this handler claims

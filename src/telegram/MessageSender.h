@@ -68,31 +68,50 @@ class MessageSender {
       std::size_t max_chars = kMaxMessageChars);
 
   // Sends `text` as markdown (MarkdownV2, parsed via parseTextEntities)
-  // with link previews disabled, in as many messages as the 4096-char
-  // split needs, strictly in order. Safe from any thread.
+  // with link previews disabled and no reply_to, in as many messages as
+  // the 4096-char split needs, strictly in order. Safe from any thread.
+  // Control-command notices use this and must keep that shape.
   void SendMarkdown(std::int64_t chat_id, const std::string& text) const;
 
+  // Same MarkdownV2 send, but as a reply to `reply_to_message_id` in
+  // `chat_id` (the TDLib dialog id, never a bare uint32 oid).
+  // `link_preview_enabled` false matches SendMarkdown (preview off).
+  // FloodWait retries keep both the reply target and the preview flag.
+  // `reply_to_message_id` <= 0 sends with no reply_to.
+  void SendMarkdownReply(std::int64_t chat_id,
+                         std::int64_t reply_to_message_id,
+                         const std::string& text,
+                         bool link_preview_enabled) const;
+
  private:
-  // Sends the chunks of one SendMarkdown call strictly in order: chunk
-  // `index` is parsed and dispatched, then the next chunk starts. `chunks`
-  // is shared so the chain can outlive the SendMarkdown call.
+  struct MarkdownDelivery {
+    std::int64_t reply_to_message_id = 0;
+    bool link_preview_enabled = false;
+  };
+
+  void StartMarkdown(std::int64_t chat_id, MarkdownDelivery delivery,
+                     const std::string& text) const;
+
+  // Sends the chunks of one call strictly in order: chunk `index` is
+  // parsed and dispatched, then the next chunk starts. `chunks` is
+  // shared so the chain can outlive the call.
   void SendChunksInOrder(
-      std::int64_t chat_id,
+      std::int64_t chat_id, MarkdownDelivery delivery,
       std::shared_ptr<const std::vector<std::string>> chunks,
       std::size_t index) const;
 
   // Parses one chunk as MarkdownV2, then sends it (via SendParsedChunk)
   // and invokes `on_done` once the send has been dispatched. A parse
   // failure falls back to the raw chunk as plain text.
-  void ParseAndSendChunk(std::int64_t chat_id, const std::string& chunk,
-                         int attempt,
+  void ParseAndSendChunk(std::int64_t chat_id, MarkdownDelivery delivery,
+                         const std::string& chunk, int attempt,
                          std::function<void()> on_done) const;
 
   // Sends one already-parsed chunk (attempt 1 from ParseAndSendChunk; the
   // flood retry path re-parses `chunk` and re-enters with attempt + 1).
   // `on_done` runs once the send has been dispatched.
   void SendParsedChunk(
-      std::int64_t chat_id,
+      std::int64_t chat_id, MarkdownDelivery delivery,
       td_api::object_ptr<td_api::formattedText> formatted,
       const std::string& chunk, int attempt,
       std::function<void()> on_done) const;

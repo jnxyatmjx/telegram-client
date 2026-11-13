@@ -1,5 +1,12 @@
 # Chunk 2 — RESUME instructions (written 2026-11-08 06:58 CST, after VM replacement)
 
+> **Obsolete.** Chunk 2 finished and later chunks landed on `main`.
+> The "still missing" file list and the partial TDLib build described
+> below are not the tree today. Do not follow these steps. Current
+> build and Outbox behavior: `README.md`.
+
+
+
 You are resuming chunk 2 of the TDLib + gRPC C++ build. The previous run died at
 2026-11-07 21:45 UTC on a GLM connection error (ECONNREFUSED, transient — the
 endpoint answers again now). The VM was replaced again at ~22:53 UTC; the process

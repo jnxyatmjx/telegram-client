@@ -1,40 +1,41 @@
 # Pending features — Telethon migration follow-ups
 
-Recorded 2026-11-11 per Hong. These two features are **not yet implemented**;
-this file is the record so they are not lost. Implement them only when Hong
-says to (retry redesign needs his choice on the design; D1 needs his
-Cloudflare credentials).
+Recorded 2026-11-11 per Hong. The retry redesign below has since landed.
+**D1 is still not implemented** — it needs Hong's Cloudflare credentials.
+Do not describe the D1 client as current behavior.
 
-## 1. Retry redesign (in-flight / kSent)
+## 1. Retry redesign (in-flight / kSent) — done
 
-- **Design doc:** `retry-design.md` (26 KB, written 2026-11-10 by Claude Code
-  CLI analysis; no code changed).
-- **Status:** design written, **awaiting Hong's decision**. Do not implement
-  until he chooses.
-- **Problem it solves:** the `925a0aa` ack-timeout fix is incomplete. A
-  freshly-sent Outbox record is Put with `next_retry_at = now + ack_timeout`
-  (30 s), but every re-send re-arms with `retry_backoff_ms` (5 s), so a
-  server slower than ~70 s/image gets 5 duplicate sends and then the record
-  DEAD-LETTERS (and the late reply hits "reply for unknown image_id").
-  Related gaps: a provably-lost send (stream break, queue dropped) still
-  waits out the full ack deadline; reconnect inside the ack window recovers
-  nothing; write success is unobservable (`Enqueue == true` is not "sent").
-- **Recommended design (a2):** persisted `OutboxState::kSent` with
-  write-outcome callbacks — `MarkSent` on write-ok, `MarkFailed` on
-  write-lost, safety-net `sent_timeout_ms` (default 10 min), startup
-  migrates `SENT → PENDING`. Alternatives in the doc: (b) adaptive timeout,
-  (c) bounded in-flight window, (d) server-ACK proto change (not
-  recommended).
-- **Open questions (from the design doc):** does the server actually dedup
-  by `image_id` (live test suggests maybe not)? Server per-image time under
-  batch load? Is a proto change acceptable? Is the duplicate-reply
-  watermark advance idempotent? Permanent-error handling for SENT?
-  Safety-net latency acceptability?
+Shipped on `main` (`42c75b0`, flow-control slot release on a successful
+`ImageReply` in `4cec0e3`). Current behavior is
+[Outbox state](../../README.md#outbox-state) in the README. The design
+write-up is `retry-design.md`: its opening decisions are Hong's
+2026-11-12 choices; **§0 is the pre-change baseline at `925a0aa`, not
+what the client does now.**
+
+What the code does, relative to that write-up:
+
+- **(a2) is in.** `OutboxState::kSent = 4`, `MarkSent` on write-ok,
+  `MarkFailed` on write-lost (from `kPending` only), safety-net
+  `outbox.sent_timeout_ms` (default 600000), startup
+  `kSent → kPending` after `send_grace_ms`.
+- **(c) is in too**, not deferred: `outbox.max_in_flight` (default 60,
+  `0` disables it) on the ProcessImages path only. `TryAcquire` before
+  enqueue; a full window leaves the row `kPending` and does not burn
+  `attempts`. `Release` runs when `MarkDone` returns true, on
+  write-lost, on a false `MarkSent`, on a failed enqueue after
+  acquire, on a safety-net requeue, when a permanent error dead-letters
+  a `kSent` row, and when `FinishProcess` replaces a row that is still
+  `kSent`. A false `MarkDone` (already `kDone`, `kDeadLetter`, or an
+  unknown id) releases nothing.
+- **(b) and (d) are not implemented.** `grpc.ack_timeout_ms` is still
+  parsed and is not read. No `ImageAck` proto change.
+- The Outbox `image_data` BLOB stayed. It is the retry byte source.
 
 ## 2. D1 hookup (Cloudflare D1 state persistence)
 
-- **Design doc:** `state-persistence-and-d1.md`
-  (written in Chunk 2) + `IMPLEMENTATION_PLAN.md` item 10.
+- **Design doc:** `state-persistence-and-d1.md` (written in Chunk 2).
+  `IMPLEMENTATION_PLAN.md` is not in this repository.
 - **Status:** SQLite backend is the working temporary implementation
   (Chunk 2). D1 is the final target. **Needs Hong's Cloudflare
   credentials** (`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`,
@@ -62,10 +63,10 @@ acceptable and stays as the retry byte source.**
 
 What this means for the two features above (and the client generally):
 
-- The retry redesign **keeps** the Outbox `image_data` BLOB — it is the
-  retry byte source, including retry-after-restart. Do **not** remove it
-  as part of the retry redesign. (The earlier version of this section said
-  the opposite; that was wrong and was corrected here on 2026-11-11.)
+- The shipped retry redesign kept the Outbox `image_data` BLOB — it is
+  the retry byte source, including retry-after-restart. (The earlier
+  version of this section said to remove it; that was wrong and was
+  corrected here on 2026-11-11.)
 - D1 stores chat state only (watermarks, chat URLs, timestamps). It must
   never receive image bytes.
 - The client itself never writes an image file. A Telegram message carries
@@ -92,6 +93,8 @@ What this means for the two features above (and the client generally):
 
 ## Done (for reference — not pending)
 
+- Retry redesign (a2) plus the flow-control window — `42c75b0`,
+  slot release on successful `MarkDone` — `4cec0e3`. See §1 above.
 - Migration Chunk 1 (protocol alignment) — remote `a939e0b`.
 - Migration Chunk 2 (state persistence, backfill, commands) — remote
   `da529f0`.
@@ -100,5 +103,6 @@ What this means for the two features above (and the client generally):
 - Duplicate-DONE fix — remote `925a0aa`.
 - owner_id int64 fix — in `da529f0`.
 - deleteFile cleanup (delete local cached file after download + BLOB
-  store, reference-counted) — remote `9775eb9`, ctest 24/24. Pre-existing
+  store, reference-counted) — remote `9775eb9`, ctest 24/24 at that
+  commit. The registered suite is now 26 binaries. Pre-existing
   files in `files_directory` from before this change are not auto-cleared.

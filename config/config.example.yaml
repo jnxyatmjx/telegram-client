@@ -115,6 +115,10 @@ outbox:
   # Flow-control window (retry design §2(c)): max sent-but-unreplied
   # ProcessImages requests. SearchImages bypasses it. 0 = unlimited.
   max_in_flight: 60
+  # On each retry sweep (~10s), delete DONE rows older than this (default
+  # 24h). Only successful sends are removed; PENDING, SENT, FAILED and
+  # DEAD_LETTER stay. 0 purges DONE rows on the next sweep.
+  purge_done_after_seconds: 86400
 
 # State persistence (Telethon migration chunk 2, Python chathis):
 # every flush_interval_seconds, chats whose watermark advanced within the

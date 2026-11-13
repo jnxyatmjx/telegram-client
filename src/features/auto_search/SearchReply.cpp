@@ -10,11 +10,11 @@
 namespace tg::features::auto_search {
 namespace {
 
-// Python rspwork, rendered as MarkdownV2. This particular string has no
-// reserved characters outside the bold markers and the link, so it is
-// also valid V2 as written (the URL's '.' sits inside the link target).
+// Python rspwork uses Telethon legacy markdown (**bold**). MarkdownV2
+// bold is a single asterisk (td::parse_markdown_v2, MessageEntity.cpp).
+// The URL's '.' sits inside the link target, where it is not reserved.
 constexpr const char* kNoOneFind =
-    "\n⚡️\t**No One Find**\t🎯\n"
+    "\n⚡️\t*No One Find*\t🎯\n"
     "[👉Maybe Here You Like👈](https://t.me/uuuiii3)";
 
 // Python: memo_str = "🎯 ✅🔥 ✅⚡️ ✅⚡️ ✅🔥 ✅🎯 " when decryption yields
@@ -386,9 +386,10 @@ SearchReplyMessage FormatSearchReply(
       memo = kEmptyMemo;
     }
     if (!body.empty()) body.push_back('\n');
-    body += "**";
+    // MarkdownV2 bold is *text*, not **text** (that pair is an empty bold).
+    body += "*";
     body += std::to_string(n + 1);
-    body += "**\\. [";
+    body += "*\\. [";
     body += telegram::EscapeMarkdownV2(memo);
     body += "](";
     body += EscapeLinkTarget(SearchResultLink(hit.cid, hit.mid, chat_url

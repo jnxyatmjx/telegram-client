@@ -3,12 +3,16 @@
 #include <features/media_thumbnail/SearchHandler.h>
 #include <telegram/MessageSender.h>
 
+#include <td/telegram/MessageEntity.h>
 #include <td/telegram/td_api.h>
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace td_api = td::td_api;
 namespace search = tg::features::auto_search;
@@ -25,6 +29,62 @@ std::string Repeat(const std::string& unit, int n) {
   std::string out;
   for (int i = 0; i < n; ++i) out += unit;
   return out;
+}
+
+// parse_markdown_v2 offsets are UTF-16 code units, not bytes.
+std::string SliceUtf16(const std::string& utf8, int32_t offset, int32_t length) {
+  std::string out;
+  int32_t units = 0;
+  for (std::size_t i = 0; i < utf8.size() && units < offset + length;) {
+    const auto c = static_cast<unsigned char>(utf8[i]);
+    std::size_t len = 1;
+    int32_t span = 1;
+    if ((c & 0x80) == 0) {
+      len = 1;
+    } else if ((c & 0xE0) == 0xC0 && i + 1 < utf8.size()) {
+      len = 2;
+    } else if ((c & 0xF0) == 0xE0 && i + 2 < utf8.size()) {
+      len = 3;
+    } else if ((c & 0xF8) == 0xF0 && i + 3 < utf8.size()) {
+      len = 4;
+      span = 2;  // surrogate pair
+    }
+    if (units >= offset) out.append(utf8, i, len);
+    units += span;
+    i += len;
+  }
+  return out;
+}
+
+void ExpectParses(const search::SearchReplyMessage& message,
+                  const std::string& plain,
+                  const std::vector<std::pair<std::string, std::string>>&
+                      bold_and_url) {
+  td::string text = message.text;
+  auto parsed = td::parse_markdown_v2(text);
+  if (parsed.is_error()) {
+    const auto err = parsed.error().message();
+    ADD_FAILURE() << std::string(err.data(), err.size()) << "\n" << message.text;
+    return;
+  }
+  EXPECT_EQ(text, plain);
+  std::vector<std::string> bolds;
+  std::vector<std::pair<std::string, std::string>> urls;
+  for (const auto& entity : parsed.ok()) {
+    if (entity.type == td::MessageEntity::Type::Bold) {
+      bolds.push_back(SliceUtf16(text, entity.offset, entity.length));
+      EXPECT_GT(entity.length, 0);
+    } else if (entity.type == td::MessageEntity::Type::TextUrl) {
+      urls.emplace_back(SliceUtf16(text, entity.offset, entity.length),
+                        entity.argument);
+    }
+  }
+  ASSERT_EQ(bolds.size(), bold_and_url.size());
+  ASSERT_EQ(urls.size(), bold_and_url.size());
+  for (std::size_t i = 0; i < bold_and_url.size(); ++i) {
+    EXPECT_EQ(bolds[i], bold_and_url[i].first);
+    EXPECT_EQ(urls[i].second, bold_and_url[i].second);
+  }
 }
 
 class FakeTdSender : public tg::telegram::ITdSender {
@@ -97,7 +157,7 @@ TEST(FormatSearchReply, EscapesMemoAndNumberAndUsesBareLink) {
       NoUrl);
   EXPECT_FALSE(message.link_preview_enabled);
   EXPECT_EQ(message.text,
-            "**1**\\. [a\\-b \\(c\\)\\!](https://t.me/c/3519704595/88)\n");
+            "*1*\\. [a\\-b \\(c\\)\\!](https://t.me/c/3519704595/88)\n");
 }
 
 TEST(FormatSearchReply, EmptyMemoUsesPlaceholderAndHttpChatUrl) {
@@ -153,7 +213,7 @@ TEST(FormatSearchReply, NoMatchCasesTurnPreviewOn) {
   for (const char* result : cases) {
     const auto message = search::FormatSearchReply(result, Plain, NoUrl);
     EXPECT_TRUE(message.link_preview_enabled) << result;
-    EXPECT_NE(message.text.find("**No One Find**"), std::string::npos) << result;
+    EXPECT_NE(message.text.find("*No One Find*"), std::string::npos) << result;
     EXPECT_NE(message.text.find("https://t.me/uuuiii3"), std::string::npos)
         << result;
   }
@@ -177,7 +237,51 @@ TEST(DeliverSearchReply, RepliesToTheOriginalMessageNotTheOid) {
   EXPECT_EQ(sender.chat_id, -1001234567890LL);
   EXPECT_EQ(sender.reply_to, 555);
   EXPECT_TRUE(sender.preview_disabled);
-  EXPECT_NE(sender.text.find("**1**\\. [hi](https://t.me/c/999/42)"),
+  EXPECT_NE(sender.text.find("*1*\\. [hi](https://t.me/c/999/42)"),
             std::string::npos);
   EXPECT_EQ(sender.text.find("-1001234567890"), std::string::npos);
+}
+
+TEST(FormatSearchReply, MarkdownV2ParsesBoldAndTextUrl) {
+  // Hits: single-asterisk bold, escaped . - ( ) !, URL '.' left literal.
+  const auto hits = search::FormatSearchReply(
+      R"({"data":[{"memo":"tok","cid":3519704595,"mid":88},{"memo":"b","cid":1,"mid":2}]})",
+      [](const std::string& token) -> std::optional<std::string> {
+        if (token == "tok") return std::string("a-b (c)!.!");
+        return std::string("hi\\x");
+      },
+      [](std::int64_t cid) -> std::optional<std::string> {
+        if (cid == 1) return std::string("https://ex.ample/a)b\\");
+        return std::nullopt;
+      });
+  ExpectParses(hits,
+               "1. a-b (c)!.!\n2. hi\\x\n",
+               {{"1", "https://t.me/c/3519704595/88"},
+                {"2", "https://ex.ample/a)b\\2"}});
+  // The second link label is the memo; the URL ate the escaped ')' and '\'.
+  td::string hit_text = hits.text;
+  auto hit_entities = td::parse_markdown_v2(hit_text);
+  ASSERT_TRUE(hit_entities.is_ok());
+  bool saw_tricky_label = false;
+  for (const auto& entity : hit_entities.ok()) {
+    if (entity.type == td::MessageEntity::Type::TextUrl &&
+        entity.argument == "https://ex.ample/a)b\\2") {
+      EXPECT_EQ(SliceUtf16(hit_text, entity.offset, entity.length), "hi\\x");
+      saw_tricky_label = true;
+    }
+  }
+  EXPECT_TRUE(saw_tricky_label);
+
+  const auto none = search::FormatSearchReply("Search 1 No Faces", Plain, NoUrl);
+  ExpectParses(none,
+               "\n⚡️\tNo One Find\t🎯\n👉Maybe Here You Like👈",
+               {{"No One Find", "https://t.me/uuuiii3"}});
+  const auto empty = search::FormatSearchReply(R"({"data":[]})", Plain, NoUrl);
+  ExpectParses(empty,
+               "\n⚡️\tNo One Find\t🎯\n👉Maybe Here You Like👈",
+               {{"No One Find", "https://t.me/uuuiii3"}});
+  const auto missing = search::FormatSearchReply("None", Plain, NoUrl);
+  ExpectParses(missing,
+               "\n⚡️\tNo One Find\t🎯\n👉Maybe Here You Like👈",
+               {{"No One Find", "https://t.me/uuuiii3"}});
 }

@@ -40,6 +40,14 @@ foreach(src IN LISTS TG_TEST_SOURCES)
   add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
+# test_search_reply calls td::parse_markdown_v2 (td/telegram/MessageEntity.h).
+# tdutils headers are not on Td::TdStatic's public include path.
+if(TG_HAVE_TDLIB AND TARGET test_search_reply)
+  target_include_directories(test_search_reply PRIVATE
+    "${CMAKE_SOURCE_DIR}/third_party/td/tdutils"
+    "${CMAKE_BINARY_DIR}/third_party/td/tdutils")
+endif()
+
 # The streamer test opens real sockets and waits on reconnects.
 set_property(TEST test_async_streamer PROPERTY TIMEOUT 120)
 # The e2e test opens real sockets (fake server + two streams).

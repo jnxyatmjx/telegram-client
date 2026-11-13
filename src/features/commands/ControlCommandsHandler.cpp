@@ -3,6 +3,7 @@
 #include <app/AppContext.h>
 #include <common/Logger.h>
 #include <features/bot_command/CommandParser.h>
+#include <telegram/MarkdownV2.h>
 
 #include <algorithm>
 #include <cctype>
@@ -101,53 +102,14 @@ std::string ControlCommandsHandler::SanitizeTitle(const std::string& title) {
 }
 
 namespace {
-// MarkdownV2 escaping (MessageSender parses with textParseModeMarkdown
-// version 2). In a formatting context (bold text, link text) every one of
-// these must be escaped or the parse fails / misfires:
-//   _ * [ ] ( ) ~ ` > # + - = | { } . !
-std::string EscapeMarkdownV2(const std::string& text) {
-  std::string out;
-  out.reserve(text.size() * 2);
-  for (const char c : text) {
-    switch (c) {
-      case '_':
-      case '*':
-      case '[':
-      case ']':
-      case '(':
-      case ')':
-      case '~':
-      case '`':
-      case '>':
-      case '#':
-      case '+':
-      case '-':
-      case '=':
-      case '|':
-      case '{':
-      case '}':
-      case '.':
-      case '!':
-        out.push_back('\\');
-        break;
-      default:
-        break;
-    }
-    out.push_back(c);
-  }
-  return out;
-}
 
-// Inside a `code span` the content is literal — only a backtick can close
-// the span early, so only it needs escaping.
-std::string EscapeCodeSpan(const std::string& text) {
-  std::string out;
-  out.reserve(text.size() + 2);
-  for (const char c : text) {
-    if (c == '`') out.push_back('\\');
-    out.push_back(c);
-  }
-  return out;
+using tg::telegram::EscapeCodeSpan;
+using tg::telegram::EscapeMarkdownV2;
+
+// "<command> <裸 chat id>" with MarkdownV2 specials escaped. `>` is
+// reserved; the command name is configurable and may contain any of them.
+std::string BackfillUsage(const std::string& command) {
+  return "用法：" + EscapeMarkdownV2(command) + " <裸 chat id\\>";
 }
 
 }  // namespace
@@ -166,7 +128,7 @@ std::vector<std::string> ControlCommandsHandler::RenderRsmeBatches(
       if (!view.username.empty()) {
         // handlersm 881/883: [{first_name}](https://t.me/{username}) + /ym.
         // The display name is user-controlled: escape it for the link text
-        // (MarkdownV2) and for the code span (backtick only).
+        // (MarkdownV2) and for the code span (` and \ only).
         // MarkdownV2: the '.' after the list number is a reserved
         // character and must be escaped (otherwise the whole chunk fails
         // to parse). The URL's '.' is fine — the link parser reads it
@@ -197,7 +159,7 @@ std::vector<std::string> ControlCommandsHandler::RenderRsmeBatches(
       // handlersm 874/894: private channel or basic group — the ⚠️ line
       // (restricted-channel auto-leave NOT migrated: destructive).
       // Title is user-controlled: escape it for the bold text and for the
-      // code span (backtick only).
+      // code span (` and \ only).
       chat_lines.push_back(std::to_string(i) + "\\. **⚠️" +
                            EscapeMarkdownV2(view.title) +
                            "⚠️**\t`/who " + std::to_string(view.bare_id) +
@@ -241,14 +203,11 @@ std::string ControlCommandsHandler::RenderRsor(
     const ChatView& view = *findings[k];
     const std::string uname =
         view.username.empty() ? "私有" : "@" + view.username;
-    // Plain-text report, but it is sent through SendMarkdown (MarkdownV2
-    // parse) — escape the user-controlled title / name / reason so a
-    // special character cannot misfire the parse. The link is left
-    // unescaped (a bare URL: if its '.' ever trips the parse, the
-    // plain-text fallback sends the whole report verbatim, which is
-    // exactly what this report is).
+    // Sent through SendMarkdown (MarkdownV2). Escape every interpolated
+    // field, including the bare URL: its '.' is reserved outside a link.
     body += "• " + EscapeMarkdownV2(view.title) + " [" +
-            EscapeMarkdownV2(uname) + "]\n  " + view.Link() +
+            EscapeMarkdownV2(uname) + "]\n  " +
+            EscapeMarkdownV2(view.Link()) +
             "\n  原因：" + EscapeMarkdownV2(view.FindingReason());
     if (k + 1 < shown) body += "\n\n";
   }
@@ -338,22 +297,22 @@ void ControlCommandsHandler::Handle(td_api::object_ptr<td_api::Update>& update,
   if (action == Action::kBackfill) {
     if (!backfill_.enabled()) {
       messenger_.SendMarkdown(
-          reply_chat_id, "回填功能未启用（features.history_backfill.enabled）。");
+          reply_chat_id,
+          "回填功能未启用（" +
+              EscapeMarkdownV2("features.history_backfill.enabled") + "）。");
       return;
     }
     if (parsed->args.empty()) {
       messenger_.SendMarkdown(reply_chat_id,
-                              "用法：" + config_.backfill_commands.front() +
-                                  " <裸 chat id>");
+                              BackfillUsage(config_.backfill_commands.front()));
       return;
     }
     const auto bare = ParseBareId(parsed->args.front());
     if (!bare.has_value()) {
-      messenger_.SendMarkdown(reply_chat_id,
-                              "无法解析 chat id `" + parsed->args.front() +
-                                  "` — 用法：" +
-                                  config_.backfill_commands.front() +
-                                  " <裸 chat id>");
+      messenger_.SendMarkdown(
+          reply_chat_id,
+          "无法解析 chat id `" + EscapeCodeSpan(parsed->args.front()) +
+              "` — " + BackfillUsage(config_.backfill_commands.front()));
       return;
     }
     if (!backfill_.Start(*bare, ctx, reply_chat_id)) {

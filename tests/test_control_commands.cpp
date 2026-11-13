@@ -12,6 +12,7 @@
 #include <features/media_thumbnail/MediaExtractor.h>
 #include <features/media_thumbnail/MediaThumbnailHandler.h>
 #include <infra/Outbox.h>
+#include <telegram/MarkdownV2.h>
 #include <telegram/MessageSender.h>
 #include <telegram/TelegramClient.h>
 #include <transport/AsyncStreamer.h>
@@ -414,11 +415,25 @@ TEST(ControlCommandStatics, RenderRsmeBatchesUsersFirstThenChats) {
             "2\\. **⚠️Priv Channel⚠️**\t`/who 400 Priv Channel`\t\n\n");
 }
 
+TEST(MarkdownV2Escape, TitlesAndCodeSpans) {
+  // Outside a code span every reserved character is escaped, including
+  // the ones that show up in chat titles and in the client's own notices.
+  EXPECT_EQ(tg::telegram::EscapeMarkdownV2("Liu Pole and Alsia Kople."),
+            "Liu Pole and Alsia Kople\\.");
+  EXPECT_EQ(tg::telegram::EscapeMarkdownV2("a-b (c)!"), "a\\-b \\(c\\)\\!");
+  EXPECT_EQ(tg::telegram::EscapeMarkdownV2("a\\b`c_d"), "a\\\\b\\`c\\_d");
+  // Inside a code span only backtick and backslash are special.
+  EXPECT_EQ(tg::telegram::EscapeCodeSpan("Liu Pole and Alsia Kople."),
+            "Liu Pole and Alsia Kople.");
+  EXPECT_EQ(tg::telegram::EscapeCodeSpan("a-b (c)!"), "a-b (c)!");
+  EXPECT_EQ(tg::telegram::EscapeCodeSpan("a\\b`c_d"), "a\\\\b\\`c_d");
+}
+
 TEST(ControlCommandStatics, RenderRsmeBatchesEscapesMarkdownV2Specials) {
   // A display name with MarkdownV2 specials (_ * …) must be escaped in
   // the formatting context (link text / bold) so MessageSender's
-  // MarkdownV2 parse succeeds; inside a `code span` only a backtick can
-  // close the span, so the other specials stay literal there.
+  // MarkdownV2 parse succeeds; inside a `code span` only ` and \ are
+  // special, so the other specials stay literal there.
   std::vector<commands::ChatView> views;
   views.push_back(MakeUserView("Cool_Channel*Star", "cool", 200));
   views.push_back(MakeChannelView("Best*Deals", "", 400));
@@ -473,7 +488,7 @@ TEST(ControlCommandStatics, RenderRsorFindingsReport) {
   EXPECT_EQ(report,
             "共发现 1 个失效/非法对话：\n\n"
             "• Dead [私有]\n"
-            "  https://t.me/c/222\n"
+            "  https://t\\.me/c/222\n"
             "  原因：已被封禁/删除（Forbidden）");
 }
 
@@ -680,7 +695,7 @@ TEST_F(ControlCommandsTest, HandleBackfillRefusals) {
   // Missing argument.
   auto no_args = MakeTextUpdate("/xm", kControl, true);
   handler_->Handle(no_args, *ctx_);
-  EXPECT_TRUE(WaitForText("用法：/xm <裸 chat id>"));
+  EXPECT_TRUE(WaitForText("用法：/xm <裸 chat id\\>"));
 
   // Unparseable argument.
   auto bad_arg = MakeTextUpdate("/xm abc", kControl, true);

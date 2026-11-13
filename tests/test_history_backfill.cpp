@@ -72,6 +72,9 @@ class FakeTdSender : public tg::telegram::ITdSender {
   // When false, EVERY getChat candidate probe fails — the "never
   // interacted" peer of UnknownPeerDropsJobWithNotice.
   bool peer_known = true;
+  // Title returned by a successful getChat. Notices interpolate it, so
+  // tests can put MarkdownV2 reserved characters here.
+  std::string peer_title = "Deals";
   // Deterministic phase-B gate: while held, getMessage answers wait for
   // ReleaseGetMessage() — pins a job mid-dispatch so it is still "running"
   // when the test issues a duplicate Start() (5 s timeout as a safety net).
@@ -97,7 +100,7 @@ class FakeTdSender : public tg::telegram::ITdSender {
         if (peer_known && chat_id == kDialog) {
           auto chat = td_api::make_object<td_api::chat>();
           chat->id_ = chat_id;
-          chat->title_ = "Deals";
+          chat->title_ = peer_title;
           chat->type_ = td_api::make_object<td_api::chatTypeSupergroup>(
               kBare, false);
           response.object = std::move(chat);
@@ -487,6 +490,38 @@ TEST_F(HistoryBackfillTest, DuplicateJobAndInvalidIdsRefused) {
   sender_.ReleaseGetMessage();  // let the pinned batch finish
   ASSERT_TRUE(WaitForOutboxCount(4));
   EXPECT_TRUE(WaitForTextContaining("Backfill finished"));
+}
+
+TEST_F(HistoryBackfillTest, NoticesEscapeMarkdownV2InTitleAndTemplate) {
+  // The live failure: the title had no '.', but the notice template ended
+  // with one, and a title may contain any MarkdownV2 reserved character.
+  // Parentheses in the finish reason are reserved too.
+  backfill_ = std::make_unique<history_backfill::HistoryBackfill>(
+      sender_, *process_handler_, *chat_state_, *messenger_,
+      history_backfill::HistoryBackfillConfig{});
+
+  auto run = [this](const std::string& title,
+                    const std::string& escaped_title) {
+    sender_.peer_title = title;
+    sender_.search_pages = {FakeTdSender::SearchPage{{400}, 0}};
+    chat_state_->ApplyReply(kBare, 500);  // page is already covered
+    if (!backfill_->Start(kBare, *ctx_, kControl)) {
+      ADD_FAILURE() << "Start refused for " << title;
+      return;
+    }
+    const std::string started =
+        "Backfill started: `1234567890` \"" + escaped_title +
+        "\" from watermark `500`\\.";
+    const std::string finished =
+        "Backfill finished for `1234567890` \"" + escaped_title +
+        "\": nothing to backfill \\(already up to date\\) — sent `0`, "
+        "skipped `0`\\.";
+    EXPECT_TRUE(WaitForTextContaining(started)) << started;
+    EXPECT_TRUE(WaitForTextContaining(finished)) << finished;
+  };
+
+  run("Liu Pole and Alsia Kople.", "Liu Pole and Alsia Kople\\.");
+  run("a-b (c)!", "a\\-b \\(c\\)\\!");
 }
 
 TEST_F(HistoryBackfillTest, DisabledRefusesEverything) {

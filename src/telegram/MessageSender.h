@@ -17,8 +17,11 @@
 // "markdown" output) and sends the returned formattedText. A chunk whose
 // markdown fails to parse (e.g. an unescaped special character in a
 // display name) falls back to plain text so the reply still goes through.
-// Callers MUST escape MarkdownV2 specials in user-controlled text
-// (_ * [ ] ( ) ~ ` > # + - = | { } . !) before handing it to SendMarkdown.
+// Callers MUST escape MarkdownV2 specials before handing text to
+// SendMarkdown. telegram/MarkdownV2.h does it: EscapeMarkdownV2 outside
+// code spans (_ * [ ] ( ) ~ ` > # + - = | { } . ! and backslash),
+// EscapeCodeSpan inside them (only backtick and backslash). Static
+// template punctuation counts too.
 //
 // Chunks are sent strictly in order: chunk N+1 is only parsed after chunk
 // N's sendMessage has been dispatched, so a multi-chunk reply cannot

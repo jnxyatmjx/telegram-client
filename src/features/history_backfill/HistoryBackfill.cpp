@@ -3,6 +3,7 @@
 #include <app/AppContext.h>
 #include <common/Idempotency.h>
 #include <common/Logger.h>
+#include <telegram/MarkdownV2.h>
 #include <telegram/TdErrors.h>
 
 #include <chrono>
@@ -17,6 +18,10 @@ std::int64_t NowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+std::string MdCode(const std::string& text) {
+  return "`" + telegram::EscapeCodeSpan(text) + "`";
 }
 
 bool IsError(const td::ClientManager::Response& response) {
@@ -77,10 +82,10 @@ bool HistoryBackfill::Start(std::int64_t bare_chat_id, app::AppContext& ctx,
   if (candidates.empty()) {
     spdlog::error("backfill: {} is not a valid bare chat id — ignored",
                   bare_chat_id);
-    messenger_.SendMarkdown(reply_chat_id,
-                            "Backfill refused: `" +
-                                std::to_string(bare_chat_id) +
-                                "` is not a valid bare chat id.");
+    messenger_.SendMarkdown(
+        reply_chat_id,
+        "Backfill refused: " + MdCode(std::to_string(bare_chat_id)) +
+            " is not a valid bare chat id\\.");
     return false;
   }
   {
@@ -89,9 +94,10 @@ bool HistoryBackfill::Start(std::int64_t bare_chat_id, app::AppContext& ctx,
     if (jobs_.count(bare_chat_id) > 0) {
       spdlog::info("backfill: chat {} already running — ignored",
                    bare_chat_id);
-      messenger_.SendMarkdown(reply_chat_id,
-                              "Backfill already running for chat `" +
-                                  std::to_string(bare_chat_id) + "`.");
+      messenger_.SendMarkdown(
+          reply_chat_id,
+          "Backfill already running for chat " +
+              MdCode(std::to_string(bare_chat_id)) + "\\.");
       return false;
     }
     ctx_ = &ctx;  // one AppContext for the process lifetime
@@ -173,9 +179,9 @@ void HistoryBackfill::Activate(const std::shared_ptr<Job>& job,
                job->bare_id, job->dialog_id, job->title, job->seed_watermark);
   messenger_.SendMarkdown(
       job->reply_chat_id,
-      "Backfill started: `" + std::to_string(job->bare_id) + "` \"" +
-          job->title + "\" from watermark `" +
-          std::to_string(job->seed_watermark) + "`.");
+      "Backfill started: " + MdCode(std::to_string(job->bare_id)) + " \"" +
+          telegram::EscapeMarkdownV2(job->title) + "\" from watermark " +
+          MdCode(std::to_string(job->seed_watermark)) + "\\.");
   SendSearchPage(job, ctx);
 }
 
@@ -466,10 +472,11 @@ void HistoryBackfill::FinishJob(const std::shared_ptr<Job>& job,
                job->total_skipped);
   messenger_.SendMarkdown(
       job->reply_chat_id,
-      "Backfill finished for `" + std::to_string(job->bare_id) + "` \"" +
-          job->title + "\": " + reason + " — sent `" +
-          std::to_string(job->total_sent) + "`, skipped `" +
-          std::to_string(job->total_skipped) + "`.");
+      "Backfill finished for " + MdCode(std::to_string(job->bare_id)) +
+          " \"" + telegram::EscapeMarkdownV2(job->title) + "\": " +
+          telegram::EscapeMarkdownV2(reason) + " — sent " +
+          MdCode(std::to_string(job->total_sent)) + ", skipped " +
+          MdCode(std::to_string(job->total_skipped)) + "\\.");
 }
 
 }  // namespace tg::features::history_backfill

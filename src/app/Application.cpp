@@ -183,45 +183,54 @@ void Application::WireHandlers() {
       &control_commands_handler_, [](telegram::IUpdateHandler*) {}));  // non-owning
 }
 
+void Application::OnProcessImageReply(const ImageReply& reply) {
+  // MarkDone accepts PENDING, FAILED and SENT. True means this reply
+  // completed the in-flight request, so the slot FinishProcess or
+  // SweepOutbox acquired comes back. False (already DONE, DEAD_LETTER, or
+  // an unknown id) must not Release — a second reply would under-count.
+  // Skipping Release on a true MarkDone leaves the slot held after the
+  // record is DONE, and the sent-timeout safety net never sees DONE rows,
+  // so the window stays full until the process restarts.
+  const bool completed = outbox_.MarkDone(reply.image_id(), reply.result());
+  if (completed) {
+    flow_control_.Release();
+    spdlog::info("process: DONE {} result: {:.200}", reply.image_id(),
+                 reply.result());
+  } else {
+    const auto existing = outbox_.Get(reply.image_id());
+    if (existing.has_value() &&
+        existing->state == infra::OutboxState::kDone) {
+      spdlog::info("process: duplicate reply for {} (already done) — "
+                   "ignored",
+                   reply.image_id());
+    } else {
+      spdlog::warn("process: reply for unknown image_id {}",
+                   reply.image_id());
+    }
+  }
+  const auto parsed =
+      features::chat_state::ParseReplyResult(reply.result());
+  if (!parsed.has_value()) {
+    // The server contract is {"cid": <bare id>, "mid": <msg id>}
+    // (Python insertIdUpdate logs a decode failure the same way).
+    spdlog::warn("process: reply result for {} is not a {{\"cid\","
+                 "\"mid\"}} JSON — watermark not updated",
+                 reply.image_id());
+    return;
+  }
+  chat_state_.ApplyReply(parsed->cid, parsed->mid);
+}
+
 void Application::WireStreamerCallbacks() {
   // ImageReply -> Outbox DONE (v5 §2.4: log + metrics only, never reply into
-  // Telegram by default) + the {"cid","mid"} watermark update (Telethon
-  // migration Chunk 1: parse result; a malformed result is logged and
-  // dropped, never crashes the pipeline).
+  // Telegram by default) and release the flow-control slot when that DONE
+  // completes an in-flight request. Also the {"cid","mid"} watermark update
+  // (Telethon migration Chunk 1: parse result; a malformed result is logged
+  // and dropped, never crashes the pipeline). The slot release happens
+  // inside OnProcessImageReply before the watermark parse, so a non-JSON
+  // result still frees the window.
   process_pool_.SetReplyHandler(
-      [this](const ImageReply& reply) {
-        const bool known = outbox_.MarkDone(reply.image_id(), reply.result());
-        if (known) {
-          spdlog::info("process: DONE {} result: {:.200}", reply.image_id(),
-                       reply.result());
-        } else {
-          // MarkDone only transitions PENDING/FAILED -> DONE, so a false
-          // here is either a duplicate reply for an already-completed
-          // send (log it quietly, the first DONE already covered it) or
-          // a reply for an id the outbox never saw (warn).
-          const auto existing = outbox_.Get(reply.image_id());
-          if (existing.has_value() &&
-              existing->state == infra::OutboxState::kDone) {
-            spdlog::info("process: duplicate reply for {} (already done) — "
-                         "ignored",
-                         reply.image_id());
-          } else {
-            spdlog::warn("process: reply for unknown image_id {}",
-                         reply.image_id());
-          }
-        }
-        const auto parsed =
-            features::chat_state::ParseReplyResult(reply.result());
-        if (!parsed.has_value()) {
-          // The server contract is {"cid": <bare id>, "mid": <msg id>}
-          // (Python insertIdUpdate logs a decode failure the same way).
-          spdlog::warn("process: reply result for {} is not a {{\"cid\","
-                       "\"mid\"}} JSON — watermark not updated",
-                       reply.image_id());
-          return;
-        }
-        chat_state_.ApplyReply(parsed->cid, parsed->mid);
-      });
+      [this](const ImageReply& reply) { OnProcessImageReply(reply); });
 
   // SearchRsp -> correlation table lookup (v5 §2.4), log only.
   search_pool_.SetReplyHandler(

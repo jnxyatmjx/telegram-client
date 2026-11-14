@@ -43,9 +43,12 @@ void UpdateDispatcher::Dispatch(td_api::object_ptr<td_api::Update>&& update,
   const std::int32_t update_id = update->get_id();
   auto shared_update =
       std::make_shared<td_api::object_ptr<td_api::Update>>(std::move(update));
+  const auto priority = claimant->PrefersSearchQueue()
+                            ? app::TaskPriority::kSearch
+                            : app::TaskPriority::kNormal;
   const bool posted = pool_->Post([&ctx, claimant, shared_update]() mutable {
     claimant->Handle(*shared_update, ctx);
-  });
+  }, priority);
   if (!posted) {
     spdlog::error("dispatcher: worker pool rejected update {} — dropped",
                   update_id);

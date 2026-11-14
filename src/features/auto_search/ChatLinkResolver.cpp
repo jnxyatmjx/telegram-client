@@ -222,13 +222,15 @@ void ChatLinkResolver::SendOff(const std::shared_ptr<Batch>& batch, int attempt,
                   [this, batch, attempt, make_request, on_response]() mutable {
                     SendOff(batch, attempt + 1, std::move(make_request),
                             std::move(on_response));
-                  });
+                  },
+                  /*rank=*/1);
             }
           }
           if (flood) return;
           on_response(std::move(*held));
         };
-        if (workers_ == nullptr || !workers_->Post(std::move(task))) {
+        if (workers_ == nullptr ||
+            !workers_->Post(std::move(task), app::TaskPriority::kSearch)) {
           FinishTimeout(batch);
         }
       });
@@ -515,7 +517,8 @@ void ChatLinkResolver::TimerLoop() {
     lock.unlock();
     for (const auto& batch : due) {
       if (workers_ != nullptr &&
-          workers_->Post([this, batch] { FinishTimeout(batch); })) {
+          workers_->Post([this, batch] { FinishTimeout(batch); },
+                         app::TaskPriority::kSearch)) {
         continue;
       }
       FinishTimeout(batch);

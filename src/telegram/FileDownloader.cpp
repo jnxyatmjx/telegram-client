@@ -16,26 +16,30 @@ FileDownloader::FileDownloader(ITdSender& sender, FloodRetry* flood_retry)
 void FileDownloader::DownloadAsync(std::int32_t file_id,
                                    DownloadCallback on_done,
                                    std::int32_t priority) {
-  bool already_pending = false;
+  bool send = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& callbacks = pending_[file_id];
     callbacks.push_back(std::move(on_done));
-    already_pending = callbacks.size() > 1;
+    const bool already_pending = callbacks.size() > 1;
     // One consumer claim per call: the caller must Release(file_id) after
     // it has stored the bytes, and the cached file is deleted when the
     // last claim is dropped (deleteFile cache cleanup).
     ++use_count_[file_id];
-    if (!already_pending) priority_[file_id] = priority;
+    if (!already_pending) {
+      priority_[file_id] = priority;
+      send = true;
+    } else if (priority > priority_[file_id]) {
+      // TDLib raises an in-flight download when downloadFile is sent again
+      // with a higher priority (FileManager::run_download update_priority).
+      // A lower caller must not pull a search download back down.
+      priority_[file_id] = priority;
+      send = true;
+      spdlog::info("file_downloader: downloadFile {} priority raised to {}",
+                   file_id, priority);
+    }
   }
-  if (already_pending) {
-    // A downloadFile request for this file is already in flight (or its
-    // flood retry is scheduled — the callbacks stay registered through a
-    // FloodWait); the callback rides along and fires when it completes.
-    // No second request, and the in-flight priority is left as-is.
-    return;
-  }
-  SendDownloadFile(file_id);
+  if (send) SendDownloadFile(file_id);
 }
 
 void FileDownloader::Release(std::int32_t file_id) {
@@ -138,6 +142,12 @@ void FileDownloader::HandleFloodWait(std::int32_t file_id,
   }
   spdlog::warn("file_downloader: downloadFile {} FloodWait — retrying via "
                "flood scheduler", file_id);
+  int rank = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = priority_.find(file_id);
+    if (it != priority_.end() && it->second >= kSearchPriority) rank = 1;
+  }
   const bool scheduled = flood_retry_->Schedule(
       error, attempt, [this, file_id] {
         // Timer thread. FailAll may have cleared everything since; sending
@@ -148,7 +158,8 @@ void FileDownloader::HandleFloodWait(std::int32_t file_id,
           still_wanted = pending_.count(file_id) > 0;
         }
         if (still_wanted) SendDownloadFile(file_id);
-      });
+      },
+      rank);
   if (!scheduled) {
     int attempts = 0;
     {

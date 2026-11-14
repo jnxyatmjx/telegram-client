@@ -75,6 +75,12 @@ class FileDownloader {
   };
   using DownloadCallback = std::function<void(DownloadResult result)>;
 
+  // TDLib downloadFile priority is 1..32, higher runs sooner. ProcessImages
+  // uses 16. Search uses 32 so a search thumbnail is not stuck behind a
+  // process download. These are the only priority values the client sends.
+  static constexpr std::int32_t kProcessPriority = 16;
+  static constexpr std::int32_t kSearchPriority = 32;
+
   // `flood_retry` is the shared 429 scheduler (Application passes one for
   // every instance); null keeps the pre-chunk-3 behaviour — a 429 fails the
   // download immediately. Production code MUST pass a FloodRetry.
@@ -84,11 +90,12 @@ class FileDownloader {
   // Counts one consumer for the file: the caller must Release(file_id)
   // after it has consumed the bytes (see the cache-cleanup note above).
   // `priority` is TDLib's downloadFile priority (higher is preferred).
-  // The default 32 is what ProcessImages sends. Search passes a lower
-  // value so its thumbnails do not outrank process downloads of other
-  // files. A file already in flight keeps the priority that started it.
+  // Omitted priority is kProcessPriority. Search passes kSearchPriority.
+  // If this file is already downloading at a lower priority, downloadFile
+  // is sent again so TDLib raises it (update_priority). A lower or equal
+  // later call just joins the in-flight request.
   void DownloadAsync(std::int32_t file_id, DownloadCallback on_done,
-                     std::int32_t priority = 32);
+                     std::int32_t priority = kProcessPriority);
 
   // Drops one consumer's claim on the file (any thread; same mutex_ as the
   // download bookkeeping). At count 0 the cached local file is deleted from

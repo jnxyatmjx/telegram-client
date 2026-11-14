@@ -973,12 +973,17 @@ of libraries.
   uint32 `oid`. `/search` replies use the same path. Searches do not
   take a ProcessImages flow-control slot. `auto_search.max_inflight`
   (default 8) is how many SearchImages streams are open on the existing
-  gRPC channels, so a server that processes one request at a time per
-  stream can still run several searches at once. ProcessImages keeps
-  `grpc.connections` lanes. Dispatch and reply log
+  gRPC channels. The face server already reads every request off a stream
+  into one priority queue (search at 1, insert at 11) and then runs
+  searches on a single GPU thread, so one stream does not serialize
+  searches and extra streams do not add server-side parallelism. They
+  only keep one slow write from delaying the client's next SearchReq.
+  ProcessImages keeps `grpc.connections` lanes. Dispatch and reply log
   `search: dispatched <key> (inflight=N)` and
   `search: rsp for <key> ... (inflight=N)`. Search thumbnail downloads
-  use a lower TDLib priority than ProcessImages downloads.
+  use TDLib priority 32; ProcessImages downloads use 16. Search tasks
+  on the shared worker pool run before queued process tasks, with a
+  burst cap so process work is not starved.
 - `features/media_thumbnail/MediaExtractor` — Pure tier selection
   (Telethon-migration chunk 1 semantics). Photo: the LARGEST tier — the
   full-resolution original, no size cap (ties by larger max edge;

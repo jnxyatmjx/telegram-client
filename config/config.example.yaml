@@ -100,8 +100,11 @@ features:
       -1003822626821: "https://t.me/somegroup/"
       "@privategroup": "https://t.me/+AbCdEf/"
     dedup_ttl_seconds: 600     # (oid, id) recent-search dedup TTL
-    # Parallel SearchImages streams on the existing gRPC channels. This is
-    # not the ProcessImages flow-control window (outbox.max_in_flight).
+    # Extra SearchImages streams on the existing gRPC channels, so one slow
+    # write cannot head-of-line block the next SearchReq. The face server
+    # already reads a single stream straight into a priority queue (search
+    # ahead of insert) and runs searches on one GPU thread. Not the
+    # ProcessImages flow-control window (outbox.max_in_flight).
     max_inflight: 8
   commands:
     # Control-chat command surface (Telethon migration chunk 2):

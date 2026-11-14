@@ -1,7 +1,7 @@
-// Several searches must overlap: downloads start together, and a server
-// that handles one request at a time per stream still sees N requests in
-// flight before it writes any reply (one SearchImages stream per search).
-// ProcessImages is not part of this test.
+// Downloads of distinct files start together, and N SearchImages streams
+// each hold one request before any reply is written. The face server
+// itself reads a single stream into a priority queue; these extra streams
+// are a client-side write-ahead, not a claim about the server.
 
 #include <app/AppContext.h>
 #include <app/Config.h>
@@ -22,6 +22,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <fstream>
 #include <mutex>
@@ -52,7 +53,8 @@ class HoldingSender : public tg::telegram::ITdSender {
     const auto file_id =
         static_cast<const td_api::downloadFile&>(*request).file_id_;
     // ProcessImages keeps priority 32. Search must ask for less.
-    EXPECT_LT(static_cast<const td_api::downloadFile&>(*request).priority_, 32);
+    EXPECT_EQ(static_cast<const td_api::downloadFile&>(*request).priority_,
+              tg::telegram::FileDownloader::kSearchPriority);
     td::ClientManager::Response response;
     auto file = td_api::make_object<td_api::file>();
     file->id_ = file_id;
@@ -253,4 +255,74 @@ TEST(SearchParallel, DownloadsAndRpcsOverlapBeforeAnyReply) {
   std::remove(thumb.c_str());
   std::remove(sock.c_str());
   std::remove(db.c_str());
+}
+
+TEST(DownloadPriority, SearchOutranksProcessAndRaisesInFlight) {
+  struct Recorder : tg::telegram::ITdSender {
+    std::vector<std::pair<std::int32_t, std::int32_t>> calls;
+    std::int64_t Send(td_api::object_ptr<td_api::Function>&& request,
+                      tg::telegram::ResponseCallback) override {
+      if (request->get_id() == td_api::downloadFile::ID) {
+        const auto& download = static_cast<const td_api::downloadFile&>(*request);
+        calls.emplace_back(download.file_id_, download.priority_);
+      }
+      return 1;
+    }
+  } sender;
+  tg::telegram::FileDownloader files(sender);
+  files.DownloadAsync(7, [](tg::telegram::FileDownloader::DownloadResult) {},
+                      tg::telegram::FileDownloader::kProcessPriority);
+  files.DownloadAsync(7, [](tg::telegram::FileDownloader::DownloadResult) {},
+                      tg::telegram::FileDownloader::kSearchPriority);
+  files.DownloadAsync(7, [](tg::telegram::FileDownloader::DownloadResult) {},
+                      tg::telegram::FileDownloader::kProcessPriority);
+  files.DownloadAsync(8, [](tg::telegram::FileDownloader::DownloadResult) {},
+                      tg::telegram::FileDownloader::kSearchPriority);
+  ASSERT_EQ(sender.calls.size(), 3u);
+  EXPECT_EQ(sender.calls[0], std::make_pair(7, 16));
+  EXPECT_EQ(sender.calls[1], std::make_pair(7, 32));
+  EXPECT_EQ(sender.calls[2], std::make_pair(8, 32));
+  EXPECT_GT(sender.calls[1].second, sender.calls[0].second);
+}
+
+TEST(WorkerPool, SearchRunsBeforeQueuedProcessTasks) {
+  tg::app::WorkerPool pool(1);
+  std::mutex mu;
+  std::condition_variable cv;
+  bool release = false;
+  pool.Post([&] {
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait(lock, [&] { return release; });
+  });
+  const auto started =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (pool.queued() != 0 && std::chrono::steady_clock::now() < started) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(pool.queued(), 0u);
+
+  std::mutex order_mu;
+  std::vector<int> order;
+  pool.Post([&] {
+    std::lock_guard<std::mutex> lock(order_mu);
+    order.push_back(1);
+  });
+  pool.Post([&] {
+    std::lock_guard<std::mutex> lock(order_mu);
+    order.push_back(2);
+  });
+  pool.Post([&] {
+    std::lock_guard<std::mutex> lock(order_mu);
+    order.push_back(9);
+  }, tg::app::TaskPriority::kSearch);
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release = true;
+  }
+  cv.notify_all();
+  ASSERT_TRUE(pool.WaitForIdle(std::chrono::seconds(2)));
+  ASSERT_EQ(order.size(), 3u);
+  EXPECT_EQ(order[0], 9);
+  EXPECT_EQ(order[1], 1);
+  EXPECT_EQ(order[2], 2);
 }

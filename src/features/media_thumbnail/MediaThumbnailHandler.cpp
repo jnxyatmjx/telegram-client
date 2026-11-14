@@ -62,7 +62,8 @@ void MediaThumbnailHandler::SendProcessImages(
       media->file_id,
       [this, media_copy, &ctx](telegram::FileDownloader::DownloadResult result) {
         OnDownloaded(media_copy, std::move(result), ctx);
-      });
+      },
+      telegram::FileDownloader::kProcessPriority);
 }
 
 void MediaThumbnailHandler::OnDownloaded(

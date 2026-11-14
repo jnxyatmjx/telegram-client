@@ -258,11 +258,13 @@ void SendOffReceive(const std::shared_ptr<ResolveJob>& job, int attempt,
                       [job, attempt, make_request, on_response]() mutable {
                         SendOffReceive(job, attempt + 1, std::move(make_request),
                                        std::move(on_response));
-                      })) {
+                      },
+                      /*rank=*/1)) {
                 return;
               }
               on_response(std::move(*held));
-            })) {
+            },
+                                 app::TaskPriority::kSearch)) {
           spdlog::error(
               "auto_search: worker pool rejected allowlist resolution");
         }

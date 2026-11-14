@@ -28,7 +28,7 @@ FloodRetry::FloodRetry(Options options)
 FloodRetry::~FloodRetry() { Shutdown(); }
 
 bool FloodRetry::Schedule(const td_api::error& error, int attempt,
-                          std::function<void()> retry) {
+                          std::function<void()> retry, int rank) {
   if (attempt > options_.max_attempts) {
     // The caller logs the give-up with its own context (which request it
     // was); nothing is scheduled.
@@ -43,8 +43,8 @@ bool FloodRetry::Schedule(const td_api::error& error, int attempt,
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopped_) return false;
-    pending_.push_back(
-        Pending{NowMs() + delay_ms, delay_ms, attempt, std::move(retry)});
+    pending_.push_back(Pending{NowMs() + delay_ms, delay_ms, attempt, rank,
+                               std::move(retry)});
     ArmForEarliestLocked();
     armed = true;
   }
@@ -67,6 +67,12 @@ void FloodRetry::OnFire() {
     pending_.erase(split, pending_.end());
     ArmForEarliestLocked();
   }
+  // Same due time: search (higher rank) before process. A later due time
+  // still waits; rank never pulls a retry forward.
+  std::stable_sort(due.begin(), due.end(),
+                   [](const Pending& a, const Pending& b) {
+                     return a.rank > b.rank;
+                   });
   // Outside the mutex: each closure sends a TDLib request and/or posts to
   // the worker pool (cheap, non-blocking).
   for (Pending& item : due) {

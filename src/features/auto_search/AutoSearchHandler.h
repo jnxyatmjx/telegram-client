@@ -64,6 +64,7 @@ class AutoSearchHandler : public telegram::IUpdateHandler {
   void Handle(td_api::object_ptr<td_api::Update>& update,
               app::AppContext& ctx) override;
   const char* Name() const override { return "AutoSearchHandler"; }
+  bool PrefersSearchQueue() const override { return true; }
 
   // True when (oid, id) was searched within the TTL window. Test hook.
   bool RecentlySearched(std::uint32_t oid, std::uint32_t id) const;

@@ -210,13 +210,17 @@ void BotCommandHandler::LookupTargetMessage(Action action,
             td_api::object_ptr<td_api::message>>(
             td_api::move_object_as<td_api::message>(
                 std::move(response.object)));
+        const auto priority = action == Action::kProcess
+                                  ? app::TaskPriority::kNormal
+                                  : app::TaskPriority::kSearch;
         if (!ctx.workers.Post([this, action, target_message, &ctx] {
               if (action == Action::kProcess) {
                 process_.SendProcessImages(**target_message, ctx);
               } else {
                 search_.SendSearchImages(**target_message, ctx);
               }
-            })) {
+            },
+                             priority)) {
           spdlog::error("bot_command: worker pool rejected {} for ({}, {})",
                         action == Action::kProcess ? "process" : "search",
                         chat_id, message_id);

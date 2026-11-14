@@ -185,7 +185,9 @@ void MessageSender::SendParsedChunk(
                     [this, chat_id, delivery, chunk, attempt] {
                       ParseAndSendChunk(chat_id, delivery, chunk, attempt + 1,
                                         [] {});
-                    })) {
+                    },
+                    // Search replies carry reply_to. Control notices do not.
+                    delivery.reply_to_message_id > 0 ? 1 : 0)) {
               return;
             }
             spdlog::error("send_text: sendMessage to {} still flood-limited "

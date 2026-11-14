@@ -117,9 +117,11 @@ Application::Application(Config config)
       dispatcher_(workers_) {
   // ProcessImages keeps grpc.connections lanes and its own flow-control
   // window. SearchImages opens max(connections, auto_search.max_inflight)
-  // streams on those same channels (HTTP/2 multiplexing, no extra process
-  // lane) so a server that handles one request at a time per stream can
-  // still run several searches at once.
+  // streams on those same channels. The face server reads a stream
+  // immediately into one priority queue (search before insert) and runs
+  // searches on a single GPU thread, so extra streams are not what makes
+  // the server parallel; they only keep one slow write from head-of-line
+  // blocking the client's next SearchReq.
   const std::size_t process_lanes = transport_.lane_count();
   const std::size_t search_lanes = std::max(
       process_lanes, static_cast<std::size_t>(config_.auto_search.max_inflight));
@@ -289,7 +291,8 @@ void Application::WireStreamerCallbacks() {
   // The handler does not take a ProcessImages flow-control slot.
   search_pool_.SetReplyHandler([this](const SearchRsp& reply) {
     auto held = std::make_shared<SearchRsp>(reply);
-    if (!workers_->Post([this, held] { OnSearchReply(*held); })) {
+    if (!workers_->Post([this, held] { OnSearchReply(*held); },
+                        TaskPriority::kSearch)) {
       OnSearchReply(*held);
     }
   });

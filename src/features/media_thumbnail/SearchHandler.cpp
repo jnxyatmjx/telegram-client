@@ -16,9 +16,7 @@ namespace {
 // Non-blocking Enqueue attempt in the finish stage (same reason as
 // MediaThumbnailHandler: the worker must not wait on a full queue).
 constexpr auto kEnqueueTimeout = std::chrono::milliseconds(0);
-// Below the ProcessImages download priority (32) so search thumbnails
-// do not outrank process downloads in TDLib's scheduler.
-constexpr std::int32_t kSearchDownloadPriority = 16;
+// TDLib downloadFile priority 32 is the maximum and outranks process (16).
 }  // namespace
 
 void SearchCorrelationTable::Register(std::uint32_t oid, std::uint32_t id,
@@ -79,7 +77,7 @@ void SearchHandler::SendSearchImages(const td_api::message& target,
       [this, media_copy, &ctx](telegram::FileDownloader::DownloadResult result) {
         OnDownloaded(media_copy, std::move(result), ctx);
       },
-      kSearchDownloadPriority);
+      telegram::FileDownloader::kSearchPriority);
 }
 
 void SearchHandler::NoteReply() const {
@@ -105,7 +103,8 @@ void SearchHandler::OnDownloaded(
   if (!ctx.workers.Post([this, media, path = result.local_path,
                          &ctx]() mutable {
         FinishSearch(std::move(media), std::move(path), ctx);
-      })) {
+      },
+                         app::TaskPriority::kSearch)) {
     spdlog::error("search: worker pool rejected finish stage for {}",
                   image_id);
   }

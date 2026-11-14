@@ -32,6 +32,10 @@ class IUpdateHandler {
 
   virtual const char* Name() const = 0;
 
+  // Dispatcher posts these handlers on the worker pool's search queue so
+  // they run ahead of queued process work. Default is the process queue.
+  virtual bool PrefersSearchQueue() const { return false; }
+
  protected:
   IUpdateHandler() = default;
 };

@@ -73,8 +73,12 @@ class FloodRetry {
 
   // Arms `retry` per the rules above; false = dropped (attempt cap or shut
   // down) — give up at the call site.
+  // `rank` breaks ties when several retries are due together: a higher
+  // rank runs first. Search passes 1; process and control notices stay 0.
+  // The due time itself is unchanged, so a later search retry does not
+  // jump ahead of an earlier process retry.
   bool Schedule(const td_api::error& error, int attempt,
-                std::function<void()> retry);
+                std::function<void()> retry, int rank = 0);
 
   // Drops all pending retries and joins the timer thread.
   void Shutdown();
@@ -87,6 +91,7 @@ class FloodRetry {
     std::int64_t due_ms;
     std::int64_t delay_ms;  // for the log line when it fires
     int attempt;
+    int rank = 0;
     std::function<void()> retry;
   };
 

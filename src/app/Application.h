@@ -76,6 +76,9 @@ class Application {
   // the flow-control slot taken before that request was enqueued. A false
   // MarkDone (already DONE, DEAD_LETTER, or an unknown id) releases nothing.
   void OnProcessImageReply(const ImageReply& reply);
+  // SearchRsp. Posted off the SearchImages completion-queue thread so link
+  // resolution and the Telegram reply cannot stall that stream's read/write.
+  void OnSearchReply(const SearchRsp& reply);
   void StartOutboxRetryThread();
   void StopOutboxRetryThread();
   // Chat-state flush loop (Chunk 2): FlushActive every

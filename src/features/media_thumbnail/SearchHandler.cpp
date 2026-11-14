@@ -16,6 +16,9 @@ namespace {
 // Non-blocking Enqueue attempt in the finish stage (same reason as
 // MediaThumbnailHandler: the worker must not wait on a full queue).
 constexpr auto kEnqueueTimeout = std::chrono::milliseconds(0);
+// Below the ProcessImages download priority (32) so search thumbnails
+// do not outrank process downloads in TDLib's scheduler.
+constexpr std::int32_t kSearchDownloadPriority = 16;
 }  // namespace
 
 void SearchCorrelationTable::Register(std::uint32_t oid, std::uint32_t id,
@@ -67,13 +70,24 @@ void SearchHandler::SendSearchImages(const td_api::message& target,
   }
 
   // Start the download and return immediately — the worker thread is free
-  // for the next message while this one downloads.
+  // for the next message while this one downloads. Distinct file ids run
+  // concurrently; this call does not wait for any other download.
+  spdlog::info("search: download file {} started", media->file_id);
   const ExtractedMedia media_copy = *media;
   files_.DownloadAsync(
       media->file_id,
       [this, media_copy, &ctx](telegram::FileDownloader::DownloadResult result) {
         OnDownloaded(media_copy, std::move(result), ctx);
-      });
+      },
+      kSearchDownloadPriority);
+}
+
+void SearchHandler::NoteReply() const {
+  int left = inflight_.load(std::memory_order_relaxed);
+  while (left > 0 &&
+         !inflight_.compare_exchange_weak(left, left - 1,
+                                          std::memory_order_relaxed)) {
+  }
 }
 
 void SearchHandler::OnDownloaded(
@@ -148,7 +162,8 @@ void SearchHandler::FinishSearch(ExtractedMedia media, std::string local_path,
                  image_id);
     return;
   }
-  spdlog::info("search: dispatched {}", image_id);
+  const int inflight = inflight_.fetch_add(1, std::memory_order_relaxed) + 1;
+  spdlog::info("search: dispatched {} (inflight={})", image_id, inflight);
 }
 
 }  // namespace tg::features::media_thumbnail

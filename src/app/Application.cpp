@@ -115,15 +115,17 @@ Application::Application(Config config)
       chat_link_resolver_(config_.auto_search, &telegram_, workers_.get(),
                           &flood_retry_),
       dispatcher_(workers_) {
-  // Lanes: one channel + one ProcessImages stream + one SearchImages stream
-  // each (grpc.connections, default 1). The pools deal requests round-robin
-  // across lanes; reply matching is by id, so lane order does not matter.
-  const std::size_t lanes = transport_.lane_count();
-  for (std::size_t lane = 0; lane < lanes; ++lane) {
+  // ProcessImages keeps grpc.connections lanes and its own flow-control
+  // window. SearchImages opens max(connections, auto_search.max_inflight)
+  // streams on those same channels (HTTP/2 multiplexing, no extra process
+  // lane) so a server that handles one request at a time per stream can
+  // still run several searches at once.
+  const std::size_t process_lanes = transport_.lane_count();
+  const std::size_t search_lanes = std::max(
+      process_lanes, static_cast<std::size_t>(config_.auto_search.max_inflight));
+  for (std::size_t lane = 0; lane < process_lanes; ++lane) {
     process_clients_.push_back(
         std::make_unique<transport::ProcessImagesClient>(transport_, lane));
-    search_clients_.push_back(
-        std::make_unique<transport::SearchImagesClient>(transport_, lane));
     transport::AsyncStreamer<ImageRequest, ImageReply>::Options process_options;
     process_options.name = "ProcessImages#" + std::to_string(lane);
     process_options.start_fn = process_clients_.back()->start_fn();
@@ -133,6 +135,12 @@ Application::Application(Config config)
     process_options.queue_capacity =
         static_cast<std::size_t>(config_.grpc.queue_capacity);
     process_pool_.AddLane(std::move(process_options));
+  }
+  for (std::size_t lane = 0; lane < search_lanes; ++lane) {
+    const std::size_t channel =
+        process_lanes == 0 ? 0 : lane % process_lanes;
+    search_clients_.push_back(
+        std::make_unique<transport::SearchImagesClient>(transport_, channel));
     transport::AsyncStreamer<SearchReq, SearchRsp>::Options search_options;
     search_options.name = "SearchImages#" + std::to_string(lane);
     search_options.start_fn = search_clients_.back()->start_fn();
@@ -233,6 +241,38 @@ void Application::OnProcessImageReply(const ImageReply& reply) {
   chat_state_.ApplyReply(parsed->cid, parsed->mid);
 }
 
+void Application::OnSearchReply(const SearchRsp& reply) {
+  const auto entry = search_handler_.correlation().Lookup(reply.oid(), reply.id());
+  if (!entry.has_value()) {
+    spdlog::warn("search: rsp for unknown (oid={}, id={})", reply.oid(),
+                 reply.id());
+    return;
+  }
+  search_handler_.NoteReply();
+  spdlog::info("search: rsp for {} (oid={}, id={}) (inflight={}) result: {:.200}",
+               entry->image_id, reply.oid(), reply.id(),
+               search_handler_.inflight(), reply.result());
+  auto cipher = std::make_shared<common::MemoCipher>(config_.media_thumbnail.keyme);
+  const auto target = *entry;
+  const std::string result = reply.result();
+  // ChatLinkResolver does not block this worker: TDLib lookups continue
+  // on later posts, and other searches keep downloading and dispatching.
+  chat_link_resolver_.Resolve(
+      features::auto_search::SearchReplyCids(result),
+      [this, cipher, target, result](
+          features::auto_search::ChatLinkResolver::BaseMap bases) {
+        features::auto_search::DeliverSearchReply(
+            messenger_, target, result,
+            [cipher](const std::string& token) { return cipher->Decrypt(token); },
+            [bases = std::move(bases)](std::int64_t cid)
+                -> std::optional<std::string> {
+              const auto it = bases.find(cid);
+              if (it == bases.end()) return std::nullopt;
+              return it->second;
+            });
+      });
+}
+
 void Application::WireStreamerCallbacks() {
   // ImageReply -> Outbox DONE (v5 §2.4: log + metrics only, never reply into
   // Telegram by default) and release the flow-control slot when that DONE
@@ -244,43 +284,15 @@ void Application::WireStreamerCallbacks() {
   process_pool_.SetReplyHandler(
       [this](const ImageReply& reply) { OnProcessImageReply(reply); });
 
-  // SearchRsp -> correlation lookup, then ONE reply to that message
-  // (app_bot_client.rspwork). The chat_id is the TDLib dialog id stored
-  // when the SearchReq was sent, never the uint32 oid. Hit links use each
-  // hit's cid. This callback does not call TDLib; ChatLinkResolver may,
-  // on the worker pool, and then formats the reply.
-  search_pool_.SetReplyHandler(
-      [this](const SearchRsp& reply) {
-        const auto entry = search_handler_.correlation().Lookup(
-            reply.oid(), reply.id());
-        if (!entry.has_value()) {
-          spdlog::warn("search: rsp for unknown (oid={}, id={})", reply.oid(),
-                       reply.id());
-          return;
-        }
-        spdlog::info("search: rsp for {} (oid={}, id={}) result: {:.200}",
-                     entry->image_id, reply.oid(), reply.id(), reply.result());
-        auto cipher = std::make_shared<common::MemoCipher>(
-            config_.media_thumbnail.keyme);
-        const auto target = *entry;
-        const std::string result = reply.result();
-        chat_link_resolver_.Resolve(
-            features::auto_search::SearchReplyCids(result),
-            [this, cipher, target, result](
-                features::auto_search::ChatLinkResolver::BaseMap bases) {
-              features::auto_search::DeliverSearchReply(
-                  messenger_, target, result,
-                  [cipher](const std::string& token) {
-                    return cipher->Decrypt(token);
-                  },
-                  [bases = std::move(bases)](std::int64_t cid)
-                      -> std::optional<std::string> {
-                    const auto it = bases.find(cid);
-                    if (it == bases.end()) return std::nullopt;
-                    return it->second;
-                  });
-            });
-      });
+  // SearchRsp is posted off this completion-queue thread. Link resolution
+  // and the Telegram reply must not stall the stream's next Read/Write.
+  // The handler does not take a ProcessImages flow-control slot.
+  search_pool_.SetReplyHandler([this](const SearchRsp& reply) {
+    auto held = std::make_shared<SearchRsp>(reply);
+    if (!workers_->Post([this, held] { OnSearchReply(*held); })) {
+      OnSearchReply(*held);
+    }
+  });
 
   // Write-ok: the request left the client (gRPC accepted it into the
   // transport). PENDING/FAILED -> SENT until the safety deadline, out of
@@ -487,12 +499,13 @@ int Application::WaitForAuthOrFailure() {
 int Application::Run() {
   spdlog::info(
       "application: starting — workers={}, outbox={}, chat_state={}, grpc "
-      "target={}, lanes={}",
+      "target={}, process_lanes={}, search_lanes={}",
       config_.worker_count, config_.outbox.db_path,
       config_.chat_state.enabled
           ? config_.chat_state.db_path
           : "<memory-only>",
-      config_.grpc.target, transport_.lane_count());
+      config_.grpc.target, process_pool_.lane_count(),
+      search_pool_.lane_count());
 
   telegram_.SetUpdateSink(
       [this](td_api::object_ptr<td_api::Update>&& update) {

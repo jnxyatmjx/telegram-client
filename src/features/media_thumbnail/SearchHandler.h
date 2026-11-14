@@ -25,6 +25,7 @@
 #include <telegram/FileDownloader.h>
 #include <telegram/TelegramClient.h>
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -67,9 +68,15 @@ class SearchHandler {
                 telegram::FileDownloader& files);
 
   // Async kick-off (runs on a worker thread): extracts + converts ids +
-  // starts the download, then returns immediately. Never blocks.
+  // starts the download, then returns immediately. Never blocks. Does not
+  // take a ProcessImages flow-control slot.
   void SendSearchImages(const td_api::message& target,
                         app::AppContext& ctx) const;
+
+  // Requests accepted by the SearchImages stream and not yet answered.
+  // NoteReply runs on the search reply path (worker, not the gRPC CQ).
+  int inflight() const { return inflight_.load(std::memory_order_relaxed); }
+  void NoteReply() const;
 
   SearchCorrelationTable& correlation() { return correlation_; }
 
@@ -89,6 +96,9 @@ class SearchHandler {
   // Mutable: SendSearchImages() is const but registers the (oid, id) entry
   // in the correlation table (internal bookkeeping, mutex-guarded inside).
   mutable SearchCorrelationTable correlation_;
+  // Log-only. A lost reply can leave this high; it does not gate dispatch,
+  // so a missing SearchRsp cannot stall later searches or ProcessImages.
+  mutable std::atomic<int> inflight_{0};
 };
 
 }  // namespace tg::features::media_thumbnail

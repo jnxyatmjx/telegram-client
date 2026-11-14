@@ -505,6 +505,10 @@ Config Config::FromFile(const std::string& path) {
       }
       cfg.auto_search.dedup_ttl_seconds =
           Int(*a, "dedup_ttl_seconds", cfg.auto_search.dedup_ttl_seconds);
+      cfg.auto_search.max_inflight = static_cast<int>(
+          Int(*a, "max_inflight", cfg.auto_search.max_inflight));
+      if (cfg.auto_search.max_inflight < 1) cfg.auto_search.max_inflight = 1;
+      if (cfg.auto_search.max_inflight > 16) cfg.auto_search.max_inflight = 16;
     }
     if (const YamlNode* c = f->Find("commands")) {
       cfg.commands.enabled = Bool(*c, "enabled", cfg.commands.enabled);

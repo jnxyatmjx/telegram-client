@@ -100,6 +100,9 @@ features:
       -1003822626821: "https://t.me/somegroup/"
       "@privategroup": "https://t.me/+AbCdEf/"
     dedup_ttl_seconds: 600     # (oid, id) recent-search dedup TTL
+    # Parallel SearchImages streams on the existing gRPC channels. This is
+    # not the ProcessImages flow-control window (outbox.max_in_flight).
+    max_inflight: 8
   commands:
     # Control-chat command surface (Telethon migration chunk 2):
     #   /rsme  dialog listing (channels/groups then users, 45-line batches)

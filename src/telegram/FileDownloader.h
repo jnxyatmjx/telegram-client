@@ -83,7 +83,12 @@ class FileDownloader {
   // Async: registers on_done and returns immediately. No thread blocks.
   // Counts one consumer for the file: the caller must Release(file_id)
   // after it has consumed the bytes (see the cache-cleanup note above).
-  void DownloadAsync(std::int32_t file_id, DownloadCallback on_done);
+  // `priority` is TDLib's downloadFile priority (higher is preferred).
+  // The default 32 is what ProcessImages sends. Search passes a lower
+  // value so its thumbnails do not outrank process downloads of other
+  // files. A file already in flight keeps the priority that started it.
+  void DownloadAsync(std::int32_t file_id, DownloadCallback on_done,
+                     std::int32_t priority = 32);
 
   // Drops one consumer's claim on the file (any thread; same mutex_ as the
   // download bookkeeping). At count 0 the cached local file is deleted from
@@ -135,6 +140,8 @@ class FileDownloader {
   // deletes during shutdown); decremented by FailOne (a failed download
   // has no consumers left, and nothing is deleted for it).
   std::map<std::int32_t, int> use_count_;
+  // downloadFile priority for the in-flight request, including a flood retry.
+  std::map<std::int32_t, std::int32_t> priority_;
 };
 
 }  // namespace tg::telegram

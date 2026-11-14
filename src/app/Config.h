@@ -138,6 +138,9 @@ struct AutoSearchConfig {
   // number as written; @name keys are matched when a public username is known.
   std::vector<AutoSearchChatLink> chat_links;
   std::int64_t dedup_ttl_seconds = 600;
+  // How many SearchImages streams to keep open (at least grpc.connections).
+  // Independent of outbox.max_in_flight, which gates ProcessImages only.
+  int max_inflight = 8;
 };
 
 struct OutboxConfig {

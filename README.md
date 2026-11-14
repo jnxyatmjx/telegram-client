@@ -970,7 +970,15 @@ of libraries.
   unchanged. The conversion is logged at debug:
   `search: cid <id> mid <tdlib> is a TDLib message id — link uses <server>`.
   The send uses the correlation entry's TDLib chat id, never the
-  uint32 `oid`. `/search` replies use the same path.
+  uint32 `oid`. `/search` replies use the same path. Searches do not
+  take a ProcessImages flow-control slot. `auto_search.max_inflight`
+  (default 8) is how many SearchImages streams are open on the existing
+  gRPC channels, so a server that processes one request at a time per
+  stream can still run several searches at once. ProcessImages keeps
+  `grpc.connections` lanes. Dispatch and reply log
+  `search: dispatched <key> (inflight=N)` and
+  `search: rsp for <key> ... (inflight=N)`. Search thumbnail downloads
+  use a lower TDLib priority than ProcessImages downloads.
 - `features/media_thumbnail/MediaExtractor` — Pure tier selection
   (Telethon-migration chunk 1 semantics). Photo: the LARGEST tier — the
   full-resolution original, no size cap (ties by larger max edge;

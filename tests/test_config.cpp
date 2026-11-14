@@ -319,6 +319,7 @@ features:
   auto_search:
     enabled: true
     chats: ["@publicxme", yykisschat, -1003822626821]  # inline comment
+    max_inflight: 3
     chat_links:
       -1003822626821: "https://t.me/somegroup/"
       4242: https://t.me/baregroup//
@@ -346,6 +347,7 @@ features:
   EXPECT_FALSE(config.auto_search.chat_links[2].numeric);
   EXPECT_EQ(config.auto_search.chat_links[2].username, "privategroup");
   EXPECT_EQ(config.auto_search.chat_links[2].url, "https://t.me/+AbCdEf");
+  EXPECT_EQ(config.auto_search.max_inflight, 3);
 }
 
 TEST(ConfigAutoSearch, SingleFlowIdIsNotDropped) {

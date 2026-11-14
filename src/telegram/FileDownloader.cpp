@@ -14,7 +14,8 @@ FileDownloader::FileDownloader(ITdSender& sender, FloodRetry* flood_retry)
     : sender_(sender), flood_retry_(flood_retry) {}
 
 void FileDownloader::DownloadAsync(std::int32_t file_id,
-                                   DownloadCallback on_done) {
+                                   DownloadCallback on_done,
+                                   std::int32_t priority) {
   bool already_pending = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -25,12 +26,13 @@ void FileDownloader::DownloadAsync(std::int32_t file_id,
     // it has stored the bytes, and the cached file is deleted when the
     // last claim is dropped (deleteFile cache cleanup).
     ++use_count_[file_id];
+    if (!already_pending) priority_[file_id] = priority;
   }
   if (already_pending) {
     // A downloadFile request for this file is already in flight (or its
     // flood retry is scheduled — the callbacks stay registered through a
     // FloodWait); the callback rides along and fires when it completes.
-    // No second request.
+    // No second request, and the in-flight priority is left as-is.
     return;
   }
   SendDownloadFile(file_id);
@@ -72,9 +74,15 @@ void FileDownloader::Release(std::int32_t file_id) {
 }
 
 void FileDownloader::SendDownloadFile(std::int32_t file_id) {
+  std::int32_t priority = 32;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = priority_.find(file_id);
+    if (it != priority_.end()) priority = it->second;
+  }
   auto request = td_api::make_object<td_api::downloadFile>();
   request->file_id_ = file_id;
-  request->priority_ = 32;  // arbitrary medium priority
+  request->priority_ = priority;
   request->offset_ = 0;
   request->limit_ = 0;  // 0 -> TDLib picks its default chunk limit
   // synchronous=true: the response only arrives once the file is complete,
@@ -187,6 +195,7 @@ void FileDownloader::MaybeComplete(std::int32_t file_id, const td_api::file& fil
     if (it == pending_.end()) return;
     callbacks = std::move(it->second);
     pending_.erase(it);
+    priority_.erase(file_id);
   }
   // Invoke WITHOUT holding the mutex: the callback posts to a worker pool
   // and must never block the Receive thread.
@@ -205,6 +214,7 @@ void FileDownloader::FailOne(std::int32_t file_id, const std::string& error) {
     if (it == pending_.end()) return;
     callbacks = std::move(it->second);
     pending_.erase(it);
+    priority_.erase(file_id);
     // The callbacks fire with an error, so no consumer will use the file:
     // drop one claim per fired callback. Decrement — do NOT erase the
     // whole entry — because an earlier successful download of the same
@@ -233,6 +243,7 @@ void FileDownloader::FailAll(const std::string& reason) {
     failed = std::move(pending_);
     pending_.clear();
     flood_attempts_.clear();
+    priority_.clear();
     // Shutdown: the process is exiting, so no consumer will consume and no
     // deleteFile is sent (clearing the claims prevents a straggler Release
     // from deleting during teardown).

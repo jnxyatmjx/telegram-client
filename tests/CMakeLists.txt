@@ -22,6 +22,7 @@ set(TG_TEST_SOURCES
   test_streamer_pool.cpp
   test_message_sender.cpp
   test_chat_state_backend.cpp
+  test_d1_chat_state.cpp
   test_history_backfill.cpp
   test_dialog_scan.cpp
   test_control_commands.cpp

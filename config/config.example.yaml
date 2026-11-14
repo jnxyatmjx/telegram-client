@@ -163,12 +163,21 @@ outbox:
 
 # State persistence (Telethon migration chunk 2, Python chathis):
 # every flush_interval_seconds, chats whose watermark advanced within the
-# last active_window_seconds are upserted into the local SQLite table
-# `chathis` (chat_id, offset_id, chat_url, init_date, init_time, updated_at;
-# GMT+8 fields, Python-compatible shape). Startup restores the table into
-# memory; D1 replaces the backend later behind the same interface.
+# last active_window_seconds are upserted into `chathis`
+# (chat_id, offset_id, chat_url, init_date, init_time, updated_at; GMT+8).
+# backend sqlite (default) uses db_path and stores the TDLib message id.
+# backend d1 uses Cloudflare D1. Set these env vars (never commit them);
+# the same names may be overridden under chat_state as d1_account_id,
+# d1_api_token, d1_database_id, d1_api_base:
+#   CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, D1_DATABASE_ID
+#   D1_API_BASE (default https://api.cloudflare.com/client/v4)
+#   D1_BATCH_SIZE 500, D1_MAX_SQL_VARIABLES 90, D1_MAX_ATTEMPTS 3,
+#   D1_TIMEOUT 35
+# D1 offset_id is the server message id (TDLib id >> 20). A build without
+# libcurl rejects backend d1 at startup.
 chat_state:
   enabled: false
+  backend: sqlite
   db_path: "/data/chathis.sqlite"
   flush_interval_seconds: 30
   active_window_seconds: 45

@@ -566,11 +566,41 @@ Config Config::FromFile(const std::string& path) {
 
   if (const YamlNode* c = root.Find("chat_state")) {
     cfg.chat_state.enabled = Bool(*c, "enabled", cfg.chat_state.enabled);
+    cfg.chat_state.backend = Str(*c, "backend", cfg.chat_state.backend);
+    if (cfg.chat_state.backend != "sqlite" && cfg.chat_state.backend != "d1") {
+      throw std::runtime_error(
+          "chat_state.backend must be sqlite or d1, got: " +
+          cfg.chat_state.backend);
+    }
     cfg.chat_state.db_path = Str(*c, "db_path", cfg.chat_state.db_path);
     cfg.chat_state.flush_interval_seconds = static_cast<int>(
         Int(*c, "flush_interval_seconds", cfg.chat_state.flush_interval_seconds));
     cfg.chat_state.active_window_seconds = static_cast<int>(
         Int(*c, "active_window_seconds", cfg.chat_state.active_window_seconds));
+    cfg.chat_state.d1_account_id =
+        Str(*c, "d1_account_id", cfg.chat_state.d1_account_id);
+    cfg.chat_state.d1_api_token =
+        Str(*c, "d1_api_token", cfg.chat_state.d1_api_token);
+    cfg.chat_state.d1_database_id =
+        Str(*c, "d1_database_id", cfg.chat_state.d1_database_id);
+    cfg.chat_state.d1_api_base =
+        Str(*c, "d1_api_base", cfg.chat_state.d1_api_base);
+    if (c->Find("d1_batch_size") != nullptr) {
+      cfg.chat_state.d1_batch_size =
+          static_cast<int>(Int(*c, "d1_batch_size", 500));
+    }
+    if (c->Find("d1_max_sql_variables") != nullptr) {
+      cfg.chat_state.d1_max_sql_variables =
+          static_cast<int>(Int(*c, "d1_max_sql_variables", 90));
+    }
+    if (c->Find("d1_max_attempts") != nullptr) {
+      cfg.chat_state.d1_max_attempts =
+          static_cast<int>(Int(*c, "d1_max_attempts", 3));
+    }
+    if (c->Find("d1_timeout_seconds") != nullptr) {
+      cfg.chat_state.d1_timeout_seconds =
+          static_cast<int>(Int(*c, "d1_timeout_seconds", 35));
+    }
   }
 
   cfg.worker_count = static_cast<int>(Int(root, "workers", cfg.worker_count));

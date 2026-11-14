@@ -109,6 +109,7 @@ add_library(tg_core STATIC
   src/features/auto_search/SearchReply.cpp
   src/features/chat_state/ChatStateStore.cpp
   src/features/chat_state/SqliteChatStateBackend.cpp
+  src/features/chat_state/D1ChatStateBackend.cpp
   src/features/commands/ControlCommandsHandler.cpp
   src/features/commands/DialogScanner.cpp
   src/features/history_backfill/HistoryBackfill.cpp
@@ -128,6 +129,15 @@ add_library(tg_core STATIC
   src/common/ResumeTimer.cpp)
 
 target_include_directories(tg_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+find_package(CURL)
+if(CURL_FOUND)
+  target_compile_definitions(tg_core PUBLIC TG_HAVE_CURL=1)
+  target_link_libraries(tg_core PUBLIC CURL::libcurl)
+else()
+  target_compile_definitions(tg_core PUBLIC TG_HAVE_CURL=0)
+  message(STATUS "libcurl not found — chat_state.backend=d1 will fail at startup")
+endif()
+
 target_link_libraries(tg_core
   PUBLIC tg_proto Threads::Threads spdlog::spdlog SQLite::SQLite3
          OpenSSL::Crypto)

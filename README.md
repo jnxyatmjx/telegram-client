@@ -1079,17 +1079,23 @@ of libraries.
   `chat_state.flush_interval_seconds` the Application flush thread
   writes entries active within `active_window_seconds`, and startup
   restores the table before the flush thread starts.
-- `features/chat_state/ChatStateBackend` + `SqliteChatStateBackend` —
-  The storage seam behind `ChatStateStore` (chunk 2). The interface
-  (`Upsert` / `LoadAll`) exists so the planned Cloudflare D1 backend —
-  the Python client's backend, sharing the watermark table — can be
-  swapped in without touching the store or the wiring. The default
-  implementation is local SQLite with the exact Python `chathis` schema
-  (column names, order, `ON CONFLICT(chat_id)` upsert —
-  app_client.py schedule2db), a separate database file from the Outbox.
-  Timestamps are GMT+8 civil strings in the Python formats
-  (`common/Gmt8`), so D1 rows written by either deployment parse back
-  in both. Full D1 design: `docs/pending/state-persistence-and-d1.md`.
+- `features/chat_state/ChatStateBackend`, `SqliteChatStateBackend`, and
+  `D1ChatStateBackend` — The storage seam behind `ChatStateStore`.
+  `chat_state.backend` is `sqlite` (default) or `d1`. SQLite uses the
+  Python `chathis` schema in its own file (`db_path`, not the Outbox)
+  and stores the TDLib message id as-is. D1 uses the same SQL
+  (`INSERT ... ON CONFLICT(chat_id) DO UPDATE`) over the Cloudflare
+  query API. At the D1 boundary only, `offset_id` is the Telethon/server
+  id: writes shift `tdlib_mid >> 20` when that value is divisible by
+  2^20, and reads shift `<< 20` back. A mid that is not divisible is not
+  written (the stored D1 offset is kept). Credentials are environment
+  variables (`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`,
+  `D1_DATABASE_ID`, optional `D1_API_BASE`, `D1_BATCH_SIZE`,
+  `D1_MAX_SQL_VARIABLES`, `D1_MAX_ATTEMPTS`, `D1_TIMEOUT`) and are never
+  logged. The HTTPS client is one reused libcurl handle (HTTP/2, TCP
+  keepalive). `Upsert` failures are logged and memory stays authoritative.
+  `LoadAll` failure aborts startup, same as a failed SQLite open.
+  Details: `docs/pending/state-persistence-and-d1.md`.
 - `features/commands/ControlCommandsHandler` — The control-chat command
   surface (chunk 2; Python `handlersm` / `handlerfetchhistory` /
   `handrestore`). `/rsme` lists dialogs (channels/groups then users,
@@ -1330,12 +1336,12 @@ is set):
 - `features.media_channels` — whitelist auto-forward (Python `handmedias`),
   OFF by default; `chats` are BARE ids, `rpc` picks `process` (Python main
   chain) or `search`.
-- `chat_state` — watermark persistence: `enabled: false` until you provide
-  a `db_path` (default `/data/chathis.sqlite`); flushes every
-  `flush_interval_seconds` (30 s), entries active within
-  `active_window_seconds` (45 s), schema and GMT+8 fields byte-compatible
-  with the Python `chathis` table. The D1 backend arrives later behind the
-  same interface (`docs/pending/state-persistence-and-d1.md`).
+- `chat_state` — watermark persistence. `enabled: false` by default.
+  `backend: sqlite` (default) writes `/data/chathis.sqlite`. `backend: d1`
+  uses Cloudflare D1 with the env vars above. Flushes every
+  `flush_interval_seconds` (30 s); only chats active within
+  `active_window_seconds` (45 s). D1 `offset_id` is the server message id
+  (`TDLib id >> 20` on write, `<< 20` on read).
 
 ## Extending the client — how to add a new feature
 
@@ -1555,9 +1561,11 @@ Per IMPLEMENTATION_TASK.md / v5 §7 — a live run is NOT possible yet:
 3. Bot user_id (`command_bot_user_id`) and the real command names
    (`/process`, `/search` are placeholders).
 4. Auto-search chat allowlist (phase 2; disabled by default).
-5. Cloudflare D1 credentials (Hong, via Secure Vault): `CLOUDFLARE_ACCOUNT_ID`,
-   `CLOUDFLARE_API_TOKEN`, `D1_DATABASE_ID` — for the chat-state backend swap
-   (SQLite default works today; design in `docs/pending/state-persistence-and-d1.md`).
+5. Cloudflare D1 credentials, only if `chat_state.backend` is `d1`:
+   `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `D1_DATABASE_ID`
+   (optional `D1_API_BASE`, `D1_BATCH_SIZE`, `D1_MAX_SQL_VARIABLES`,
+   `D1_MAX_ATTEMPTS`, `D1_TIMEOUT`). SQLite remains the default and needs
+   none of these. See `docs/pending/state-persistence-and-d1.md`.
 6. Restricted private channels: Python auto-left them during `/rsme`
    (LeaveChannelRequest — destructive); the C++ port only marks them ⚠️.
    Confirm whether to migrate the auto-leave or keep report-only.

@@ -33,8 +33,8 @@ deployment would not parse back in the other (SURVEY §8.5-4).
 - `Upsert(row)` — one flush-pass row (Python `schedule2db` upsert shape).
 - `LoadAll()` — startup restore (Python `load_chat_state`).
 
-`ChatStateStore` and `Application` do NOT change when D1 arrives: only
-another `ChatStateBackend` implementation is swapped in by the wiring.
+`ChatStateStore` does not change when the backend changes. `Application`
+only chooses sqlite or d1 from `chat_state.backend`.
 `SqliteChatStateBackend` is the default while `chat_state.enabled` is set;
 it is a separate SQLite file (`chat_state.db_path`, default
 `/data/chathis.sqlite`) — not a table inside the Outbox database — so the
@@ -53,31 +53,76 @@ copy rows into D1 verbatim.
   lesson: a resolution storm over many chats is a FloodWait trap) —
   resolution stays on demand, exactly as in the realtime chain.
 
-## D1 client design (to implement when credentials arrive)
+## D1 backend (implemented)
 
-Authoritative reference: the Python `D1Database` wrapper (app_client.py
-449-648). The C++ client mirrors its REST call:
+`features/chat_state/D1ChatStateBackend` is the Cloudflare client. Select
+it with `chat_state.backend: d1` (`sqlite` remains the default, so existing
+deployments do not change). A build without libcurl refuses `d1` at
+startup with an explicit error.
 
-- **Endpoint**: `POST {D1_API_BASE}/accounts/{account_id}/d1/database/{database_id}/query`
-  with `D1_API_BASE` defaulting to `https://api.cloudflare.com/client/v4`.
-- **Headers**: `Authorization: Bearer {CLOUDFLARE_API_TOKEN}`,
-  `Content-Type: application/json`. Timeout 35 s per request.
-- **Retries**: on 429/500/502/503/504 back off exponentially
-  (0.5 · 2^(n−1) s, capped at 8 s), at most 3 attempts; 401/403 fail
-  immediately (credentials are wrong — retrying cannot help).
-- **Parameters**: SQL named parameters (`:name`) are translated to `?`
-  placeholders with an ordered bind list.
-- **Batch inserts**: expand VALUES per row, then chunk so no statement
-  exceeds `D1_MAX_SQL_VARIABLES` (default 90) bound variables; row chunks
-  of `D1_BATCH_SIZE` (default 500).
-- **Config keys** (env, never git/logs): `CLOUDFLARE_ACCOUNT_ID`,
-  `CLOUDFLARE_API_TOKEN`, `D1_DATABASE_ID`, `D1_API_BASE`,
-  `D1_BATCH_SIZE`, `D1_MAX_SQL_VARIABLES`, `D1_MAX_ATTEMPTS`, `D1_TIMEOUT`.
-- **Transport**: an HTTPS client in the C++ process. Not built — chunk 3
-  did not add it. When it exists, flushing stays on the Application
-  flush thread; the D1 backend must never block a worker or the Receive
-  thread.
+Credentials come from the environment and are never logged. The same names
+may be set under `chat_state` (`d1_account_id`, `d1_api_token`,
+`d1_database_id`, `d1_api_base`, `d1_batch_size`, `d1_max_sql_variables`,
+`d1_max_attempts`, `d1_timeout_seconds`) and override the environment.
 
-Credentials arrive via Hong (Secure Vault). Until then the SQLite backend
-keeps the process fully functional — same schema, same flush semantics, so
-switching to D1 is a wiring change plus a one-time row copy.
+| env | default |
+| --- | --- |
+| `CLOUDFLARE_ACCOUNT_ID` | required |
+| `CLOUDFLARE_API_TOKEN` | required |
+| `D1_DATABASE_ID` | required |
+| `D1_API_BASE` | `https://api.cloudflare.com/client/v4` |
+| `D1_BATCH_SIZE` | 500 |
+| `D1_MAX_SQL_VARIABLES` | 90 (15 rows × 6 columns) |
+| `D1_MAX_ATTEMPTS` | 3 |
+| `D1_TIMEOUT` | 35 seconds |
+
+`POST {D1_API_BASE}/accounts/{id}/d1/database/{id}/query` with
+`Authorization: Bearer …` and `{"sql","params"}`. `success != true` and a
+per-result `success: false` are errors. 401/403 fail immediately. 429 and
+5xx, and connection failures, retry with backoff `min(8s, 0.5·2^(n-1))`.
+The SQL is the Python upsert:
+
+```sql
+INSERT INTO chathis (chat_id, offset_id, chat_url, init_date, init_time, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(chat_id) DO UPDATE SET
+    offset_id = excluded.offset_id,
+    chat_url = excluded.chat_url,
+    init_date = excluded.init_date,
+    init_time = excluded.init_time,
+    updated_at = excluded.updated_at
+```
+
+`LoadAll` is `SELECT chat_id, offset_id, chat_url, init_date, init_time FROM chathis`.
+`init_date` may be an integer or a digit string. `init_time` may carry a
+fractional second, which is stripped. A null `chat_url` becomes empty.
+
+### offset_id scale
+
+Python stores the Telethon/server message id. The C++ store and backfill
+compare TDLib ids (`server_id << 20`). Only the D1 backend converts:
+
+- Write: `offset_id = tdlib_mid >> 20` when `tdlib_mid % 2^20 == 0`.
+  Otherwise the row's offset is not changed. If D1 already has the chat,
+  that stored server id is written back with the other columns. If it does
+  not, the row is skipped and a warning is logged.
+- Read: `offset_id << 20`, unless the shift would overflow (the row is
+  skipped). SQLite still stores the TDLib id unchanged.
+
+### Keep-alive
+
+One libcurl easy handle is owned by the backend and reused for every
+request (flush thread and startup restore; a mutex guards it anyway).
+HTTP/2 is requested (`CURL_HTTP_VERSION_2TLS`, falling back to 1.1
+keep-alive). TCP keepalive idle and interval are 20s, `CURLOPT_MAXAGE_CONN`
+is 60s, connect timeout is 10s, total timeout is `D1_TIMEOUT`. A
+connection-level error destroys and recreates the handle before the retry.
+`CURLINFO_NUM_CONNECTS == 0` is logged at debug as a reused connection.
+
+### Failures
+
+`Upsert` throws `std::runtime_error`. `ChatStateStore::FlushActive` logs
+that and leaves memory authoritative. `LoadAll` throws as well: startup
+restore does not catch it, so a D1 outage during boot exits the process
+the same way a corrupt SQLite file does. Neither path runs on a worker or
+the TDLib receive thread.

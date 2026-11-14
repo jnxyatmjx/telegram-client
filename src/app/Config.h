@@ -173,9 +173,23 @@ struct OutboxConfig {
 struct ChatStateConfig {
   // False = memory-only (Chunk 1 behaviour, nothing restored at startup).
   bool enabled = false;
+  // "sqlite" (default, existing deployments) or "d1".
+  std::string backend = "sqlite";
   std::string db_path = "/data/chathis.sqlite";
   int flush_interval_seconds = 30;   // Python schedule.every(30)
   int active_window_seconds = 45;    // flush only chats active within 45 s
+  // Optional D1 overrides. Empty / -1 means the environment variable
+  // (CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, D1_DATABASE_ID,
+  // D1_API_BASE, D1_BATCH_SIZE, D1_MAX_SQL_VARIABLES, D1_MAX_ATTEMPTS,
+  // D1_TIMEOUT). The token is never logged.
+  std::string d1_account_id;
+  std::string d1_api_token;
+  std::string d1_database_id;
+  std::string d1_api_base;
+  int d1_batch_size = -1;
+  int d1_max_sql_variables = -1;
+  int d1_max_attempts = -1;
+  int d1_timeout_seconds = -1;
 };
 
 // Control-chat command surface (/rsme //rsor //xm ...; Python handlersm /

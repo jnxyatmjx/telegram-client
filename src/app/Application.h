@@ -12,7 +12,6 @@
 #include <features/auto_search/ChatLinkResolver.h>
 #include <features/bot_command/BotCommandHandler.h>
 #include <features/chat_state/ChatStateStore.h>
-#include <features/chat_state/SqliteChatStateBackend.h>
 #include <features/commands/ControlCommandsHandler.h>
 #include <features/commands/DialogScanner.h>
 #include <features/history_backfill/HistoryBackfill.h>

@@ -3,12 +3,15 @@
 #include <common/Logger.h>
 #include <common/MemoCipher.h>
 #include <features/auto_search/SearchReply.h>
+#include <features/chat_state/D1ChatStateBackend.h>
+#include <features/chat_state/SqliteChatStateBackend.h>
 
 #include <memory>
 #include <telegram/AuthManager.h>
 
 #include <csignal>
 #include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -51,6 +54,54 @@ std::int64_t NowMs() {
       .count();
 }
 
+std::string EnvOr(const std::string& config_value, const char* name,
+                  const std::string& fallback = {}) {
+  if (!config_value.empty()) return config_value;
+  const char* env = std::getenv(name);
+  if (env != nullptr && env[0] != '\0') return env;
+  return fallback;
+}
+
+int EnvIntOr(int config_value, const char* name, int fallback) {
+  if (config_value >= 0) return config_value;
+  const char* env = std::getenv(name);
+  if (env == nullptr || env[0] == '\0') return fallback;
+  char* end = nullptr;
+  const long parsed = std::strtol(env, &end, 10);
+  if (end == env) return fallback;
+  return static_cast<int>(parsed);
+}
+
+std::unique_ptr<features::chat_state::ChatStateBackend> OpenChatState(
+    const Config& config) {
+  if (!config.chat_state.enabled) return nullptr;
+  if (config.chat_state.backend == "d1") {
+    features::chat_state::D1Settings settings;
+    settings.account_id =
+        EnvOr(config.chat_state.d1_account_id, "CLOUDFLARE_ACCOUNT_ID");
+    settings.api_token =
+        EnvOr(config.chat_state.d1_api_token, "CLOUDFLARE_API_TOKEN");
+    settings.database_id =
+        EnvOr(config.chat_state.d1_database_id, "D1_DATABASE_ID");
+    settings.api_base = EnvOr(config.chat_state.d1_api_base, "D1_API_BASE",
+                              "https://api.cloudflare.com/client/v4");
+    settings.batch_size =
+        EnvIntOr(config.chat_state.d1_batch_size, "D1_BATCH_SIZE", 500);
+    settings.max_sql_variables = EnvIntOr(
+        config.chat_state.d1_max_sql_variables, "D1_MAX_SQL_VARIABLES", 90);
+    settings.max_attempts =
+        EnvIntOr(config.chat_state.d1_max_attempts, "D1_MAX_ATTEMPTS", 3);
+    settings.timeout_seconds =
+        EnvIntOr(config.chat_state.d1_timeout_seconds, "D1_TIMEOUT", 35);
+    // Do not log settings.api_token.
+    spdlog::info("chat_state: D1 backend account={} database={}",
+                 settings.account_id, settings.database_id);
+    return features::chat_state::MakeD1ChatStateBackend(std::move(settings));
+  }
+  return features::chat_state::MakeSqliteChatStateBackend(
+      config.chat_state.db_path);
+}
+
 }  // namespace
 
 namespace {
@@ -81,13 +132,9 @@ Application::Application(Config config)
       transport_(config_.grpc),
       // Flow-control window for the process path (retry design §2(c)).
       flow_control_(config_.outbox.max_in_flight),
-      // chat_state.enabled=false keeps the store memory-only (Chunk 1
-      // behaviour); otherwise the Python `chathis` SQLite schema backs it.
-      chat_state_(telegram_,
-                  config_.chat_state.enabled
-                      ? features::chat_state::MakeSqliteChatStateBackend(
-                            config_.chat_state.db_path)
-                      : nullptr),
+      // chat_state.enabled=false keeps the store memory-only. Otherwise
+      // sqlite (default) or d1, chosen by chat_state.backend.
+      chat_state_(telegram_, OpenChatState(config_)),
       process_handler_(MediaExtractor(config_.media_thumbnail), telegram_,
                        files_,
                        common::MemoCipher(config_.media_thumbnail.keyme)),
@@ -505,7 +552,8 @@ int Application::Run() {
       "target={}, process_lanes={}, search_lanes={}",
       config_.worker_count, config_.outbox.db_path,
       config_.chat_state.enabled
-          ? config_.chat_state.db_path
+          ? (config_.chat_state.backend == "d1" ? std::string("d1")
+                                                : config_.chat_state.db_path)
           : "<memory-only>",
       config_.grpc.target, process_pool_.lane_count(),
       search_pool_.lane_count());
@@ -537,7 +585,10 @@ int Application::Run() {
     if (config_.chat_state.enabled) {
       const std::size_t restored = chat_state_.Restore();
       spdlog::info("application: chat state restored — {} chats from {}",
-                   restored, config_.chat_state.db_path);
+                   restored,
+                   config_.chat_state.backend == "d1"
+                       ? "d1"
+                       : config_.chat_state.db_path);
     }
     StartOutboxRetryThread();
     StartStateFlushThread();
